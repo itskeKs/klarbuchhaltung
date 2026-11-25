@@ -1763,7 +1763,7 @@ def book_expense_as_category(conn, expense_id: int, category: str) -> dict:
     z. B. 'privatentnahme' (Konto 1800, ohne USt), 'gebuehr', 'einnahme_sonstige', 'ignorieren'.
     Die Ausgabe wird entfernt; die zugrundeliegende Zahlung erhält die Kategorie (gibt es keine,
     wird eine angelegt). Es wird KEINE Auto-Regel gelernt (einmalige Korrektur)."""
-    if category not in TX_CATEGORIES or category in ("offen", "ausgabe", "einnahme_rechnung"):
+    if category not in TX_CATEGORIES or category in ("offen", "ausgabe", "einnahme_rechnung") or category in TAXABLE_BANK_INCOME:
         raise ValueError(f"Nicht als Kategorie buchbar: {category}")
     e = conn.execute("SELECT * FROM expenses WHERE id = ?", (expense_id,)).fetchone()
     if e is None:
@@ -1785,15 +1785,32 @@ def book_expense_as_category(conn, expense_id: int, category: str) -> dict:
 
 
 # ── Bank / Transaktionen ─────────────────────────────────────────────────
+TAXABLE_BANK_INCOME = {
+    "einnahme_ust19": (19, "8400", "Erlöse 19 % USt."),
+    "einnahme_ust7": (7, "8300", "Erlöse 7 % USt."),
+}
+
 TX_CATEGORIES = {
     "offen": "offen",
     "einnahme_rechnung": "Einnahme (Rechnung)",
     "einnahme_sonstige": "Einnahme (sonstige)",
+    **{category: label for category, (_, _, label) in TAXABLE_BANK_INCOME.items()},
     "ausgabe": "Betriebsausgabe",
     "privatentnahme": "Privatentnahme / Barauszahlung",
     "gebuehr": "Bankgebühr",
     "ignorieren": "Ignorieren",
 }
+
+
+def direct_income_available(cfg) -> bool:
+    tax = cfg.get("tax", {})
+    return tax.get("taxation", "ist") == "ist" and not tax.get("small_business") and home_currency() == "EUR"
+
+
+def _bank_income_amounts(gross, rate):
+    gross = money(gross)
+    net = money(gross * Decimal(100) / (100 + rate))
+    return net, gross - net
 
 
 def _num(v) -> float:
@@ -1855,13 +1872,15 @@ def import_bank_csv(conn, text: str) -> dict:
     return {"imported": imported, "duplicates": dups, "matched": matched}
 
 
-def import_bank_rows(conn, rows: list) -> dict:
+ENABLE_BANKING_REF_PREFIX = "enablebanking:"
+
+
+def import_bank_rows(conn, rows: list, *, auto_match: bool = True, require_fx: bool = False) -> dict:
     """Fertig normalisierte Zahlungen aufnehmen (z. B. aus dem Wirex-Konto).
 
-    Landen als 'offen' in den Zahlungen – bewusst OHNE Buchungssatz und ohne
-    Festschreibung: die buchhalterische Zuordnung macht der Nutzer.
+    Auto-match is optional. Enable Banking rows are always left for review.
     'ref' ist UNIQUE, ein erneuter Abruf legt also nichts doppelt an."""
-    imported = dups = 0
+    imported = dups = deferred = 0
     for r in rows:
         ref = (r.get("ref") or "").strip()
         date_ = (r.get("date") or "")[:10]
@@ -1873,18 +1892,26 @@ def import_bank_rows(conn, rows: list) -> dict:
         amount = float(r.get("amount") or 0)
         currency = (r.get("currency") or "EUR").upper()
         amount_home, fx = to_home(conn, amount, currency, date_)
-        conn.execute(
+        if require_fx and amount_home is None:
+            deferred += 1
+            continue
+        inserted = conn.execute(
             """INSERT INTO transactions
                (ref, date, amount, fee, currency, amount_home, fx_rate,
                 description, tx_type, category, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?, 'offen', ?)""",
+               VALUES (?,?,?,?,?,?,?,?,?, 'offen', ?)
+               ON CONFLICT(ref) DO NOTHING""",
             (ref, date_, amount, float(r.get("fee") or 0), currency, amount_home, fx,
              r.get("description") or "", r.get("tx_type") or "", _now()),
         )
-        imported += 1
+        imported += inserted.rowcount
+        dups += 1 - inserted.rowcount
     conn.commit()
-    matched = _auto_match_transactions(conn) if imported else 0
-    return {"imported": imported, "duplicates": dups, "matched": matched}
+    matched = _auto_match_transactions(conn) if imported and auto_match else 0
+    result = {"imported": imported, "duplicates": dups, "matched": matched}
+    if require_fx:
+        result["deferred"] = deferred
+    return result
 
 
 def _auto_match_transactions(conn) -> int:
@@ -1892,7 +1919,10 @@ def _auto_match_transactions(conn) -> int:
     matched = 0
     txs = conn.execute(
         """SELECT * FROM transactions
-           WHERE amount > 0 AND invoice_id IS NULL AND amount_home IS NOT NULL"""
+           WHERE amount > 0 AND invoice_id IS NULL AND amount_home IS NOT NULL
+             AND (ref IS NULL OR ref NOT LIKE ?)
+             AND category NOT IN ('einnahme_ust19', 'einnahme_ust7')""",
+        (ENABLE_BANKING_REF_PREFIX + "%",),
     ).fetchall()
     for t in txs:
         cands = conn.execute(
@@ -2036,12 +2066,19 @@ def list_ledger(conn, lo: str, hi: str) -> list:
         if t["expense_id"] or t["invoice_id"] or t["id"] in used_tx:
             continue                                          # schon als Ausgabe/Rechnung im Journal
         ah = t["amount_home"] if t["amount_home"] is not None else t["amount"]
+        income = TAXABLE_BANK_INCOME.get(t["category"])
+        contributions = {"sonstige": ah} if t["category"] == "einnahme_sonstige" else {}
+        if income:
+            rate, _, _ = income
+            ah = t["amount"]
+            net, vat = _bank_income_amounts(ah, rate)
+            contributions = {"umsatz_net": float(net), "umsatz_ust": float(vat), "inv_kind": "domestic"}
         rows.append({"kind": "bank", "id": t["id"], "date": t["date"],
                      "text": t["description"] or "—", "sub": t["tx_type"], "skr_no": "",
                      "skr_name": "", "amount": ah, "is_income": t["amount"] > 0,
                      "beleg": bool(t["receipt_path"]) and abs_pfad(t["receipt_path"]).exists(),
                      "vat_rate": None, "reverse_charge": False, "category": t["category"], "tx": t,
-                     "_euer": ({"sonstige": ah} if t["category"] == "einnahme_sonstige" else {})})
+                     "_euer": contributions})
 
     # Nutzungsentnahme direkt unter ihre Ausgabe (gleiche id) einsortieren
     rows.sort(key=lambda r: (r["date"] or "", r["kind"] != "bank", r["id"],
@@ -2087,6 +2124,8 @@ def reset_tx(conn, tx_id: int) -> None:
     t = get_transaction(conn, tx_id)
     if not t:
         return
+    if t["category"] in TAXABLE_BANK_INCOME:
+        _guard_open_period(t["date"], "Umbuchen")
     exp_id, inv_id = t["expense_id"], t["invoice_id"]
     # zuerst die Verweise der Transaktion lösen (sonst FK-Verletzung beim Löschen)
     conn.execute("UPDATE transactions SET category = 'offen', expense_id = NULL, "
@@ -2103,10 +2142,21 @@ def reset_tx(conn, tx_id: int) -> None:
 def set_tx_category(conn, tx_id: int, category: str, note: str | None = None) -> None:
     if category not in TX_CATEGORIES:
         raise ValueError(f"Unbekannte Kategorie: {category}")
+    t = get_transaction(conn, tx_id)
+    if not t:
+        raise ValueError("Zahlung nicht gefunden.")
+    if category in TAXABLE_BANK_INCOME:
+        if (not direct_income_available(load_config()) or not 0.005 <= t["amount"] <= 10**14
+                or t["currency"] != "EUR"
+                or t["expense_id"] is not None or t["invoice_id"] is not None):
+            raise ValueError("Direkte Umsatzsteuerbuchungen sind für ungebundene positive Zahlungen "
+                             "bei Ist-Versteuerung in EUR und ohne Kleinunternehmerregelung verfügbar.")
+        _guard_open_period(t["date"], "Buchen")
+    elif t["category"] in TAXABLE_BANK_INCOME:
+        _guard_open_period(t["date"], "Umbuchen")
     conn.execute("UPDATE transactions SET category = ?, note = COALESCE(?, note) WHERE id = ?",
                  (category, note, tx_id))
     conn.commit()
-    t = get_transaction(conn, tx_id)
     save_rule(conn, t["description"], category)
 
 
@@ -2148,6 +2198,11 @@ def suggestion_for(rules_map: dict, description: str):
 
 def link_tx_invoice(conn, tx_id: int, invoice_id: int) -> None:
     t = get_transaction(conn, tx_id)
+    if t and t["category"] in TAXABLE_BANK_INCOME:
+        _guard_open_period(t["date"], "Umbuchen")
+        invoice = get_invoice(conn, invoice_id)
+        if not invoice or invoice["paid_date"] or money(invoice["gross"]) != money(t["amount"]):
+            raise ValueError("Wähle eine offene Rechnung mit dem gleichen Bruttobetrag.")
     conn.execute("UPDATE transactions SET invoice_id = ?, category = 'einnahme_rechnung' WHERE id = ?",
                  (invoice_id, tx_id))
     conn.execute("UPDATE invoices SET paid_date = ? WHERE id = ?", (t["date"], invoice_id))
@@ -2158,6 +2213,8 @@ def create_expense_from_tx(conn, tx_id: int, category: str, vat_rate,
                            description: str | None = None, private_share=0,
                            vat_kind=None) -> None:
     t = get_transaction(conn, tx_id)
+    if t and t["category"] in TAXABLE_BANK_INCOME:
+        _guard_open_period(t["date"], "Umbuchen")
     signed = t["amount_home"] if t["amount_home"] is not None else t["amount"]
     # Abgang (−) → positive Betriebsausgabe; Eingang (+) → negative Ausgabe = Erstattung/Minderung
     gross_home = -signed
@@ -2770,6 +2827,21 @@ def _vat_figures(conn, cfg, lo: str, hi: str) -> dict:
     net_by_rate = {int(r["rate"]): money(r["net"] or 0) for r in rows}
     net19, net7 = net_by_rate.get(19, Decimal(0)), net_by_rate.get(7, Decimal(0))
     ust19, ust7 = money(net19 * Decimal("0.19")), money(net7 * Decimal("0.07"))
+
+    for tx in conn.execute(
+        """SELECT category, amount FROM transactions
+           WHERE category IN ('einnahme_ust19', 'einnahme_ust7')
+             AND date BETWEEN ? AND ? AND expense_id IS NULL AND invoice_id IS NULL
+             AND currency = 'EUR' AND amount > 0""", (lo, hi),
+    ):
+        rate = TAXABLE_BANK_INCOME[tx["category"]][0]
+        net, tax = _bank_income_amounts(tx["amount"], rate)
+        if rate == 19:
+            net19 += net
+            ust19 += tax
+        else:
+            net7 += net
+            ust7 += tax
 
     # Steuerfreie / nicht steuerbare Umsätze – Kennzahl aus Rechnungstyp + Leistungsart.
     supply: dict[str, Decimal] = {}

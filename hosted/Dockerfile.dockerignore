@@ -1,0 +1,16 @@
+**
+!app.py
+!assistant.py
+!core.py
+!wirex.py
+!import_template.csv
+!LICENSE
+!fonts/
+!fonts/**
+!static/
+!static/**
+!templates/
+!templates/**
+!hosted/
+!hosted/*.py
+!hosted/requirements.txt

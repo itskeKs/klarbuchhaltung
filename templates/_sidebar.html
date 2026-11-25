@@ -43,31 +43,40 @@
 
   <div class="kl-spacer"></div>
 
+  {% if not hosted %}
   <button type="button" class="kl-ask" onclick="toggleAsk()" style="border:none;width:100%;text-align:left;cursor:pointer;font-family:inherit">
     <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 4.7L18.6 9l-4.7 1.9L12 15.6 10.1 10.9 5.4 9l4.7-1.3z"/></svg>
     <span style="font-size:13.5px;font-weight:600">Ask Klar</span>
     <span class="kbd">Chat</span>
   </button>
   {% endif %}
+  {% endif %}
 
   {# Eine Kachel unten. Beim Überfahren (oder per Tastatur-Fokus) klappt das
      Menü mit Einstellungen, Profilwahl und Wechsel auf. #}
-  {% if not setup_modus %}
+  {% if hosted or not setup_modus %}
   <div class="kl-account">
     <button type="button" class="kl-user" aria-haspopup="true">
-      <div class="av">{{ profil_initialen if profil else '·' }}</div>
+      <div class="av">{{ hosted_username[0] if hosted else (profil_initialen if profil else '·') }}</div>
       <div style="line-height:1.3;flex:1;min-width:0">
-        <div style="font-size:13px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ profil.name if profil else 'Buchhaltung' }}</div>
+        <div style="font-size:13px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ hosted_username if hosted else (profil.name if profil else 'Buchhaltung') }}</div>
         <div style="font-size:11.5px;color:var(--ink-3)">Konto &amp; Einstellungen</div>
       </div>
       <svg class="chev" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 15 6-6 6 6"/></svg>
     </button>
 
     <div class="kl-menu" role="menu">
+      {% if not setup_modus %}
       <a href="{{ url_for('settings') }}" role="menuitem">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
         Einstellungen</a>
-      {% if profil %}
+      {% endif %}
+      {% if hosted %}
+      <form method="post" action="/logout">
+        <input type="hidden" name="_klar_csrf" value="{{ hosted_csrf }}">
+        <button type="submit" role="menuitem">Abmelden</button>
+      </form>
+      {% elif profil %}
       <div class="trenner"></div>
       <a href="{{ url_for('profile_waehlen') }}" role="menuitem">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><path d="M17.5 14v7M14 17.5h7"/></svg>

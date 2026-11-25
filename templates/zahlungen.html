@@ -144,13 +144,13 @@
         <div style="width:210px;flex-shrink:0" onclick="event.stopPropagation()">
           {% if t.categorized %}
           <button class="skrbox" onclick="openEdit(this)"
-                  data-tid="{{ t.id }}" data-action="{{ t.st.action }}" data-cat="{{ t.st.category }}" data-vat="{{ t.st.vat_rate }}" data-vatkind="{{ t.st.vat_kind or 'domestic' }}" data-private="{{ t.st.private_share }}" data-income="{{ '1' if t.is_income else '0' }}" data-title="{{ (t.description or '—')|replace('"', ' ') }} · {{ t.date|de_date }}">
+                  data-tid="{{ t.id }}" data-action="{{ t.st.action }}" data-cat="{{ t.st.category }}" data-vat="{{ t.st.vat_rate }}" data-vatkind="{{ t.st.vat_kind or 'domestic' }}" data-private="{{ t.st.private_share }}" data-income="{{ '1' if t.is_income else '0' }}" data-eur="{{ '1' if t.currency == 'EUR' else '0' }}" data-title="{{ (t.description or '—')|replace('"', ' ') }} · {{ t.date|de_date }}">
             <div class="num" style="font-size:12px;font-weight:600">{{ t.skr_no }}</div>
             <div style="font-size:11.5px;color:var(--ink-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ t.skr_name or cats.get(t.category, t.category) }}</div>
           </button>
           {% else %}
           <button class="skr-assign" onclick="openEdit(this)"
-                  data-tid="{{ t.id }}" data-action="" data-cat="" data-vat="19" data-vatkind="domestic" data-private="0" data-income="{{ '1' if t.is_income else '0' }}" data-title="{{ (t.description or '—')|replace('"', ' ') }} · {{ t.date|de_date }}">+ Buchungssatz zuweisen</button>
+                  data-tid="{{ t.id }}" data-action="" data-cat="" data-vat="19" data-vatkind="domestic" data-private="0" data-income="{{ '1' if t.is_income else '0' }}" data-eur="{{ '1' if t.currency == 'EUR' else '0' }}" data-title="{{ (t.description or '—')|replace('"', ' ') }} · {{ t.date|de_date }}">+ Buchungssatz zuweisen</button>
           {% endif %}
         </div>
         <div style="width:120px;flex-shrink:0"><span style="display:inline-block;font-size:12px;font-weight:500;color:#3C3E49;border:1px solid var(--field-border);border-radius:8px;padding:6px 9px;background:var(--surface);white-space:nowrap">{{ t.tax }}</span></div>
@@ -167,7 +167,7 @@
           <div><div class="overline" style="margin-bottom:3px">Betrag (EUR)</div><div class="num" style="font-size:13.5px">{{ (t.amount_home if t.amount_home is not none else t.amount)|eur }}</div></div>
           <div style="grid-column:1 / -1" class="row" style="gap:10px;margin-top:2px">
             <button class="btn btn--primary btn--sm" onclick="openEditFromDetail(this)"
-                    data-tid="{{ t.id }}" data-action="{{ t.st.action }}" data-cat="{{ t.st.category }}" data-vat="{{ t.st.vat_rate }}" data-vatkind="{{ t.st.vat_kind or 'domestic' }}" data-private="{{ t.st.private_share }}" data-income="{{ '1' if t.is_income else '0' }}" data-title="{{ (t.description or '—')|replace('"', ' ') }} · {{ t.date|de_date }}">Bearbeiten</button>
+                    data-tid="{{ t.id }}" data-action="{{ t.st.action }}" data-cat="{{ t.st.category }}" data-vat="{{ t.st.vat_rate }}" data-vatkind="{{ t.st.vat_kind or 'domestic' }}" data-private="{{ t.st.private_share }}" data-income="{{ '1' if t.is_income else '0' }}" data-eur="{{ '1' if t.currency == 'EUR' else '0' }}" data-title="{{ (t.description or '—')|replace('"', ' ') }} · {{ t.date|de_date }}">Bearbeiten</button>
             {% if not t.is_income %}
             <button class="btn btn--outline btn--sm" onclick="openSplit(this)"
                     data-tid="{{ t.id }}" data-amount="{{ '%.2f'|format((t.amount_home if t.amount_home is not none else t.amount)|abs) }}">Split buchen</button>
@@ -224,7 +224,7 @@
           </div>
         </div>
         {# Steuer + Privatanteil #}
-        <div style="display:grid;grid-template-columns:1.5fr 1fr;gap:18px;align-items:start">
+        <div id="ef-expense-fields" style="display:grid;grid-template-columns:1.5fr 1fr;gap:18px;align-items:start">
           <div>
             <label style="display:block;font-size:13px;font-weight:600;color:#3C3E49;margin-bottom:8px">Steuer</label>
             <div class="row" style="flex-wrap:wrap;gap:6px" id="ef-tax">
@@ -256,13 +256,23 @@
           </div>
           <div id="ef-inv-panel" class="bs-panel" hidden>
             <div class="bs-opt" onclick="bsPickInv('','Rechnung wählen…')"><span style="font-size:14px;color:var(--ink-3)">— keine —</span></div>
-            {% for i in inv_options %}<div class="bs-opt" onclick="bsPickInv('{{ i['id'] }}', '{{ i['number'] }} · {{ i['customer_name'][:20]|replace("'", " ") }}')"><span class="num" style="font-size:12px;font-weight:600;color:var(--ink-2);width:78px;flex-shrink:0">{{ i['number'] }}</span><span style="font-size:14px;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ i['customer_name'][:24] }}</span><span class="num" style="font-size:12.5px;color:var(--ink-3)">{{ i['gross']|eur }}</span></div>{% endfor %}
+            {% for i in inv_options %}<div class="bs-opt" data-id="{{ i['id'] }}" data-label="{{ i['number'] }} · {{ i['customer_name'][:20] }}" onclick="bsPickInv(this.dataset.id,this.dataset.label)"><span class="num" style="font-size:12px;font-weight:600;color:var(--ink-2);width:78px;flex-shrink:0">{{ i['number'] }}</span><span style="font-size:14px;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ i['customer_name'][:24] }}</span><span class="num" style="font-size:12.5px;color:var(--ink-3)">{{ i['gross']|eur }}</span></div>{% endfor %}
           </div>
         </div>
+        {% if direct_income %}
+        <div id="ef-direct-income" class="field" hidden>
+          <label for="ef-income-rate">Umsatzsteuer ohne Rechnungszuordnung</label>
+          <select class="select" id="ef-income-rate" name="income_rate">
+            <option value="0">Ohne Umsatzsteuer · sonstige Einnahme</option>
+            <option value="19">19 % USt. · SKR03 8400</option>
+            <option value="7">7 % USt. · SKR03 8300</option>
+          </select>
+        </div>
+        {% endif %}
       </div>
       <div class="row" style="justify-content:space-between;gap:10px;padding:20px 24px">
         <label class="row" style="gap:8px;font-size:13px;color:var(--ink-2);cursor:pointer"><input type="checkbox" name="save_rule" checked style="width:15px;height:15px;accent-color:var(--ink)">Regel merken</label>
-        <div class="row" style="gap:10px"><button class="btn btn--outline" type="button" onclick="closeModal('edit-modal')">Abbrechen</button><button class="btn btn--primary" type="submit">Speichern</button></div>
+        <div class="row" style="gap:10px">{% if hosted %}<button class="btn btn--outline" id="ef-reopen" type="button" hidden onclick="bsReopen()">Zuordnung aufheben</button>{% endif %}<button class="btn btn--outline" type="button" onclick="closeModal('edit-modal')">Abbrechen</button><button class="btn btn--primary" type="submit">Speichern</button></div>
       </div>
     </form>
   </div>
@@ -352,6 +362,7 @@
 {% endblock %}
 {% block scripts %}
 <style>
+  #ef-expense-fields[hidden], #ef-direct-income[hidden], #ef-reopen[hidden] { display:none !important; }
   .tx-item .txn{ cursor:pointer; }
   .tx-item.open .chev{ transform:rotate(180deg); color:var(--ink); }
   .skrbox{ width:100%; text-align:left; border:1px solid var(--field-border); border-radius:9px; padding:6px 10px; background:var(--surface); cursor:pointer; }
@@ -394,8 +405,18 @@
   let bsSeg='expense';
   function bsSkrItems(){ return SPLIT_ACCOUNTS.map(a=>{ const i=a.indexOf(' - '); return {no:i>=0?a.slice(0,i):a, name:i>=0?a.slice(i+3):'', full:a}; }); }
   function bsAction(btn){ bsSeg=btn.dataset.a; document.querySelectorAll('.bs-seg').forEach(b=>b.classList.toggle('on', b===btn));
+    updateBookingFields(); }
+  function updateBookingFields(){
     document.getElementById('ef-inv-wrap').hidden = bsSeg!=='income';
-    document.getElementById('ef-erstattung-hint').hidden = !(window._efIncome && bsSeg==='expense'); }
+    document.getElementById('ef-erstattung-hint').hidden = !(window._efIncome && bsSeg==='expense');
+    {% if hosted %}
+    document.getElementById('ef-skr-wrap').hidden=bsSeg!=='expense';
+    document.getElementById('ef-expense-fields').hidden=bsSeg!=='expense';
+    {% endif %}
+    {% if direct_income %}
+    document.getElementById('ef-direct-income').hidden=bsSeg!=='income' || !window._efDirectIncome || Boolean(document.getElementById('ef-invoiceid').value);
+    {% endif %}
+  }
   function bsToggle(w){ const p=document.getElementById('ef-'+w+'-panel'); const o=document.getElementById('ef-'+(w==='skr'?'inv':'skr')+'-panel'); if(o)o.hidden=true;
     p.hidden=!p.hidden; if(!p.hidden && w==='skr'){ const q=document.getElementById('ef-skr-q'); q.value=''; bsSkrFilter(); setTimeout(()=>q.focus(),20); } }
   function bsSkrFilter(){ const q=(document.getElementById('ef-skr-q').value||'').toLowerCase(); const cur=document.getElementById('ef-category').value;
@@ -417,21 +438,45 @@
     document.getElementById('ef-vatkind').value = k;
     document.getElementById('ef-tax-hint').textContent = VK_HINT[k]||''; }
   function bsPickInv(id,label){ document.getElementById('ef-invoiceid').value=id; const l=document.getElementById('ef-inv-label');
-    l.textContent=label; l.style.color=id?'var(--ink)':'var(--ink-3)'; document.getElementById('ef-inv-panel').hidden=true; }
+    l.textContent=label; l.style.color=id?'var(--ink)':'var(--ink-3)'; document.getElementById('ef-inv-panel').hidden=true;
+    updateBookingFields(); }
+  {% if hosted %}
+  function bsReopen(){
+    document.getElementById('ef-action').value='offen';
+    document.getElementById('edit-form').submit();
+  }
+  {% endif %}
   function bsSubmit(){ let action;
     if(bsSeg==='expense'){ action='expense'; if(!document.getElementById('ef-category').value){ klarAlert('Bitte ein SKR-Konto wählen.'); return false; } }
-    else if(bsSeg==='income'){ action = document.getElementById('ef-invoiceid').value ? 'invoice' : 'einnahme_sonstige'; }
+    else if(bsSeg==='income'){
+      action = document.getElementById('ef-invoiceid').value ? 'invoice' : 'einnahme_sonstige';
+      {% if direct_income %}
+      const rate=document.getElementById('ef-income-rate').value;
+      if(action==='einnahme_sonstige' && window._efDirectIncome && rate!=='0') action='einnahme_ust'+rate;
+      {% endif %}
+    }
     else { action='privatentnahme'; }
     document.getElementById('ef-action').value=action; return true; }
   function openEdit(el){ const d=el.dataset;
     document.getElementById('edit-form').action = d.kind==='expense'
       ? '/expenses/'+d.eid+'/update' : '/zahlungen/tx/'+d.tid+'/set';
     document.getElementById('ef-txn').textContent=d.title||'';
-    window._efIncome = d.income==='1';                 // Eingang? -> „Betriebsausgabe" = Erstattung
-    bsSeg = d.action==='privatentnahme'?'private' : ((d.action==='invoice'||d.action==='einnahme_sonstige')?'income':'expense');
+    window._efIncome = d.income==='1';
+    window._efDirectIncome = window._efIncome && d.eur==='1';                 // Eingang? -> „Betriebsausgabe" = Erstattung
+    const directVat=d.action?.startsWith('einnahme_ust');
+    bsSeg = d.action==='privatentnahme'?'private' : ((d.action==='invoice'||d.action==='einnahme_sonstige'||directVat)?'income':'expense');
+    {% if hosted %}
+    if(!d.action && window._efIncome) bsSeg='income';
+    document.getElementById('ef-reopen').hidden=!directVat;
+    {% endif %}
+    {% if direct_income %}
+    const incomeRate=document.getElementById('ef-income-rate');
+    incomeRate.value=directVat?d.vat:'0';
+    incomeRate.dispatchEvent(new Event('change', {bubbles:true}));
+    {% endif %}
+    bsPickInv('', 'Rechnung wählen…');
     document.querySelectorAll('.bs-seg').forEach(b=>b.classList.toggle('on', b.dataset.a===bsSeg));
-    document.getElementById('ef-inv-wrap').hidden = bsSeg!=='income';
-    document.getElementById('ef-erstattung-hint').hidden = !(window._efIncome && bsSeg==='expense');
+    updateBookingFields();
     const full=d.cat||SPLIT_ACCOUNTS[0]||''; const i=full.indexOf(' - ');
     document.getElementById('ef-category').value=full;
     document.getElementById('ef-skr-no').textContent=i>=0?full.slice(0,i):full;

@@ -22,7 +22,9 @@
 </div>
 
 <div class="row" style="gap:3px;background:var(--surface);border:1px solid var(--line-2);padding:4px;border-radius:12px;margin-bottom:22px;display:inline-flex">
-  {% for id,label in [('appearance','Darstellung'),('preferences','Präferenzen'),('steuer','Steuer'),('llm','LLM'),('email','E-Mail'),('profile','Profil')] %}
+  {% set tabs = [('appearance','Darstellung'),('preferences','Präferenzen'),('steuer','Steuer')] %}
+  {% if not hosted %}{% set tabs = tabs + [('llm','LLM'),('email','E-Mail')] %}{% endif %}
+  {% for id,label in tabs + [('profile','Profil')] %}
   <button class="btn btn--sm settab" data-tab="{{ id }}" onclick="setTab('{{ id }}')" style="{{ '' if tab==id else 'background:transparent;color:var(--ink-2)' }}">{{ label }}</button>
   {% endfor %}
 </div>
@@ -134,6 +136,7 @@
   </div>
 </div>
 
+{% if not hosted %}
 {# ── LLM ── #}
 <div class="tabpane" data-pane="llm" hidden style="max-width:680px">
   <div class="card">
@@ -195,6 +198,8 @@
     </form>
   </div>
 </div>
+
+{% endif %}
 
 {# ── Profil ── #}
 <div class="tabpane" data-pane="profile" hidden style="max-width:640px">
