@@ -2016,6 +2016,24 @@ def _bank_observed_secondary_refs(row, by_day):
     return set.intersection(*({old.ref for old in by_day[group]} for group in groups)) if groups else set()
 
 
+def _defer_conflicting_bank_witnesses(options, cohorts):
+    for (old, _), contenders in cohorts.items():
+        dated = [row for row, rank in contenders if rank == 0 and _stored_secondary_match(row, old) is True]
+        described = [row for row, _ in contenders if _bank_description_matches(row, old)]
+        if len(dated) != 1 or len(described) != 1:
+            continue
+        date_ref, description_ref = dated[0]["ref"], described[0]["ref"]
+        if date_ref == description_ref or _stored_secondary_match(described[0], old) is not False:
+            continue
+        date_priority = options[date_ref][old.ref]
+        description_priority = options[description_ref][old.ref]
+        # Equal corroboration leaves the cached date and description in conflict.
+        # Tying these candidates allows a stronger match elsewhere to settle the overlap.
+        if date_priority[:3] == description_priority[:3]:
+            shared = max(date_priority, description_priority)
+            options[date_ref][old.ref] = options[description_ref][old.ref] = shared
+
+
 def _occupied_bank_reference(ref, row):
     identity = (ref, *(row[field] for field in _BANK_IDENTITY_FIELDS if field not in _BANK_SECONDARY_DATES))
     alternate = tuple(pair for pair in row["counterparty_ids"] if pair != ("IBAN", row["counterparty_iban"]))
@@ -2073,6 +2091,7 @@ def _bank_matches(conn, rows):
     by_provider = lookup("WHERE f.provider_ref = ?", {r["provider_ref"] for r in bank_rows if r["provider_ref"]})
     options = {}
     unconfirmed_payers = defaultdict(list)
+    cohorts = defaultdict(list)
     for row in bank_rows:
         # The stored posting date still matches after the bank drops the original value date.
         candidates = {old for old in by_provider.get(row["provider_ref"], ()) if old.booked_day in row["bank_groups"]}
@@ -2092,6 +2111,10 @@ def _bank_matches(conn, rows):
                   if (rank := _bank_match_rank(row, old, ref, source_refs)) is not None]
         options[row["ref"]] = {old.ref: _bank_candidate_priority(row, old, rank, source_refs, observed_refs)
                                for old, rank in ranked}
+        if row["_dated_ref"]:
+            for old, rank in ranked:
+                if rank < 6:
+                    cohorts[old, row["_dated_ref"]].append((row, rank))
         if row["counterparty_ids"] and row["creditor_ref"]:
             for old, rank in ranked:
                 if (rank == 6 and old.creditor_ref == row["creditor_ref"]
@@ -2109,6 +2132,7 @@ def _bank_matches(conn, rows):
                     row, old, 4, observed_refs=_bank_observed_secondary_refs(row, by_day),
                 )
 
+    _defer_conflicting_bank_witnesses(options, cohorts)
     matched = {}
     used = set()
     priorities = {priority for candidates in options.values() for priority in candidates.values() if priority is not None}

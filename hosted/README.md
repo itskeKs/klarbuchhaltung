@@ -38,13 +38,15 @@ dates and a newly supplied bank reference when it can identify an existing payme
 Different known balances, structured references or comparable counterparty account
 identifiers can distinguish separate payments, even when the bank reuses a reference.
 When two bookings with the same reference appear together, different known dates of
-the same kind can identify the separate payments and match later replays.
+the same kind can identify the separate payments and match later replays. A shared
+running balance and structured reference can corroborate a secondary-date correction.
 The ledger remembers account identifiers as fingerprints and learns missing evidence
 from later matches. Temporary transaction IDs help identify copies within one fetch.
 **Banking** flags conflicting memos and entries with multiple possible matches. Compare
 them with the statement. The next fetch retries them as the bank supplies more detail.
-Reauthorizing the same account preserves its payment history, including when the bank
-adds an IBAN.
+Reauthorizing the same account preserves its payment history when the bank adds an
+IBAN or reports a previously known primary account hash. If multiple accounts claim
+the same historical identity, Banking asks you to review the connection.
 
 When a consent expires, use **Bank verbinden** and complete consent again. **Verbindung
 trennen** stops imports for that connection. Its payments and their categories remain in

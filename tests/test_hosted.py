@@ -1010,6 +1010,67 @@ def test_fetch_local_invoice_reference_alone_keeps_distinct_known_dates():
         assert {row["transaction_day"] for row in rows} == {"2026-11-20", "2026-11-21"}
 
 
+@pytest.mark.parametrize("reverse", [True, False])
+def test_first_date_correction_and_new_payment_wait_on_conflicting_historical_evidence(sandbox, reverse):
+    import core
+
+    rent = bank_row(entry_reference="reused", booking_date="2026-11-23", transaction_date="2026-11-20",
+                    debtor_account={"iban": "DE00FIXTURE0001"}, remittance_information=["Rent"])
+    corrected = rent | {"transaction_date": "2026-11-19", "transaction_id": "rent", "reference_number": "INV-RENT"}
+    supplies = rent | {"transaction_id": "supplies", "remittance_information": ["Supplies"]}
+    debit = bank_row(entry_reference="debit", booking_date="2026-11-23", credit_debit_indicator="DBIT",
+                     transaction_amount={"currency": "EUR", "amount": "23.00"}, remittance_information=["Offset"])
+    batch = [supplies, corrected, debit] if reverse else [corrected, supplies, debit]
+    with closing(core.db()) as ledger:
+        rows, _ = transaction_rows("account-a", [rent, debit])
+        assert core.import_bank_rows(ledger, rows, auto_match=False)["imported"] == 2
+        core.set_tx_category(ledger, 1, "einnahme_sonstige")
+        original = tuple(ledger.execute("SELECT id, ref, description, category FROM transactions WHERE id = 1").fetchone())
+        for page in (batch, batch[::-1], batch):
+            rows, skipped = transaction_rows("account-a", page)
+            result = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True)
+            assert (result["imported"], skipped + result["ambiguous"]) == (0, 2)
+            assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (2, 96)
+            assert tuple(ledger.execute("SELECT id, ref, description, category FROM transactions WHERE id = 1").fetchone()) == original
+            assert ledger.execute("SELECT creditor_ref FROM bank_import_facts WHERE ref = ?", (original[1],)).fetchone()[0] is None
+
+        rows, _ = transaction_rows("account-a", [corrected, debit])
+        assert core.import_bank_rows(ledger, rows, auto_match=False)["imported"] == 0
+        for page, expected in ((batch, 1), (batch[::-1], 0), ([corrected, debit], 0), ([supplies, debit], 0)):
+            rows, skipped = transaction_rows("account-a", page)
+            result = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True)
+            assert (result["imported"], skipped + result["ambiguous"]) == (expected, 0)
+            assert [tuple(row) for row in ledger.execute("SELECT amount, description, category FROM transactions ORDER BY id")] == [
+                (119, "Rent", "einnahme_sonstige"), (-23, "Offset", "offen"), (119, "Supplies", "offen"),
+            ]
+
+
+@pytest.mark.parametrize("reverse", [True, False])
+@pytest.mark.parametrize("lookup_ids", [(None, None), ("first", "rotated"), (None, "new")])
+def test_independent_lookup_ids_do_not_split_corroborated_dated_copies(sandbox, reverse, lookup_ids):
+    import core
+
+    original = bank_row(entry_reference="reused", booking_date="2026-11-23", transaction_date="2026-11-20",
+                        transaction_id=lookup_ids[0], debtor_account={"iban": "DE00FIXTURE0001"},
+                        balance_after_transaction={"currency": "EUR", "amount": "119"}, reference_number="INV123")
+    corrected = original | {"transaction_date": "2026-11-21", "transaction_id": lookup_ids[1]}
+    debit = bank_row(entry_reference="debit", booking_date="2026-11-23", credit_debit_indicator="DBIT",
+                     transaction_amount={"currency": "EUR", "amount": "23.00"})
+    batch = [corrected, original, debit] if reverse else [original, corrected, debit]
+    with closing(core.db()) as ledger:
+        rows, skipped = transaction_rows("account-a", batch)
+        result = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True)
+        assert (result["imported"], skipped + result["ambiguous"]) == (2, 0)
+        core.set_tx_category(ledger, 1, "einnahme_sonstige")
+        saved = tuple(ledger.execute("SELECT id, ref, category FROM transactions WHERE id = 1").fetchone())
+        for page in (batch[::-1], [original, debit], [corrected, debit]):
+            rows, skipped = transaction_rows("account-a", page)
+            result = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True)
+            assert (result["imported"], skipped + result["ambiguous"]) == (0, 0)
+            assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (2, 96)
+            assert tuple(ledger.execute("SELECT id, ref, category FROM transactions WHERE id = 1").fetchone()) == saved
+
+
 def test_indistinguishable_dated_contenders_leave_old_booking_for_statement_review(sandbox):
     import core
 
@@ -1459,6 +1520,110 @@ def test_existing_iban_key_is_retained_after_reauthorization(sandbox):
     connect()
     assert service.consents()[0]["accounts"][0]["key"] == accounts[0]["key"]
     assert service.sync(force=True) == 0
+
+
+@pytest.mark.parametrize("reverse", [True, False])
+@pytest.mark.parametrize("history", ["active", "disconnected", "legacy-disconnected", "untyped"])
+def test_reconnect_uses_previous_primary_after_account_hash_rotation(sandbox, reverse, history):
+    import core
+    from hosted.bank_service import BankingService
+
+    previous_hash = ("W1siYWNjb3VudCIsImFjY291bnRfaWQiXV0=.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+                     if history == "legacy-disconnected" else "stable-bank-account")
+
+    class RotatedPrimary(StubProvider):
+        rotated = False
+
+        def request(self, method, path, *, query=None, data=None):
+            response = super().request(method, path, query=query, data=data)
+            if path == "/sessions":
+                account = response["accounts"][1]
+                account["identification_hash"] = previous_hash
+                if self.rotated:
+                    hashes = [previous_hash, "not-a-known-primary", "rotated-primary"]
+                    account["identification_hash"] = "rotated-primary"
+                    account["identification_hashes"] = hashes[::-1] if reverse else hashes
+            return response
+
+    callback = SITE + "/api/bank/callback"
+    service = BankingService(sandbox, sandbox, callback, client_factory=RotatedPrimary)
+    service.save_credentials(APP_ID, b"fixture-key")
+
+    def reconnect():
+        state = parse_qs(urlsplit(service.begin("login-a", "DE", BANK, "business")).query)["state"][0]
+        service.finish("login-a", state, "fixture-code", "")
+        return service.consents()[0]["accounts"][0]["key"]
+
+    account_key = reconnect()
+    assert service.sync(force=True) == 2
+    with closing(core.db()) as ledger:
+        core.set_tx_category(ledger, 1, "einnahme_sonstige")
+        original = [tuple(row) for row in ledger.execute("SELECT id, ref, amount, category FROM transactions ORDER BY id")]
+    if history in {"disconnected", "legacy-disconnected"}:
+        service.disconnect(SESSION)
+    if history in {"legacy-disconnected", "untyped"}:
+        with closing(service.connect()) as db, db:
+            db.execute("DROP TABLE IF EXISTS primary_account_aliases")
+    RotatedPrimary.rotated = True
+    service = BankingService(sandbox, sandbox, callback, client_factory=RotatedPrimary)
+    if history == "untyped":
+        with pytest.raises(BankingError, match="mehrdeutig"):
+            reconnect()
+        assert service.consents()[0]["accounts"][0]["key"] == account_key
+    else:
+        assert reconnect() == account_key
+    assert service.sync(force=True) == 0
+    assert service.sync(force=True) == 0
+    with closing(core.db()) as ledger:
+        assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (2, 96)
+        assert [tuple(row) for row in ledger.execute("SELECT id, ref, amount, category FROM transactions ORDER BY id")] == original
+
+
+@pytest.mark.parametrize("reverse", [True, False])
+@pytest.mark.parametrize("retain_primary", [True, False])
+def test_reconnect_does_not_share_one_historical_primary_across_current_accounts(sandbox, reverse, retain_primary):
+    import core
+    from hosted.bank_service import BankingService
+
+    second_uid = "11841a03-5418-4ec3-9c8a-16c88fcd0fd8"
+
+    class TwoCurrentAccounts(StubProvider):
+        reconnecting = False
+
+        def request(self, method, path, *, query=None, data=None):
+            if path == "/sessions" and self.reconnecting:
+                accounts = [{"uid": uid, "identification_hash": primary, "identification_hashes": ["stable-bank-account"]}
+                            for uid, primary in ((ACCOUNT, "stable-bank-account" if retain_primary else "rotated-first"),
+                                                 (second_uid, "new-second"))]
+                return {"session_id": SESSION, "accounts": accounts[::-1] if reverse else accounts}
+            if path == f"/accounts/{second_uid}/transactions":
+                return {"transactions": [bank_row(entry_reference="credit")]}
+            return super().request(method, path, query=query, data=data)
+
+    service = BankingService(sandbox, sandbox, SITE + "/api/bank/callback", client_factory=TwoCurrentAccounts)
+    service.save_credentials(APP_ID, b"fixture-key")
+
+    def reconnect():
+        state = parse_qs(urlsplit(service.begin("login-a", "DE", BANK, "business")).query)["state"][0]
+        service.finish("login-a", state, "fixture-code", "")
+        return {account["uid"]: account["key"] for account in service.consents()[0]["accounts"]}
+
+    original_key = reconnect()[ACCOUNT]
+    assert service.sync(force=True) == 2
+    TwoCurrentAccounts.reconnecting = True
+    if retain_primary:
+        keys = reconnect()
+        assert keys[ACCOUNT] == original_key and keys[second_uid] != original_key
+        assert service.sync(force=True) == 1
+        expected = (3, 215)
+    else:
+        with pytest.raises(BankingError, match="mehrdeutig"):
+            reconnect()
+        assert {account["key"] for account in service.consents()[0]["accounts"]} == {original_key}
+        expected = (2, 96)
+    assert service.sync(force=True) == 0
+    with closing(core.db()) as ledger:
+        assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == expected
 
 
 @pytest.mark.parametrize("entry_ref", ["credit", None])

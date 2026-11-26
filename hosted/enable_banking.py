@@ -129,10 +129,11 @@ def _balance_key(balance):
 
 _FINANCIAL_BOOKING_FACTS = ("balance_key", "creditor_ref", "reference_schema")
 _SECONDARY_BANK_DATES = core._BANK_SECONDARY_DATES
-_OPTIONAL_BOOKING_FACTS = (*_FINANCIAL_BOOKING_FACTS, "counterparty_iban", *_SECONDARY_BANK_DATES)
+_FIXED_BOOKING_FACTS = (*_FINANCIAL_BOOKING_FACTS, "counterparty_iban")
+_OPTIONAL_BOOKING_FACTS = (*_FIXED_BOOKING_FACTS, *_SECONDARY_BANK_DATES)
 _REFERENCE_COPY_FACTS = ("balance_key", "creditor_ref")
 _FETCH_COPY_FACTS = ("provider_ref", "booked_day", *_OPTIONAL_BOOKING_FACTS)
-_FETCH_FIXED_FACTS = tuple(field for field in _FETCH_COPY_FACTS if field not in _SECONDARY_BANK_DATES)
+_FETCH_FIXED_FACTS = ("provider_ref", "booked_day", *_FIXED_BOOKING_FACTS)
 
 
 def _optional_bank_day(value):
@@ -247,20 +248,29 @@ def _merge_copy_metadata(row, versions):
     row["_counterparty_names"] = frozenset().union(*(copy["_counterparty_names"] for copy in versions))
 
 
+def _dated_copies_conflict(first, second):
+    same_financial_facts = all(first[field] and first[field] == second[field] for field in _REFERENCE_COPY_FACTS)
+    fields = _FIXED_BOOKING_FACTS if same_financial_facts else _OPTIONAL_BOOKING_FACTS
+    return _conflicting_facts(first, second, fields)
+
+
 def _merge_dated_bookings(dated_ref, copies):
     """Combine compatible copies and keep payments with conflicting known facts separate."""
-    groups, unresolved = _compatible_copy_groups(copies, lambda a, b: _conflicting_facts(a, b, _OPTIONAL_BOOKING_FACTS))
+    groups, unresolved = _compatible_copy_groups(copies, _dated_copies_conflict)
 
     merged = []
     skipped = len({row["ref"] for row in unresolved})
     for versions in groups:
-        known = {field: row[field] for row in versions for field in _OPTIONAL_BOOKING_FACTS if row[field]}
+        known = {field: row[field] for row in versions for field in _FIXED_BOOKING_FACTS if row[field]}
+        for field in _SECONDARY_BANK_DATES:
+            known[field] = min((copy[field] for copy in versions if copy[field]), default=None)
         known["counterparty_ids"] = tuple(sorted({pair for copy in versions for pair in copy["counterparty_ids"]}))
         ref = _dated_booking_ref(dated_ref, known)
         row = min(versions, key=lambda version: (version["ref"] != ref, version["description"])) | known
         row["ref"] = ref
         row["booked_day"] = next((copy["booked_day"] for copy in versions if copy["booked_day"]), None)
         _merge_copy_metadata(row, versions)
+        row["prior_refs"].extend(copy["ref"] for copy in versions if copy["ref"] != ref)
         skipped += len({copy["description"] for copy in versions}) - 1
         merged.append(row)
     return sorted(merged, key=lambda row: row["ref"]), skipped

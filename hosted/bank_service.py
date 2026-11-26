@@ -1,4 +1,5 @@
 """Tenant-local credentials, consent and scheduled bank imports."""
+from base64 import b64decode
 from collections import Counter
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
@@ -21,10 +22,61 @@ from hosted.enable_banking import BankingError, EnableBanking, fingerprint, tran
 # Enable Banking is migrating its consent pages from tilisy to auth.
 CONSENT_HOSTS = {"auth.enablebanking.com", "tilisy.enablebanking.com"}
 RECONNECT = "Die Bankfreigabe ist abgelaufen. Verbinde das Konto erneut."
+AMBIGUOUS_ACCOUNT = "Die Kontokennung ist mehrdeutig. Prüfe die Bankverbindung."
 
 
 def utc_now():
     return datetime.now(timezone.utc)
+
+
+def _is_provider_account_hash(value):
+    """Recognize old provider hashes among aliases stored without their source type."""
+    try:
+        scheme, signature = value.split(".")
+        paths = json.loads(b64decode(scheme, altchars=b"-_", validate=True))
+        signature_bytes = b64decode(signature, altchars=b"-_", validate=True)
+    except ValueError:
+        return False
+    return (len(signature_bytes) == 32 and isinstance(paths, list)
+            and any(isinstance(path, list) and path[:2] == ["account", "account_id"] for path in paths))
+
+
+def _bind_accounts(db, accounts):
+    alias_counts = Counter(alias for account in accounts for alias in account["aliases"])
+    known_aliases = dict(db.execute("SELECT alias, account_key FROM account_aliases"))
+    primary_aliases = {row[0] for row in db.execute("SELECT alias FROM primary_account_aliases")}
+    direct = set()
+    for account in accounts:
+        account["aliases"] = [alias for alias in account["aliases"] if alias_counts[alias] == 1]
+        known = {known_aliases[alias] for alias in account["aliases"] if alias in known_aliases}
+        if not account["aliases"] or len(known) > 1 or known & direct:
+            raise BankingError(AMBIGUOUS_ACCOUNT)
+        if known:
+            account["key"] = next(iter(known))
+            direct.update(known)
+
+    claimed = set(direct)
+    for account in accounts:
+        if "key" in account:
+            continue
+        history = {alias: known_aliases[alias] for alias in account["history"]
+                   if alias in known_aliases and known_aliases[alias] not in direct}
+        trusted = {key for alias, key in history.items() if alias in primary_aliases or account["history"][alias]}
+        if len(trusted) > 1 or set(history.values()) != trusted:
+            raise BankingError(AMBIGUOUS_ACCOUNT)
+        key = next(iter(trusted), account["aliases"][0])
+        if key in claimed:
+            raise BankingError(AMBIGUOUS_ACCOUNT)
+        account["key"] = key
+        claimed.add(key)
+
+    for account in accounts:
+        primary = account.pop("primary")
+        aliases = account.pop("aliases")
+        account.pop("history")
+        db.executemany("INSERT OR IGNORE INTO account_aliases VALUES (?, ?)", ((alias, account["key"]) for alias in aliases))
+        if primary in aliases:
+            db.execute("INSERT OR IGNORE INTO primary_account_aliases VALUES (?)", (primary,))
 
 
 class BankingService:
@@ -45,6 +97,9 @@ class BankingService:
                 );
                 CREATE TABLE IF NOT EXISTS account_aliases (
                     alias TEXT PRIMARY KEY, account_key TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS primary_account_aliases (
+                    alias TEXT PRIMARY KEY
                 );
                 CREATE TABLE IF NOT EXISTS pending (
                     state TEXT PRIMARY KEY, login TEXT NOT NULL, expires INTEGER NOT NULL,
@@ -192,12 +247,16 @@ class BankingService:
                 except (KeyError, TypeError, ValueError, AttributeError):
                     continue
                 iban = (account.get("account_id") or {}).get("iban")
-                # Secondary provider hashes can be shared by distinct accounts.
-                identifiers = [account.get("identification_hash"), iban]
+                primary_hash = account.get("identification_hash")
+                primary = fingerprint(primary_hash) if isinstance(primary_hash, str) and primary_hash else None
+                identifiers = [primary_hash, iban]
                 aliases = list(dict.fromkeys(fingerprint(v) for v in identifiers if isinstance(v, str) and v))
                 if not aliases:
                     continue
-                accounts.append({"uid": uid, "aliases": aliases,
+                hashes = account.get("identification_hashes")
+                history = {fingerprint(value): _is_provider_account_hash(value) for value in hashes
+                           if isinstance(value, str) and value and value != primary_hash} if primary and isinstance(hashes, list) else {}
+                accounts.append({"uid": uid, "aliases": aliases, "primary": primary, "history": history,
                                  "label": (account.get("name") or account.get("product") or "Konto"),
                                  "suffix": iban[-4:] if iban else None})
             valid_until = (authorized.get("access") or {}).get("valid_until") or pending["valid_until"]
@@ -208,19 +267,7 @@ class BankingService:
             raise BankingError("Die Bank hat keine Konten freigegeben.")
         with closing(self.connect()) as db, db:
             db.execute("BEGIN IMMEDIATE")
-            alias_counts = Counter(alias for account in accounts for alias in account["aliases"])
-            for account in accounts:
-                aliases = [alias for alias in account.pop("aliases") if alias_counts[alias] == 1]
-                if not aliases:
-                    raise BankingError("Die Kontokennung ist mehrdeutig. Prüfe die Bankverbindung.")
-                known = {found[0] for alias in aliases for found in db.execute(
-                    "SELECT account_key FROM account_aliases WHERE alias = ?", (alias,)
-                )}
-                if len(known) > 1:
-                    raise BankingError("Die Kontokennung ist mehrdeutig. Prüfe die Bankverbindung.")
-                key = next(iter(known), aliases[0])
-                db.executemany("INSERT OR IGNORE INTO account_aliases VALUES (?, ?)", ((a, key) for a in aliases))
-                account["key"] = key
+            _bind_accounts(db, accounts)
             previous = db.execute(
                 "SELECT id FROM consents WHERE bank = ? AND country = ? AND psu_type = ?",
                 (pending["bank"], pending["country"], pending["psu_type"]),
