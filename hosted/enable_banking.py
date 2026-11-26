@@ -4,7 +4,7 @@ from collections import Counter, defaultdict
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from http.client import HTTPException, HTTPSConnection
-from itertools import combinations
+from itertools import combinations, islice, product
 import json
 import re
 import time
@@ -138,6 +138,7 @@ _FETCH_FIXED_FACTS = ("provider_ref", "booked_day", *_FIXED_BOOKING_FACTS)
 _STATEMENT_IDENTITY_FACTS = ("provider_ref", "creditor_ref", "reference_schema")
 _STATEMENT_OBSERVATION_FACTS = (*_FETCH_COPY_FACTS, "counterparty_ids", "_counterparty_names",
                                 "_transaction_id", "_statement_balance")
+_STATEMENT_PLACEMENT_BUDGET = 128
 
 
 def _optional_bank_day(value):
@@ -262,6 +263,8 @@ def _merge_copy_metadata(row, versions):
 def _statement_copies_conflict(first, second):
     if first is second:
         return False
+    if first.get("_statement_independent") and second.get("_statement_independent"):
+        return True
     current_lookup_matches = first["_transaction_id"] and first["_transaction_id"] == second["_transaction_id"]
     if not (first["provider_ref"] or second["provider_ref"] or current_lookup_matches):
         return True
@@ -416,10 +419,12 @@ def _statement_day_closings(currency, movements, openings, *, anchored, backward
     return closings, complete
 
 
-def _statement_observe(movements, row, day):
+def _statement_observe(movements, row, day, *, independent=False):
     identity = tuple(row[fact] for fact in _STATEMENT_OBSERVATION_FACTS)
-    if not row["provider_ref"] and not row["_transaction_id"]:
+    if independent or not (row["provider_ref"] or row["_transaction_id"]):
         identity += (row["_statement_sources"],)
+    if independent:
+        row = row | {"_statement_independent": True}
     movements[day][Decimal(row["amount"])][identity] = row
 
 
@@ -433,7 +438,7 @@ def _statement_trail(currency, observations, candidates, interval, *, entering=N
     anchored = any(row["_statement_balance"] and row["_statement_balance"][0] == currency
                    for day, rows in observations.items() if first_day <= day <= last_day for row in rows)
     for day, row in candidates:
-        _statement_observe(movements, row, day)
+        _statement_observe(movements, row, day, independent=True)
     for checkpoint in (entering, leaving):
         if checkpoint is not None:
             movements.setdefault(checkpoint[0], {})
@@ -465,6 +470,75 @@ def _statement_evidence(row):
     return row | {field: value for field, value in facts.items() if row[field] is None} if facts else row
 
 
+def _statement_observations(account_rows, sources, currency):
+    observations = {}
+    dates = ("booked_day", *_SECONDARY_BANK_DATES)
+    for index, row in enumerate(account_rows):
+        if index in sources or row["currency"] != currency or not Decimal(row["amount"]):
+            continue
+        row = _statement_evidence(row)
+        provenance = row["_statement_sources"]
+        previous = observations.get(provenance)
+        if previous is None:
+            observations[provenance] = row
+        else:
+            observations[provenance] = previous | {field: row[field] for field in dates if row[field] and not previous[field]}
+    return list(observations.values())
+
+
+def _statement_other_versions(observations):
+    """Keep date alternatives in the same proof, without asking which the ledger would import."""
+    by_identity = defaultdict(list)
+    date_fields = ("booked_day", *_SECONDARY_BANK_DATES)
+    for row in observations:
+        identity = tuple(row[field] for field in ("provider_ref", *_REFERENCE_COPY_FACTS))
+        if all(identity):
+            by_identity[identity].append(row)
+    cohorts = []
+    for variants in by_identity.values():
+        if len(variants) > 1 and all(
+            not _conflicting_facts(first, second, _FIXED_BOOKING_FACTS)
+            and _conflicting_facts(first, second, date_fields)
+            for first, second in combinations(variants, 2)
+        ):
+            cohorts.append(tuple(variants))
+    return cohorts
+
+
+def _statement_version_choices(cohort, field):
+    versions = tuple((row[field], row) for row in cohort)
+    choices = (choice for count in range(len(versions), 0, -1) for choice in combinations(versions, count))
+    return tuple(islice(choices, _STATEMENT_PLACEMENT_BUDGET + 1))
+
+
+def _statement_search(currency, observed, candidates, other_versions, floating, interval, *,
+                      entering=None, leaving=None, backwards=False, find_any=False):
+    """Return proven boundary balances and whether every placement was checked."""
+    budget = _STATEMENT_PLACEMENT_BUDGET
+    days = sorted(set(observed) | {day for day, _ in candidates}
+                  | {day for options in other_versions for version in options for day, _ in version if day})
+    balances = set()
+    complete = True
+    for other in product(*other_versions):
+        conditional = [item for version in other for item in version]
+        fixed = (*candidates, *((day, row) for day, row in conditional if day))
+        undated = [*floating, *(row for day, row in conditional if not day)]
+        for slots in product(days, repeat=len(undated)):
+            if not budget:
+                return balances, False
+            budget -= 1
+            # Slots are possible positions in the proof, never inferred dates
+            # written to the booking or copied from another date field.
+            world = (*fixed, *zip(slots, undated))
+            result, checked = _statement_trail(currency, observed, world, interval,
+                                               entering=entering, leaving=leaving, backwards=backwards)
+            if result is None or (find_any and result):
+                return result, checked
+            balances.update(result)
+            complete &= checked
+    return balances, complete
+
+
 def _statement_variants(first, second, account_rows, date_fields=_SECONDARY_BANK_DATES):
     """Return supported version indexes, an ambiguous empty tuple, or no evidence."""
     first, second = _statement_evidence(first), _statement_evidence(second)
@@ -474,37 +548,60 @@ def _statement_variants(first, second, account_rows, date_fields=_SECONDARY_BANK
     amount = Decimal(first["amount"])
     if currency != first["currency"] or not amount:
         return None
+    if not _conflicting_facts(first, second, date_fields):
+        return None
     sources = first["_statement_sources"] | second["_statement_sources"]
+    observations = _statement_observations(account_rows, sources, currency)
+    cohorts = _statement_other_versions(observations)
+    competing_sources = {row["_statement_sources"] for version in cohorts for row in version}
+    fixed = [row for row in observations if row["_statement_sources"] not in competing_sources]
     supported = set()
-    for field in date_fields:
+    direct = False
+    inconsistent = False
+    axes = (*date_fields, "booked_day") if "booked_day" not in date_fields else date_fields
+    for field in axes:
         days = (first[field], second[field])
-        if not all(days) or days[0] == days[1]:
+        if not all(days):
             continue
-        start, end = sorted(days)
-        observations = defaultdict(list)
-        for index, row in enumerate(account_rows):
-            day = row[field]
-            if day and row["currency"] == currency and index not in sources and Decimal(row["amount"]):
-                observations[day].append(row)
+        dated = defaultdict(list)
+        floating = []
+        for row in fixed:
+            if row[field]:
+                dated[row[field]].append(row)
+            else:
+                floating.append(row)
+        others = [_statement_version_choices(cohort, field) for cohort in cohorts]
+        alternate_days = [row[field] for cohort in cohorts for row in cohort if row[field]]
+        start, end = min(*days, *alternate_days), max(*days, *alternate_days)
         versions = ((days[0], first), (days[1], second))
         inside = start, end
-        local_closings, closed_completely = _statement_trail(currency, observations, versions, inside)
-        if not local_closings:
-            continue
-        anchored_days = [day for day, rows in observations.items()
+        anchored_days = [day for day, rows in dated.items()
                          if any(row["_statement_balance"] and row["_statement_balance"][0] == currency for row in rows)]
-        has_prior = any(day < start for day in anchored_days)
-        has_following = any(day > end for day in anchored_days)
+        prior = any(day < start for day in anchored_days)
+        following = any(day > end for day in anchored_days)
+        undated = bool(floating) or any(row[field] is None for cohort in cohorts for row in cohort)
+        if undated and not (prior and following):
+            continue
+        if start == end and not (prior and following):
+            continue
+        has_prior = prior or (start in anchored_days and any(row["_statement_balance"] is None for row in dated[start]))
+        has_following = following or (end in anchored_days and any(row["_statement_balance"] is None for row in dated[end]))
+        if not undated:
+            local_closings, closed_completely = _statement_search(currency, dated, versions, others, floating, inside)
+            if not local_closings:
+                continue
         if not (has_prior or has_following):
-            supported.add((0, 1))
+            direct = True
             continue
 
-        # Compare alternatives under the same boundaries. In the absence of
-        # a surrounding balance on one side, keep the dated trail's boundary
-        # there so deleting an endpoint cannot invent a new opening/closing.
+        # Preserve the observed local opening unless an earlier reported
+        # balance provides it independently. A local closing is needed only
+        # when the trailing statement gives no separate balance evidence.
         entering = leaving = None
-        if not has_prior:
-            local_openings, opened_completely = _statement_trail(currency, observations, versions, inside, backwards=True)
+        if not prior:
+            local_openings, opened_completely = _statement_search(
+                currency, dated, versions, others, floating, inside, backwards=True,
+            )
             if not opened_completely or not local_openings:
                 supported.add(())
                 continue
@@ -515,9 +612,10 @@ def _statement_variants(first, second, account_rows, date_fields=_SECONDARY_BANK
                 continue
             leaving = end, local_closings
 
-        interval = min(start, min(observations)), max(end, max(observations))
+        interval = min(start, min(dated)), max(end, max(dated))
         alternatives = tuple(
-            _statement_fit(_statement_trail(currency, observations, candidate, interval, entering=entering, leaving=leaving))
+            _statement_fit(_statement_search(currency, dated, candidate, others, floating, interval,
+                                             entering=entering, leaving=leaving, find_any=True))
             for candidate in (versions, (versions[0],), (versions[1],))
         )
         if alternatives == (True, False, False):
@@ -526,11 +624,15 @@ def _statement_variants(first, second, account_rows, date_fields=_SECONDARY_BANK
             supported.add((0,))
         elif alternatives == (False, False, True):
             supported.add((1,))
+        elif alternatives == (False, False, False):
+            inconsistent = True
         else:
             supported.add(())
     if len(supported) == 1:
         return next(iter(supported))
-    return () if supported else None
+    if supported or inconsistent:
+        return ()
+    return (0, 1) if direct else None
 
 
 def _balance_repeats(first, second, account_rows):

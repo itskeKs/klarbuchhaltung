@@ -1082,7 +1082,7 @@ def test_independent_lookup_ids_do_not_split_corroborated_dated_copies(sandbox, 
     "sparse-first-day-fee", "posting-sparse-last-day-fee", "posting-complete-and-sparse-last-day-fee",
     "posting-sparse-boundary-fees",
     "anchored-first-gap", "anchored-last-gap", "posting-anchored-inner-gap", "posting-anchored-distinct-days",
-    "anchored-two-gaps",
+    "anchored-two-gaps", "anchored-two-gaps-anchor-day",
     "parallel-unreferenced",
 ])
 def test_intervening_booked_movement_distinguishes_repeated_statement_balances(sandbox, sign, seed, reverse, evidence):
@@ -1140,6 +1140,7 @@ def test_intervening_booked_movement_distinguishes_repeated_statement_balances(s
             "anchored-inner-gap": [("20", 50, 69), ("20", 10, None), ("20", 10, None), ("20", 49, 0)],
             "anchored-distinct-days": [("19", 50, None), ("20", 49, 20), ("21", 20, None)],
             "anchored-two-gaps": [("20", 30, 89), ("20", 10, None), ("20", 40, 39), ("20", 20, None), ("20", 19, 0)],
+            "anchored-two-gaps-anchor-day": [("19", 20, None), ("19", 30, 69), ("19", 10, None), ("19", 59, 0)],
         }
         adjustments = [
             adjustment | {"entry_reference": f"reversal-{index}", "transaction_id": f"reversal-{index}",
@@ -1328,7 +1329,7 @@ def test_neighboring_statement_balance_can_prove_a_single_corrected_booking(
 
 
 @pytest.mark.parametrize("day_field", ["booking_date", "transaction_date"])
-@pytest.mark.parametrize("context", ["before", "after", "long-after"])
+@pytest.mark.parametrize("context", ["before", "after", "long-after", "end-day"])
 @pytest.mark.parametrize("outcome,seed", [
     ("one", False), ("one", True), ("one", "both"), ("one", "alternate"),
     ("two", False), ("two", True), ("ambiguous", False), ("ambiguous", True),
@@ -1363,7 +1364,8 @@ def test_statement_context_compares_both_payment_counts_without_dropping_sparse_
     first = payment(19, 119, 119, "rent", "Rent")
     second = payment(21, 119, 119, "rent", "Rent")
     reversal = payment(20, -119, 0, "reversal", "Reversal")
-    neighbors = [payment(22, 119, None, "supplies", "Supplies"), payment(22, -23, 96, "fee", "Fee")]
+    boundary = 21 if context == "end-day" else 22
+    neighbors = [payment(boundary, 119, None, "supplies", "Supplies"), payment(boundary, -23, 96, "fee", "Fee")]
     net = 96
     if context == "long-after":
         for day in (23, 24):
@@ -1427,6 +1429,78 @@ def test_statement_context_compares_both_payment_counts_without_dropping_sparse_
             assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (
                 expected_count, net * ledger_sign,
             )
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+@pytest.mark.parametrize("variant", ["missing-secondary", "missing-primary", "unanchored", "parallel", "one-witness"])
+@pytest.mark.parametrize("seed", [True, False])
+def test_reported_balance_order_resolves_missing_dates_and_coupled_versions(sandbox, sign, variant, seed):
+    import core
+
+    def movement(day, change, balance, ref, *, booking_day=None, value_day=None, lookup=None):
+        change *= sign
+        return bank_row(booking_date=booking_day or f"2026-11-{day:02}",
+                        transaction_date=f"2026-11-{day:02}", value_date=value_day or f"2026-11-{day:02}",
+                        transaction_amount={"amount": str(abs(change)), "currency": "EUR"},
+                        credit_debit_indicator="CRDT" if change > 0 else "DBIT",
+                        balance_after_transaction={"currency": "EUR", "amount": str(sign * balance)},
+                        debtor_account={"iban": "DE00PAYER"}, creditor_account={"iban": "DE00PAYEE"},
+                        entry_reference=ref, reference_number=ref, transaction_id=lookup or ref,
+                        remittance_information=[ref])
+
+    first = movement(19, 119, 119, "rent", lookup="rent-a")
+    second = movement(21, 119, 119, "rent", lookup="rent-b")
+    reversal = movement(20, -119, 0, "reversal")
+    opening = movement(18, 10, 0, "opening")
+    fee = movement(23, -23, 96, "fee")
+    if variant == "missing-secondary":
+        first["booking_date"] = second["booking_date"] = reversal["booking_date"] = "2026-11-22"
+        reversal["value_date"] = reversal["transaction_date"] = None
+    elif variant in {"missing-primary", "unanchored"}:
+        first["transaction_date"] = second["transaction_date"] = "2026-11-18"
+        first["value_date"] = second["value_date"] = "2026-11-18"
+        reversal["booking_date"] = reversal["transaction_date"] = None
+    adjustments = [reversal]
+    expected = (5, 106, False)
+    batch = [opening, first, reversal, second, fee]
+    if variant in {"parallel", "one-witness"}:
+        for row in (first, second, fee):
+            row["booking_date"] = "2026-11-23"
+        first["value_date"] = second["value_date"] = "2026-11-17"
+        adjustments = [
+            movement(20, 20, 139, "witness", booking_day="2026-11-23", value_day="2026-11-19", lookup="witness-a"),
+            movement(20, 20, 139, "witness", booking_day="2026-11-23", value_day="2026-11-20", lookup="witness-b"),
+            movement(20, -139, 0, "clear", booking_day="2026-11-23"),
+        ]
+        if variant == "parallel":
+            adjustments.append(movement(20, -20, 119, "return", booking_day="2026-11-23"))
+        batch = [first, *adjustments, second, fee]
+        expected = (7 if variant == "parallel" else 5, 96, False)
+    elif variant == "unanchored":
+        batch.remove(opening)
+        expected = (3 if seed else 2, -23 if seed else -142, True)
+
+    with closing(core.db()) as ledger:
+        def sync(rows):
+            mapped, skipped = transaction_rows("account-a", rows)
+            result = core.import_bank_rows(ledger, mapped, auto_match=False, require_fx=True)
+            return result["imported"], skipped + result["ambiguous"]
+
+        saved = None
+        if seed:
+            assert sync([first])[0] == 1
+            saved = tuple(ledger.execute("SELECT id, ref, date FROM transactions WHERE description = 'rent'").fetchone())
+            core.set_tx_category(ledger, saved[0], "einnahme_sonstige")
+        for page in (batch[::-1] if seed else batch, batch if seed else batch[::-1]):
+            _, warnings = sync(page)
+            assert bool(warnings) == expected[2]
+            assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (
+                expected[0], expected[1] * sign,
+            )
+            if saved:
+                assert tuple(ledger.execute(
+                    "SELECT id, ref, date, category FROM transactions WHERE id = ?", (saved[0],),
+                ).fetchone()) == (*saved, "einnahme_sonstige")
 
 
 @pytest.mark.parametrize("mode", ["initial", "singleton", "overlap"])
