@@ -1503,6 +1503,90 @@ def test_reported_balance_order_resolves_missing_dates_and_coupled_versions(sand
                 ).fetchone()) == (*saved, "einnahme_sonstige")
 
 
+@pytest.mark.parametrize("scenario,stored", [
+    ("shifted", "new"), ("shifted", "early"), ("shifted", "alternate"),
+    ("shifted-late", "new"), ("shifted-late", "early"), ("shifted-late", "alternate"),
+    ("same-day", "new"), ("same-day", "early"), ("same-day", "late"),
+    ("different-days", "new"), ("different-days", "early"),
+    ("repeated", "new"), ("repeated", "early"), ("repeated-separate-days", "new"),
+    ("four", "new"), ("corrections", "new"),
+])
+@pytest.mark.parametrize("direction", [-1, 1])
+@pytest.mark.parametrize("lookup", [False, True])
+def test_statement_subject_cohort_respects_cardinality_and_posting_date(sandbox, scenario, stored, direction, lookup):
+    import core
+
+    def movement(day, amount, balance, ref, lookup_id=None):
+        amount *= direction
+        booked_day = 26 if ref == "rent" and scenario in {"same-day", "repeated", "corrections", "four"} else day
+        return bank_row(booking_date=f"2026-11-{booked_day:02}", value_date=f"2026-11-{day:02}",
+                        transaction_date=f"2026-11-{day:02}", entry_reference=ref, reference_number=ref,
+                        transaction_id=(lookup_id or ref) if lookup else None, remittance_information=[ref],
+                        debtor_account={"iban": "DE00PAYER"}, creditor_account={"iban": "DE00PAYEE"},
+                        transaction_amount={"amount": str(abs(amount)), "currency": "EUR"},
+                        credit_debit_indicator="CRDT" if amount > 0 else "DBIT",
+                        balance_after_transaction={"amount": str(direction * balance), "currency": "EUR"})
+
+    first = movement(19, 119, 119, "rent", "rent-a")
+    second = movement(21, 119, 119, "rent", "rent-a" if scenario.startswith("shifted") else "rent-b")
+    third = movement(23 if scenario.startswith("repeated") else 22, 119, 119, "rent", "rent-c")
+    reversal = movement(20, -119, 0, "reversal")
+    fee = movement(24, -23, 96, "fee")
+    opening = movement(18, 10, 0, "opening")
+    if scenario in {"shifted", "corrections"}:
+        fee = movement(20, -23, 96, "fee")
+        batch = [opening, first, fee, second] + ([third] if scenario == "corrections" else [])
+        count, net, warn = 3, 106, False
+    elif scenario == "shifted-late":
+        opening = movement(18, 10, 119, "opening")
+        fee = movement(20, -119, 0, "fee")
+        batch = [opening, first, fee, second]
+        count, net, warn = 3, 10, False
+    elif scenario.startswith("repeated"):
+        next_reversal = movement(22, -119, 0, "next reversal")
+        batch = [first, reversal, second, next_reversal, third, fee]
+        count, net, warn = 6, 96, False
+    else:
+        batch = [first, reversal, second, third, fee]
+        if scenario == "four":
+            batch.insert(-1, movement(23, 119, 119, "rent", "rent-d"))
+        count, net, warn = (3, -23, True) if scenario == "different-days" else (4, 96, True)
+
+    with closing(core.db()) as ledger:
+        def sync(page):
+            rows, skipped = transaction_rows("account-a", page)
+            result = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True)
+            return result["imported"], skipped + result["ambiguous"]
+
+        if stored == "early":
+            assert sync([first]) == (1, 0)
+        elif stored == "late":
+            assert sync([first, reversal, third, fee]) == (4, 0)
+        elif stored == "alternate":
+            assert sync([second]) == (1, 0)
+        if (scenario, stored) in {("shifted", "alternate"), ("shifted-late", "early")}:
+            warn = True
+        rent_rows = "SELECT id, ref, date FROM transactions WHERE description = 'rent' ORDER BY id"
+        saved = [tuple(row) for row in ledger.execute(rent_rows)]
+        for booking_id, _, _ in saved:
+            core.set_tx_category(ledger, booking_id, "einnahme_sonstige")
+        duplicates = [first | {"balance_after_transaction": None}, *batch, batch[-1],
+                      second | {"reference_number": None}]
+        pages = (batch, batch[::-1], duplicates) if not lookup else (duplicates, batch[::-1], batch)
+        for page in pages:
+            _, warnings = sync(page)
+            assert bool(warnings) == warn
+            assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (count, net * direction)
+            for booking_id, booking_ref, booked_day in saved:
+                assert tuple(ledger.execute(
+                    "SELECT id, ref, date, category FROM transactions WHERE id = ?", (booking_id,),
+                ).fetchone()) == (booking_id, booking_ref, booked_day, "einnahme_sonstige")
+        if scenario == "same-day":
+            assert sync([first, second, fee])[0] == 0
+            assert sync([first, third, fee])[0] == 0
+            assert len(list(ledger.execute(rent_rows))) == 2
+
+
 @pytest.mark.parametrize("mode", ["initial", "singleton", "overlap"])
 @pytest.mark.parametrize("reverse", [False, True])
 @pytest.mark.parametrize("omitted", [(), ("debtor_account",), ("reference_number",),

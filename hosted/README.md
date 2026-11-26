@@ -48,6 +48,8 @@ and transaction dates separate and uses reported balances to place movements
 with missing dates in possible sequences. Surrounding balances can show
 which of two bank versions fits the statement. When those balances leave both
 counts possible, **Banking** asks for review before adding a second payment.
+For several versions, the statement can establish how many payments share a
+reported posting day even when their secondary dates remain unclear.
 If a later statement contradicts a payment already in the ledger, **Banking**
 flags it and keeps the posted payment and category.
 The ledger remembers account identifiers as fingerprints and learns missing evidence

@@ -1980,6 +1980,8 @@ def _bank_posting_conflict(row, same_reference):
     known_dates = {old.booked_day for old in same_reference if old.booked_day and _bank_corroborates(row, old._asdict())}
     if row["booked_day"] in known_dates:
         return False
+    if row.get("_statement_rejections") and _bank_rejected_statement_booking(row, None, same_reference, posting_date=True):
+        return True
     peers = row.get("_booked_date_peers", {})
     return any(not peers.get(day, False) for day in known_dates | peers.keys())
 
@@ -1989,11 +1991,13 @@ def _stored_secondary_match(row, old):
                                  (getattr(old, field) for field in _BANK_SECONDARY_DATES))
 
 
-def _bank_rejected_statement_booking(row, matched_ref, recorded):
+def _bank_rejected_statement_booking(row, matched_ref, recorded, *, posting_date=False):
     for old in recorded:
         if old.ref == matched_ref:
             continue
         for ref, dates in row.get("_statement_rejections", ()):
+            if posting_date and not any(field == "booked_day" for field, _ in dates):
+                continue
             if ref == old.ref:
                 return True
             observed_dates = [(getattr(old, field), day) for field, day in dates if getattr(old, field)]
