@@ -136,6 +136,8 @@ _REFERENCE_COPY_FACTS = ("balance_key", "creditor_ref")
 _FETCH_COPY_FACTS = ("provider_ref", "booked_day", *_OPTIONAL_BOOKING_FACTS)
 _FETCH_FIXED_FACTS = ("provider_ref", "booked_day", *_FIXED_BOOKING_FACTS)
 _STATEMENT_IDENTITY_FACTS = ("provider_ref", "creditor_ref", "reference_schema")
+_STATEMENT_OBSERVATION_FACTS = (*_FETCH_COPY_FACTS, "counterparty_ids", "_counterparty_names",
+                                "_transaction_id", "_statement_balance")
 
 
 def _optional_bank_day(value):
@@ -254,23 +256,49 @@ def _merge_copy_metadata(row, versions):
                                          if copy["balance_key"] == row["balance_key"])
 
 
-def _statement_day_span(currency, movements):
+def _statement_copies_conflict(first, second):
+    if first["_statement_balance"] is not None and second["_statement_balance"] is not None:
+        return (first["_statement_balance"] != second["_statement_balance"]
+                or _conflicting_facts(first, second, _STATEMENT_IDENTITY_FACTS))
+    if first is second:
+        return False
+    if _conflicting_facts(first, second, _FETCH_COPY_FACTS):
+        return True
+    if first["provider_ref"] and first["provider_ref"] == second["provider_ref"]:
+        return False
+    if _conflicting_counterparties(first, second):
+        return True
+    current_lookup_matches = first["_transaction_id"] and first["_transaction_id"] == second["_transaction_id"]
+    remittance_matches = (first["creditor_ref"] and first["creditor_ref"] == second["creditor_ref"]
+                          and (first["provider_ref"] or second["provider_ref"]))
+    return not (current_lookup_matches or remittance_matches)
+
+
+def _statement_day_balances(movements, boundary):
+    for amount, observations in movements.items():
+        groups, unresolved = _compatible_copy_groups(list(observations.values()), _statement_copies_conflict)
+        for versions in groups:
+            ending = next((row["_statement_balance"] for row in versions if row["_statement_balance"] is not None), None)
+            if ending is not None or not boundary:
+                yield amount, ending
+        for row in unresolved:
+            if row["_statement_balance"] is not None or not boundary:
+                yield amount, None
+
+
+def _statement_day_span(currency, movements, *, boundary):
     """Return valid opening balances and the closing balance, if fixed."""
     net = Counter()
     neighbors = defaultdict(set)
-    for (amount, ending), observations in movements.items():
+    # A movement with an unknown balance can precede the first day's trail
+    # or follow the last day's trail. It cannot establish an interior link.
+    for amount, ending in _statement_day_balances(movements, boundary):
         if ending is None or ending[0] != currency:
             return set(), None
         after = ending[1]
         before = after - amount
-        # Conflicting known identities prove parallel movements, while an
-        # additional sparse copy cannot establish another edge.
-        identities = list(observations.values())
-        groups, _ = _compatible_copy_groups(
-            identities, lambda first, second: _conflicting_facts(first, second, _STATEMENT_IDENTITY_FACTS),
-        )
-        net[before] += len(groups)
-        net[after] -= len(groups)
+        net[before] += 1
+        net[after] -= 1
         neighbors[before].add(after)
         neighbors[after].add(before)
     if not neighbors:
@@ -311,8 +339,8 @@ def _balance_repeats(first, second, account_rows, date_fields=_SECONDARY_BANK_DA
         movements = defaultdict(lambda: defaultdict(dict))
 
         def observe(day, change, row):
-            identity = tuple(row[fact] for fact in _STATEMENT_IDENTITY_FACTS) + (row["counterparty_ids"],)
-            movements[day][change, row["_statement_balance"]][identity] = row
+            identity = tuple(row[fact] for fact in _STATEMENT_OBSERVATION_FACTS)
+            movements[day][change][identity] = row
 
         for index, row in enumerate(account_rows):
             day = row[field]
@@ -324,7 +352,7 @@ def _balance_repeats(first, second, account_rows, date_fields=_SECONDARY_BANK_DA
             observe(row[field], amount, row)
         openings = None
         for day in sorted(movements):
-            starts, finish = _statement_day_span(currency, movements[day])
+            starts, finish = _statement_day_span(currency, movements[day], boundary=day in days)
             feasible = starts if openings is None else starts & openings
             if not feasible:
                 break
@@ -415,7 +443,7 @@ def _merge_fetch_copies(account_key, rows):
     """Use the current lookup ID within one account fetch, before numbering source occurrences."""
     batches = defaultdict(list)
     for index, row in enumerate(rows):
-        lookup_id = row.pop("_transaction_id")
+        lookup_id = row["_transaction_id"]
         group = (lookup_id, row["_amount_key"], row["currency"]) if lookup_id else (index,)
         batches[group].append(row)
 
@@ -652,4 +680,5 @@ def transaction_rows(account_key, transactions):
     for row in rows:
         del row["_statement_balance"]
         del row["_statement_sources"]
+        del row["_transaction_id"]
     return rows, skipped + warnings

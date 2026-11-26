@@ -1078,6 +1078,9 @@ def test_independent_lookup_ids_do_not_split_corroborated_dated_copies(sandbox, 
     "one-movement", "two-movements", "shared-lookup-and-two-movements", "copy-adds-balance", "posting-dates",
     "early-reversal", "late-reversal", "cycle", "parallel-cycle", "parallel-reused-reference",
     "posting-early-reversal", "posting-late-reversal", "posting-cycle",
+    "sparse-reversal", "posting-sparse-reversal", "sparse-reversal-no-entry", "posting-sparse-reversal-no-lookup",
+    "sparse-first-day-fee", "posting-sparse-last-day-fee", "posting-complete-and-sparse-last-day-fee",
+    "posting-sparse-boundary-fees",
 ])
 def test_intervening_booked_movement_distinguishes_repeated_statement_balances(sandbox, sign, seed, reverse, evidence):
     import core
@@ -1113,6 +1116,20 @@ def test_intervening_booked_movement_distinguishes_repeated_statement_balances(s
     if evidence == "copy-adds-balance":
         versions = [first | {"balance_after_transaction": None}, first | {"entry_reference": None}]
     trail = evidence.removeprefix("posting-")
+    if trail == "sparse-first-day-fee":
+        offset.update(value_date="2026-11-19", transaction_date="2026-11-19", balance_after_transaction=None)
+    if trail in {"sparse-last-day-fee", "complete-and-sparse-last-day-fee"}:
+        offset.update(value_date="2026-11-21", transaction_date="2026-11-21")
+        if trail == "sparse-last-day-fee":
+            offset["balance_after_transaction"] = None
+    offsets = [offset]
+    if trail == "sparse-boundary-fees":
+        offsets = [
+            offset | {"entry_reference": "first-fee", "value_date": "2026-11-19", "transaction_date": "2026-11-19",
+                      "transaction_amount": {"amount": "10", "currency": "EUR"}, "balance_after_transaction": None},
+            offset | {"entry_reference": "last-fee", "value_date": "2026-11-21", "transaction_date": "2026-11-21",
+                      "transaction_amount": {"amount": "13", "currency": "EUR"}, "balance_after_transaction": None},
+        ]
     if trail == "early-reversal":
         adjustment.update(value_date="2026-11-19", transaction_date="2026-11-19")
         offset.update(value_date="2026-11-19", transaction_date="2026-11-19",
@@ -1140,12 +1157,22 @@ def test_intervening_booked_movement_distinguishes_repeated_statement_balances(s
     if evidence.startswith("posting-"):
         date_field = "date"
         shared_dates = {"transaction_date": "2026-11-17", "value_date": "2026-11-18"}
-        for row in (first, *adjustments, second, offset):
+        for row in (first, *adjustments, second, *offsets):
             row["booking_date"] = row["transaction_date"]
         first.update(shared_dates)
         second.update(shared_dates)
-    whole = [*versions, *adjustments, second, offset]
-    expected_count = 3 + len(adjustments)
+    aliases = []
+    if trail.startswith("sparse-reversal"):
+        alias = adjustment | {"balance_after_transaction": None}
+        if trail.endswith("no-entry"):
+            alias["entry_reference"] = None
+        if trail.endswith("no-lookup"):
+            alias["transaction_id"] = None
+        aliases.append(alias)
+    if trail == "complete-and-sparse-last-day-fee":
+        aliases.append(offset | {"balance_after_transaction": None})
+    whole = [*versions, *adjustments, *aliases, second, *offsets]
+    expected_count = 2 + len(adjustments) + len(offsets)
     if reverse:
         whole.reverse()
     with closing(core.db()) as ledger:
@@ -1161,8 +1188,8 @@ def test_intervening_booked_movement_distinguishes_repeated_statement_balances(s
             f"WHERE description = 'Settlement' AND {date_field} = '2026-11-19'",
         ).fetchone())
         core.set_tx_category(ledger, original[0], "einnahme_sonstige")
-        for page, expected in ((whole, 2 if seed else 0), (whole[::-1], 0), ([second, first], 0),
-                               ([second, offset], 0), ([first, *adjustments], 0), (whole, 0)):
+        for page, expected in ((whole, 1 + len(offsets) if seed else 0), (whole[::-1], 0), ([second, first], 0),
+                               ([second, *offsets], 0), ([first, *adjustments], 0), (whole, 0)):
             assert sync(page) == expected
             assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (
                 expected_count, 96 * sign,
@@ -1175,15 +1202,34 @@ def test_intervening_booked_movement_distinguishes_repeated_statement_balances(s
 
 
 @pytest.mark.parametrize("ending_balance", [None, {"amount": "0", "currency": "USD"}, {"amount": "1", "currency": "EUR"}])
-def test_incomplete_statement_balance_chain_does_not_split_a_date_correction(ending_balance):
+@pytest.mark.parametrize("day", ["2026-11-19", "2026-11-20", "2026-11-21"])
+def test_incomplete_statement_balance_chain_does_not_split_a_date_correction(ending_balance, day):
     first = bank_row(entry_reference="batch", booking_date="2026-11-23", transaction_date="2026-11-19",
                      reference_number="INV123", balance_after_transaction={"amount": "119", "currency": "EUR"})
     second = first | {"transaction_date": "2026-11-21"}
-    adjustment = bank_row(entry_reference="reversal", booking_date="2026-11-23", transaction_date="2026-11-20",
+    adjustment = bank_row(entry_reference="reversal", booking_date="2026-11-23", transaction_date=day,
                           credit_debit_indicator="DBIT", balance_after_transaction=ending_balance)
     rows, skipped = transaction_rows("account-a", [second, adjustment, first])
     assert skipped == 0
     assert sorted(float(row["amount"]) for row in rows) == [-119, 119]
+
+
+@pytest.mark.parametrize("identity", [
+    {"entry_reference": "other"},
+    {"creditor_account": {"iban": "DE00OTHER"}},
+    {"entry_reference": None, "reference_number": None},
+])
+def test_separate_interior_movement_without_balance_keeps_trail_unresolved(identity):
+    first = bank_row(entry_reference="batch", booking_date="2026-11-23", transaction_date="2026-11-19",
+                     reference_number="INV123", balance_after_transaction={"amount": "119", "currency": "EUR"})
+    second = first | {"transaction_date": "2026-11-21"}
+    adjustment = second | {"entry_reference": "reversal", "credit_debit_indicator": "DBIT",
+                           "transaction_date": "2026-11-20", "creditor_account": {"iban": "DE00REVERSAL"},
+                           "balance_after_transaction": {"amount": "0", "currency": "EUR"}}
+    sparse = adjustment | {"balance_after_transaction": None} | identity
+    rows, skipped = transaction_rows("account-a", [second, adjustment, sparse, first])
+    assert skipped == 0
+    assert sorted(float(row["amount"]) for row in rows) == [-119, -119, 119]
 
 
 def test_disconnected_same_day_balance_movements_do_not_split_a_date_correction():
