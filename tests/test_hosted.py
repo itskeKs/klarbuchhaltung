@@ -879,6 +879,68 @@ def test_known_secondary_dates_distinguish_reused_entry_references(sandbox, date
             )
 
 
+@pytest.mark.parametrize("evidence, second_is_known", [
+    ("description", False), ("balance", False), ("balance", True), ("invoice", False), ("invoice", True),
+])
+@pytest.mark.parametrize("reverse", [True, False])
+def test_coexisting_bookings_keep_identity_with_discriminating_evidence(sandbox, evidence, second_is_known, reverse):
+    import core
+
+    shared = bank_row(entry_reference="reused", booking_date="2026-11-22", debtor_account={"iban": "DE00FIXTURE0001"},
+                      remittance_information=["Rent"])
+    first = shared.copy()
+    second = shared | {"transaction_date": "2026-11-21", "transaction_id": "lookup-supplies"}
+    if evidence == "description":
+        second["remittance_information"] = ["Supplies"]
+    else:
+        first["transaction_date"] = "2026-11-19"
+        if evidence == "balance":
+            first["balance_after_transaction"] = {"currency": "EUR", "amount": "119"}
+            second["balance_after_transaction"] = {"currency": "EUR", "amount": "238"}
+        else:
+            first["reference_number"] = "INV119"
+            second["reference_number"] = "INV238"
+    corrected = first | {"transaction_date": "2026-11-20", "transaction_id": "lookup-rent"}
+    debit = bank_row(entry_reference="debit", booking_date="2026-11-22", credit_debit_indicator="DBIT",
+                     transaction_amount={"currency": "EUR", "amount": "23.00"})
+    with closing(core.db()) as ledger:
+        rows, _ = transaction_rows("account-a", [first, debit])
+        assert core.import_bank_rows(ledger, rows, auto_match=False)["imported"] == 2
+        core.set_tx_category(ledger, 1, "einnahme_sonstige")
+        original = tuple(ledger.execute("SELECT id, ref, description, category FROM transactions WHERE id = 1").fetchone())
+        if second_is_known:
+            rows, _ = transaction_rows("account-a", [second, debit])
+            assert core.import_bank_rows(ledger, rows, auto_match=False)["imported"] == 1
+        batch = [second, corrected, debit] if reverse else [corrected, second, debit]
+        for page, expected in ((batch, int(not second_is_known)), (batch[::-1], 0), ([corrected, debit], 0),
+                               ([second, debit], 0), (batch, 0)):
+            rows, skipped = transaction_rows("account-a", page)
+            result = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True)
+            assert (result["imported"], result["ambiguous"] + skipped) == (expected, 0)
+            assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (3, 215)
+            assert tuple(ledger.execute("SELECT id, ref, description, category FROM transactions WHERE id = 1").fetchone()) == original
+
+
+def test_indistinguishable_dated_contenders_leave_old_booking_for_statement_review(sandbox):
+    import core
+
+    original = bank_row(entry_reference="reused", booking_date="2026-11-22", debtor_account={"iban": "DE00FIXTURE0001"})
+    first = original | {"transaction_date": "2026-11-20", "transaction_id": "lookup-a"}
+    second = original | {"transaction_date": "2026-11-21", "transaction_id": "lookup-b"}
+    debit = bank_row(entry_reference="debit", booking_date="2026-11-22", credit_debit_indicator="DBIT",
+                     transaction_amount={"currency": "EUR", "amount": "23.00"})
+    with closing(core.db()) as ledger:
+        rows, _ = transaction_rows("account-a", [original, debit])
+        assert core.import_bank_rows(ledger, rows, auto_match=False)["imported"] == 2
+        core.set_tx_category(ledger, 1, "einnahme_sonstige")
+        for page in ([first, second, debit], [second, debit, first]):
+            rows, skipped = transaction_rows("account-a", page)
+            result = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True)
+            assert (result["imported"], result["ambiguous"] + skipped) == (0, 2)
+            assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (2, 96)
+            assert core.get_transaction(ledger, 1)["category"] == "einnahme_sonstige"
+
+
 def test_legacy_reference_learns_secondary_dates_without_replacing_payment(sandbox):
     import core
 

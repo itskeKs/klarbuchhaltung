@@ -262,12 +262,6 @@ def _merge_dated_bookings(dated_ref, copies):
         _merge_copy_metadata(row, versions)
         skipped += len({copy["description"] for copy in versions}) - 1
         merged.append(row)
-    for row in merged:
-        row["_distinct_secondary_dates"] = any(
-            core._bank_secondary_match((row[field] for field in _SECONDARY_BANK_DATES),
-                                       (other[field] for field in _SECONDARY_BANK_DATES)) is False
-            for other in merged
-        )
     return sorted(merged, key=lambda row: row["ref"]), skipped
 
 

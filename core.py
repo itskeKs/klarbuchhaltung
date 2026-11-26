@@ -1995,6 +1995,22 @@ def _bank_match_rank(row, old, ref, source_refs):
     return 6  # Financial facts agree but there is no positive identifying evidence.
 
 
+def _bank_candidate_priority(row, old, rank, source_refs=()):
+    if rank == 6:
+        return None
+    if rank == 0:
+        return (0,)
+    if old.ref in source_refs:
+        return (1,)
+    financial_matches = sum(bool(row[field] and row[field] == getattr(old, field))
+                            for field in ("balance_key", "creditor_ref"))
+    account_match = _bank_account_match(row["counterparty_ids"], old.counterparty_ids) is True
+    # Compare corroboration only on eligible edges. A different secondary date
+    # is not a veto when another coexisting booking cannot match these facts.
+    return (2, -(financial_matches + account_match), _stored_secondary_match(row, old) is not True,
+            rank, not _bank_description_matches(row, old))
+
+
 def _occupied_bank_reference(ref, row):
     identity = (ref, *(row[field] for field in _BANK_IDENTITY_FIELDS if field not in _BANK_SECONDARY_DATES))
     alternate = tuple(pair for pair in row["counterparty_ids"] if pair != ("IBAN", row["counterparty_iban"]))
@@ -2059,28 +2075,22 @@ def _bank_matches(conn, rows):
         for group in row["bank_groups"].values():
             candidates.update(by_day[group])
         ref = row["ref"]
-        distinct_dates = row.get("_distinct_secondary_dates", False)
         # A legacy storage reference can be occupied by an incompatible booking.
         while record := conn.execute(select + "WHERE t.ref = ?", (ref,)).fetchone():
             existing = _bank_booking(record)
-            if not _bank_facts_conflict(row, existing) and not (distinct_dates and _stored_secondary_match(row, existing) is False):
+            if not _bank_facts_conflict(row, existing):
                 candidates.add(existing)
                 break
             ref = _occupied_bank_reference(ref, row)
         storage_refs[row["ref"]] = ref
         source_refs = _bank_source_refs(row, candidates)
-        ranked = [(old, rank, _stored_secondary_match(row, old)) for old in candidates
+        ranked = [(old, rank) for old in candidates
                   if (rank := _bank_match_rank(row, old, ref, source_refs)) is not None]
-        # A conflicting secondary date alone can be a changed bank date. Separate
-        # coexisting bookings or prefer a positive replay that matches known dates.
-        compare_dates = distinct_dates or any(rank < 6 and date_match is True for _, rank, date_match in ranked)
-        options[row["ref"]] = {old.ref: rank for old, rank, date_match in ranked
-                               if not compare_dates or date_match is not False}
+        options[row["ref"]] = {old.ref: _bank_candidate_priority(row, old, rank, source_refs) for old, rank in ranked}
         if row["counterparty_ids"] and row["creditor_ref"]:
-            for old in candidates:
-                if (old.creditor_ref == row["creditor_ref"]
-                        and _bank_account_match(row["counterparty_ids"], old.counterparty_ids) is None
-                        and options[row["ref"]].get(old.ref) == 6):
+            for old, rank in ranked:
+                if (rank == 6 and old.creditor_ref == row["creditor_ref"]
+                        and _bank_account_match(row["counterparty_ids"], old.counterparty_ids) is None):
                     unconfirmed_payers[old].append(row)
 
     for old, contenders in unconfirmed_payers.items():
@@ -2089,11 +2099,13 @@ def _bank_matches(conn, rows):
                for first, second in combinations(contenders, 2)):
             matching = [row for row in contenders if _bank_description_matches(row, old)]
             if len(matching) == 1:
-                options[matching[0]["ref"]][old.ref] = 4
+                row = matching[0]
+                options[row["ref"]][old.ref] = _bank_candidate_priority(row, old, 4)
 
     matched = {}
     used = set()
-    for rank in range(6):
+    priorities = {priority for candidates in options.values() for priority in candidates.values() if priority is not None}
+    for rank in sorted(priorities):
         contenders = Counter()
         choices = {}
         for ref, candidates in options.items():
