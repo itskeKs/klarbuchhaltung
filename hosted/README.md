@@ -35,10 +35,10 @@ reference can be reused on another date. Compatible copies of a booking with the
 dated reference count once. A copy can add a posting date, balance or reference
 when the matching dates and known details agree. The ledger remembers alternate
 dates and a newly supplied bank reference when it can identify an existing payment.
-Different known balances, structured references or counterparty IBANs can distinguish
-separate payments, even when the bank reuses a reference. The ledger remembers the
-counterparty IBAN as a fingerprint when it identifies a payment. It learns missing
-counterparty evidence from later matches.
+Different known balances, structured references or comparable counterparty account
+identifiers can distinguish separate payments, even when the bank reuses a reference.
+The ledger remembers account identifiers as fingerprints and learns missing evidence
+from later matches. Temporary transaction IDs help identify copies within one fetch.
 **Banking** flags conflicting memos and entries with multiple possible matches. Compare
 them with the statement. The next fetch retries them as the bank supplies more detail.
 Reauthorizing the same account preserves its payment history, including when the bank

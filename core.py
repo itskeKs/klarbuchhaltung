@@ -14,6 +14,7 @@ from collections import Counter, defaultdict, namedtuple
 from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from hashlib import sha256
+from itertools import combinations
 from pathlib import Path
 
 # ── Pfade ────────────────────────────────────────────────────────────────
@@ -1128,7 +1129,8 @@ def init_schema(conn: sqlite3.Connection) -> None:
             balance_key TEXT,
             creditor_ref TEXT,
             reference_schema TEXT,
-            counterparty_iban TEXT
+            counterparty_iban TEXT,
+            counterparty_ids TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_bank_provider_ref ON bank_import_facts(provider_ref);
         CREATE INDEX IF NOT EXISTS idx_bank_import_group ON bank_import_identity(booking_group);
@@ -1199,7 +1201,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
     if dcols and "suggest_tx" not in dcols:
         conn.execute("ALTER TABLE documents ADD COLUMN suggest_tx INTEGER")
     tcols = {r["name"] for r in conn.execute("PRAGMA table_info(transactions)")}
-    bank_fact_columns = ("creditor_ref", "reference_schema", "counterparty_iban")
+    bank_fact_columns = ("creditor_ref", "reference_schema", "counterparty_iban", "counterparty_ids")
     bank_cols = {r["name"] for r in conn.execute("PRAGMA table_info(bank_import_facts)")}
     if not bank_cols.issuperset(bank_fact_columns):
         if not conn.in_transaction:
@@ -1891,7 +1893,23 @@ ENABLE_BANKING_REF_PREFIX = "enablebanking:"
 
 
 _BANK_IDENTITY_FIELDS = ("provider_ref", "booked_day", "balance_key", "creditor_ref", "reference_schema", "counterparty_iban")
-_BankBooking = namedtuple("_BankBooking", ("ref", "description", *_BANK_IDENTITY_FIELDS))
+_BankBooking = namedtuple("_BankBooking", ("ref", "description", *_BANK_IDENTITY_FIELDS, "counterparty_ids"))
+
+
+def _bank_account_match(first, second):
+    """Compare identifiers in shared namespaces. No common namespace leaves the match unknown."""
+    shared = {scheme for scheme, _ in first} & {scheme for scheme, _ in second}
+    if not shared:
+        return None
+    return all({value for scheme, value in first if scheme == key} &
+               {value for scheme, value in second if scheme == key} for key in shared)
+
+
+def _bank_booking(record):
+    alternate = json.loads(record[-1]) if record[-1] else ()
+    iban = record[-2]
+    identifiers = tuple(tuple(pair) for pair in alternate) + ((("IBAN", iban),) if iban else ())
+    return _BankBooking(*record[:-1], identifiers)
 
 
 def _remember_bank_booking(conn, ref, row):
@@ -1899,21 +1917,32 @@ def _remember_bank_booking(conn, ref, row):
                  (ref, row["bank_group"]))
     conn.executemany("INSERT OR IGNORE INTO bank_import_date_aliases (booking_group, ref) VALUES (?, ?)",
                      ((group, ref) for group in row["bank_groups"].values()))
+    alternate = {pair for pair in row["counterparty_ids"] if pair != ("IBAN", row["counterparty_iban"])}
+    identifiers = None
+    if alternate:
+        previous = conn.execute("SELECT counterparty_ids FROM bank_import_facts WHERE ref = ?", (ref,)).fetchone()
+        if previous and previous[0]:
+            alternate.update(tuple(pair) for pair in json.loads(previous[0]))
+        identifiers = json.dumps(sorted(alternate), separators=(",", ":"))
     conn.execute(
-        "INSERT INTO bank_import_facts (ref, provider_ref, booked_day, balance_key, creditor_ref, reference_schema, counterparty_iban) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?) "
+        "INSERT INTO bank_import_facts "
+        "(ref, provider_ref, booked_day, balance_key, creditor_ref, reference_schema, counterparty_iban, counterparty_ids) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(ref) DO UPDATE SET provider_ref = COALESCE(provider_ref, excluded.provider_ref), "
         "booked_day = COALESCE(booked_day, excluded.booked_day), "
         "balance_key = COALESCE(balance_key, excluded.balance_key), "
         "creditor_ref = COALESCE(creditor_ref, excluded.creditor_ref), "
         "reference_schema = COALESCE(reference_schema, excluded.reference_schema), "
-        "counterparty_iban = COALESCE(counterparty_iban, excluded.counterparty_iban)",
-        (ref, *(row[field] for field in _BANK_IDENTITY_FIELDS)),
+        "counterparty_iban = COALESCE(counterparty_iban, excluded.counterparty_iban), "
+        "counterparty_ids = COALESCE(excluded.counterparty_ids, counterparty_ids)",
+        (ref, *(row[field] for field in _BANK_IDENTITY_FIELDS), identifiers),
     )
 
 
 def _bank_facts_conflict(row, old):
-    return any(row[field] and getattr(old, field) and row[field] != getattr(old, field) for field in _BANK_IDENTITY_FIELDS)
+    return (any(row[field] and getattr(old, field) and row[field] != getattr(old, field)
+                for field in _BANK_IDENTITY_FIELDS)
+            or _bank_account_match(row["counterparty_ids"], old.counterparty_ids) is False)
 
 
 def _bank_description_matches(row, old):
@@ -1932,7 +1961,7 @@ def _bank_match_rank(row, old, ref, source_refs):
     provider_match = old.provider_ref and row["provider_ref"] == old.provider_ref
     balance_match = old.balance_key and row["balance_key"] == old.balance_key
     description_match = _bank_description_matches(row, old)
-    if row["counterparty_iban"] and not old.counterparty_iban:
+    if row["counterparty_ids"] and _bank_account_match(row["counterparty_ids"], old.counterparty_ids) is None:
         # A reused reference needs corroboration before it can teach a missing payer.
         if not balance_match and not ((previous_ref or provider_match) and description_match):
             return 6
@@ -1950,7 +1979,11 @@ def _bank_match_rank(row, old, ref, source_refs):
 
 
 def _occupied_bank_reference(ref, row):
-    fields = json.dumps((ref, *(row[field] for field in _BANK_IDENTITY_FIELDS)), separators=(",", ":"))
+    identity = (ref, *(row[field] for field in _BANK_IDENTITY_FIELDS))
+    alternate = tuple(pair for pair in row["counterparty_ids"] if pair != ("IBAN", row["counterparty_iban"]))
+    if alternate:
+        identity += (alternate,)
+    fields = json.dumps(identity, separators=(",", ":"))
     return ENABLE_BANKING_REF_PREFIX + sha256(fields.encode()).hexdigest()
 
 
@@ -1961,9 +1994,9 @@ def bank_source_reference(key, occurrence):
 
 
 def _bank_source_refs(row, candidates):
-    if not row["counterparty_iban"]:
+    if not row["counterparty_ids"]:
         return set()
-    unknown_refs = {old.ref for old in candidates if not old.counterparty_iban}
+    unknown_refs = {old.ref for old in candidates if _bank_account_match(row["counterparty_ids"], old.counterparty_ids) is None}
     if not unknown_refs:
         return set()
     # Check the possible occurrence numbers without selecting an arbitrary copy.
@@ -1985,9 +2018,10 @@ def _bank_matches(conn, rows):
             ((row["bank_group"], candidate) for candidate in (row["ref"], *row["prior_refs"])),
         )
     select = ("SELECT t.ref, t.description, " + ", ".join(f"f.{field}" for field in _BANK_IDENTITY_FIELDS)
+              + ", f.counterparty_ids"
               + " FROM transactions t LEFT JOIN bank_import_facts f USING (ref) ")
     def lookup(clause, keys):
-        return {key: [_BankBooking(*r) for r in conn.execute(select + clause, (key,))]
+        return {key: [_bank_booking(r) for r in conn.execute(select + clause, (key,))]
                 for key in keys}
 
     by_day = lookup(
@@ -2007,7 +2041,7 @@ def _bank_matches(conn, rows):
         ref = row["ref"]
         # A legacy storage reference can be occupied by an incompatible booking.
         while record := conn.execute(select + "WHERE t.ref = ?", (ref,)).fetchone():
-            existing = _BankBooking(*record)
+            existing = _bank_booking(record)
             if not _bank_facts_conflict(row, existing):
                 candidates.add(existing)
                 break
@@ -2016,15 +2050,17 @@ def _bank_matches(conn, rows):
         source_refs = _bank_source_refs(row, candidates)
         options[row["ref"]] = {old.ref: rank for old in candidates
                                if (rank := _bank_match_rank(row, old, ref, source_refs)) is not None}
-        if row["counterparty_iban"] and row["creditor_ref"]:
+        if row["counterparty_ids"] and row["creditor_ref"]:
             for old in candidates:
-                if (not old.counterparty_iban and old.creditor_ref == row["creditor_ref"]
+                if (old.creditor_ref == row["creditor_ref"]
+                        and _bank_account_match(row["counterparty_ids"], old.counterparty_ids) is None
                         and options[row["ref"]].get(old.ref) == 6):
                     unconfirmed_payers[old].append(row)
 
     for old, contenders in unconfirmed_payers.items():
         # Known distinct payers in the same overlap can corroborate a unique prior description.
-        if len({row["counterparty_iban"] for row in contenders}) > 1:
+        if any(_bank_account_match(first["counterparty_ids"], second["counterparty_ids"]) is False
+               for first, second in combinations(contenders, 2)):
             matching = [row for row in contenders if _bank_description_matches(row, old)]
             if len(matching) == 1:
                 options[matching[0]["ref"]][old.ref] = 4
