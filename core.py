@@ -1880,7 +1880,7 @@ _BankBooking = namedtuple("_BankBooking", "ref description provider_ref booked_d
 
 def _remember_bank_booking(conn, ref, row):
     conn.execute("INSERT OR IGNORE INTO bank_import_identity (ref, booking_group) VALUES (?, ?)",
-                 (ref, row["bank_groups"][0]))
+                 (ref, row["bank_group"]))
     conn.execute(
         "INSERT INTO bank_import_facts (ref, provider_ref, booked_day, balance_key, creditor_ref, reference_schema) "
         "VALUES (?, ?, ?, ?, ?, ?) "
@@ -1925,7 +1925,7 @@ def _bank_matches(conn, rows):
         conn.executemany(
             "INSERT OR IGNORE INTO bank_import_identity (booking_group, ref) "
             "SELECT ?, ref FROM transactions WHERE ref = ?",
-            ((row["bank_groups"][0], candidate) for candidate in (row["ref"], *row["prior_refs"])),
+            ((row["bank_group"], candidate) for candidate in (row["ref"], *row["prior_refs"])),
         )
     select = ("SELECT i.ref, t.description, f.provider_ref, f.booked_day, f.balance_key, f.creditor_ref, f.reference_schema "
               "FROM bank_import_identity i JOIN transactions t USING (ref) "
@@ -1934,12 +1934,13 @@ def _bank_matches(conn, rows):
         return {key: [_BankBooking(*r) for r in conn.execute(select + clause, (key,))]
                 for key in keys}
 
-    by_day = lookup("WHERE i.booking_group = ?", {g for row in bank_rows for g in row["bank_groups"]})
+    by_day = lookup("WHERE i.booking_group = ?", {g for row in bank_rows for g in row["bank_groups"].values()})
     by_provider = lookup("WHERE f.provider_ref = ?", {r["provider_ref"] for r in bank_rows if r["provider_ref"]})
     options = {}
     for row in bank_rows:
-        candidates = set(by_provider.get(row["provider_ref"], []))
-        for group in row["bank_groups"]:
+        # The stored posting date still matches after the bank drops the original value date.
+        candidates = {old for old in by_provider.get(row["provider_ref"], ()) if old.booked_day in row["bank_groups"]}
+        for group in row["bank_groups"].values():
             candidates.update(by_day[group])
         options[row["ref"]] = {old.ref: rank for old in candidates
                                if (rank := _bank_match_rank(row, old)) is not None}

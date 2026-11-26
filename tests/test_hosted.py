@@ -331,6 +331,8 @@ def test_provider_enrichment_preserves_open_total_and_category(sandbox, initial_
     enriched = first | {"entry_reference": "credit", "booking_date": "2026-11-25"}
     assert ingest([debit, enriched]) == 0
     assert ingest([enriched | {"remittance_information": ["Updated memo"]}, debit]) == 0
+    assert ingest([enriched | {"value_date": None}, debit]) == 0
+    assert ingest([enriched | {"booking_date": None, "value_date": "2026-11-26", "transaction_date": "2026-11-25"}, debit]) == 0
     assert tuple(conn.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (2, 96)
     assert core.get_transaction(conn, 1)["category"] == "einnahme_sonstige"
 
@@ -377,6 +379,50 @@ def test_dated_match_precedes_reused_bank_reference(sandbox, reverse):
         assert core.get_transaction(ledger, 1)["category"] == "einnahme_sonstige"
 
 
+@pytest.mark.parametrize("reverse", [True, False])
+@pytest.mark.parametrize("partial_balance, changes, expected_imports", [
+    (None, {"balance_after_transaction": {"amount": "119.00", "currency": "EUR"}}, 0),
+    ("119.00", {}, 0),
+    (None, {"value_date": "2026-11-22"}, 1),
+    ("119.00", {"balance_after_transaction": {"amount": "238.00", "currency": "EUR"}}, 1),
+])
+def test_partial_date_copy_coexists_with_posted_version(sandbox, reverse, partial_balance, changes, expected_imports):
+    import core
+
+    ledger = core.db()
+    partial = bank_row(entry_reference="credit", booking_date=None, value_date="2026-11-20",
+                       transaction_date="2026-11-19")
+    if partial_balance:
+        partial["balance_after_transaction"] = {"amount": partial_balance, "currency": "EUR"}
+    posted = partial | {"booking_date": "2026-11-21"} | changes
+    debit = bank_row(entry_reference="debit", credit_debit_indicator="DBIT",
+                     transaction_amount={"currency": "EUR", "amount": "23.00"})
+    rows, _ = transaction_rows("account-a", [partial, debit])
+    assert core.import_bank_rows(ledger, rows, auto_match=False)["imported"] == 2
+    core.set_tx_category(ledger, 1, "einnahme_sonstige")
+
+    batch = [posted, partial, debit] if reverse else [partial, posted, debit]
+    for page, expected in ((batch, expected_imports), (batch[::-1], 0)):
+        rows, skipped = transaction_rows("account-a", page)
+        result = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True)
+        assert ledger.execute("SELECT sum(amount) FROM transactions").fetchone()[0] == (215 if expected_imports else 96)
+        assert (result["imported"], skipped + result["ambiguous"]) == (expected, 0)
+        assert core.get_transaction(ledger, 1)["category"] == "einnahme_sonstige"
+
+
+def test_partial_date_copy_alone_replays_fresh_canonical_booking(sandbox):
+    import core
+
+    ledger = core.db()
+    partial = bank_row(entry_reference="credit", booking_date=None, value_date="2026-11-20")
+    posted = partial | {"booking_date": "2026-11-21"}
+    for page, expected in (([posted, partial], 1), ([partial], 0), ([posted], 0)):
+        rows, skipped = transaction_rows("account-a", page)
+        result = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True)
+        assert (result["imported"], skipped + result["ambiguous"]) == (expected, 0)
+        assert [tuple(row) for row in ledger.execute("SELECT date, amount FROM transactions")] == [("2026-11-21", 119)]
+
+
 def test_reference_reused_on_another_booking_date(sandbox):
     import core
 
@@ -391,6 +437,120 @@ def test_reference_reused_on_another_booking_date(sandbox):
         assert skipped == 0
         assert core.import_bank_rows(ledger, rows, auto_match=False)["imported"] == expected
     assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (3, 215)
+
+
+def test_daily_overlap_imports_reused_reference_without_a_shared_date(sandbox):
+    import core
+    from hosted.bank_service import BankingService
+
+    first = bank_row(entry_reference="reused", booking_date=None, value_date="2026-11-01")
+    second = first | {"value_date": None, "booking_date": "2026-11-25"}
+    debit = bank_row(entry_reference="debit", booking_date="2026-11-24", credit_debit_indicator="DBIT",
+                     transaction_amount={"currency": "EUR", "amount": "23.00"})
+
+    class OverlapProvider(StubProvider):
+        def request(self, method, path, *, query=None, data=None):
+            if path != f"/accounts/{ACCOUNT}/transactions":
+                return super().request(method, path, query=query, data=data)
+            if query.get("continuation_key") == "debit":
+                return {"transactions": [debit]}
+            if query.get("date_from"):
+                assert query["date_from"] in {"2026-11-10", "2026-11-11"}
+                return {"transactions": [second], "continuation_key": "debit"}
+            return {"transactions": [first], "continuation_key": "debit"}
+
+    service = BankingService(sandbox, sandbox, SITE + "/api/bank/callback", client_factory=OverlapProvider)
+    service.save_credentials(APP_ID, b"fixture-key")
+    state = parse_qs(urlsplit(service.begin("login-a", "DE", BANK, "business")).query)["state"][0]
+    service.finish("login-a", state, "fixture-code", "")
+    now = datetime(2026, 11, 24, 12, tzinfo=timezone.utc)
+    assert service.sync(now=now) == 2
+    ledger = core.db()
+    core.set_tx_category(ledger, 1, "einnahme_sonstige")
+    assert service.sync(now=now + timedelta(days=1)) == 1
+    core.set_tx_category(ledger, 3, "einnahme_sonstige")
+    for _ in range(2):
+        assert service.sync(now=now + timedelta(days=1), force=True) == 0
+        assert service.consents()[0]["skipped"] == 0
+        assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (3, 215)
+        assert [tuple(row) for row in ledger.execute("SELECT date, category FROM transactions ORDER BY id")] == [
+            ("2026-11-01", "einnahme_sonstige"), ("2026-11-24", "offen"), ("2026-11-25", "einnahme_sonstige"),
+        ]
+
+
+@pytest.mark.parametrize("first_details, second_details", [
+    ({}, {"balance_after_transaction": {"amount": "119", "currency": "EUR"}}),
+    ({}, {"reference_number": "INV123", "reference_number_schema": "SCOR"}),
+    ({"balance_after_transaction": {"amount": "119", "currency": "EUR"}},
+     {"reference_number": "INV123", "reference_number_schema": "SCOR"}),
+])
+@pytest.mark.parametrize("initial_payment", [True, False])
+@pytest.mark.parametrize("reverse", [True, False])
+def test_dated_reference_batch_collapses_enriched_copy(sandbox, first_details, second_details, initial_payment, reverse):
+    import core
+
+    ledger = core.db()
+    credit = bank_row(entry_reference="credit")
+    first = credit | first_details
+    second = credit | second_details
+    debit = bank_row(entry_reference="debit", credit_debit_indicator="DBIT",
+                     transaction_amount={"currency": "EUR", "amount": "23.00"})
+    if initial_payment:
+        rows, _ = transaction_rows("account-a", [first, debit])
+        assert core.import_bank_rows(ledger, rows, auto_match=False)["imported"] == 2
+        core.set_tx_category(ledger, 1, "einnahme_sonstige")
+
+    batch = [second, first, debit] if reverse else [first, second, debit]
+    for page, expected in ((batch, 0 if initial_payment else 2), (batch[::-1], 0), ([first, debit], 0)):
+        rows, skipped = transaction_rows("account-a", page)
+        result = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True)
+        assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (2, 96)
+        assert (result["imported"], skipped + result["ambiguous"]) == (expected, 0)
+        if initial_payment:
+            assert core.get_transaction(ledger, 1)["category"] == "einnahme_sonstige"
+
+
+@pytest.mark.parametrize("first_details, second_details, sparse_details", [
+    ({"balance_after_transaction": {"amount": "119", "currency": "EUR"}},
+     {"balance_after_transaction": {"amount": "238", "currency": "EUR"}}, {}),
+    ({"reference_number": "INV123", "reference_number_schema": "SCOR"},
+     {"reference_number": "INV456", "reference_number_schema": "SCOR"}, {}),
+    ({"balance_after_transaction": {"amount": "119", "currency": "EUR"}},
+     {"balance_after_transaction": {"amount": "238", "currency": "EUR"}},
+     {"reference_number": "INV123", "reference_number_schema": "SCOR"}),
+])
+@pytest.mark.parametrize("reverse", [True, False])
+def test_sparse_copy_does_not_join_conflicting_bookings(sandbox, first_details, second_details, sparse_details, reverse):
+    import core
+
+    ledger = core.db()
+    credit = bank_row(entry_reference="credit")
+    first = credit | first_details
+    second = credit | second_details
+    sparse = credit | sparse_details
+    debit = bank_row(entry_reference="debit", credit_debit_indicator="DBIT",
+                     transaction_amount={"currency": "EUR", "amount": "23.00"})
+    batch = [second, first, sparse, debit] if reverse else [sparse, first, second, debit]
+    for page, expected in ((batch, 3), (batch[::-1], 0), ([sparse, debit], 0)):
+        rows, skipped = transaction_rows("account-a", page)
+        result = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True)
+        assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (3, 215)
+        assert (result["imported"], skipped + result["ambiguous"]) == (expected, 1)
+
+
+@pytest.mark.parametrize("reverse", [True, False])
+def test_dated_reference_batch_flags_conflicting_memos(sandbox, reverse):
+    import core
+
+    ledger = core.db()
+    bare = bank_row(entry_reference="credit")
+    enriched = bare | {"balance_after_transaction": {"amount": "119", "currency": "EUR"},
+                       "remittance_information": ["Another transfer"]}
+    batch = [enriched, bare] if reverse else [bare, enriched]
+    rows, skipped = transaction_rows("account-a", batch)
+    result = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True)
+    assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (1, 119)
+    assert (result["imported"], skipped + result["ambiguous"]) == (1, 1)
 
 
 def test_balance_distinguishes_equal_bookings_when_a_memo_arrives(sandbox):

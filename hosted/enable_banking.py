@@ -1,6 +1,6 @@
 """Enable Banking's account-information API and transaction mapping."""
 import base64
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from http.client import HTTPException, HTTPSConnection
@@ -127,11 +127,91 @@ def _balance_key(balance):
     return None
 
 
+_OPTIONAL_BOOKING_FACTS = ("balance_key", "creditor_ref", "reference_schema")
+_SECONDARY_BANK_DATES = ("_value_day", "_transaction_day")
+
+
+def _conflicting_facts(first, second, fields):
+    return any(first.get(field) and second.get(field) and first[field] != second[field] for field in fields)
+
+
+def _dated_booking_ref(dated_ref, facts):
+    values = [facts.get(field) for field in _OPTIONAL_BOOKING_FACTS]
+    identity = fingerprint(dated_ref, *values) if any(values) else dated_ref
+    return core.ENABLE_BANKING_REF_PREFIX + identity
+
+
+def _align_partial_booking_dates(bookings):
+    posted = defaultdict(list)
+    for dated_ref, rows in bookings.items():
+        for row in rows:
+            if row["provider_ref"] and row["booked_day"]:
+                for field in _SECONDARY_BANK_DATES:
+                    if row[field]:
+                        posted[row["provider_ref"], field, row[field]].append((dated_ref, row))
+
+    aligned = {}
+    unresolved = set()
+    fields = (*_SECONDARY_BANK_DATES, *_OPTIONAL_BOOKING_FACTS)
+    for dated_ref, rows in bookings.items():
+        for row in rows:
+            key = dated_ref
+            if row["provider_ref"] and not row["booked_day"]:
+                matches = {ref: candidate for field in _SECONDARY_BANK_DATES
+                           for ref, candidate in posted.get((row["provider_ref"], field, row[field]), ())
+                           if not _conflicting_facts(row, candidate, fields)}
+                if len(matches) > 1:
+                    unresolved.add(row["ref"])
+                    continue
+                if matches:
+                    key, candidate = next(iter(matches.items()))
+                    row["date"] = candidate["date"]
+                    row["ref"] = _dated_booking_ref(key, row)
+            aligned.setdefault(key, []).append(row)
+    return aligned, len(unresolved)
+
+
+def _merge_dated_bookings(dated_ref, copies):
+    """Combine compatible copies and keep payments with conflicting known facts separate."""
+    facts = {row["ref"]: {field: row[field] for field in _OPTIONAL_BOOKING_FACTS if row[field]}
+             for row in copies}
+    conflicts = {ref: frozenset(other_ref for other_ref, other in facts.items()
+                                if _conflicting_facts(known, other, _OPTIONAL_BOOKING_FACTS))
+                 for ref, known in facts.items()}
+    # Copies with the same conflicts can be merged. A sparse copy may rule out fewer
+    # alternatives and can only be attached if exactly one group accounts for it.
+    signatures = set(conflicts.values())
+    groups = {s: [] for s in signatures if not any(s < other for other in signatures)}
+    unresolved = set()
+    for row in copies:
+        matches = [s for s in groups if conflicts[row["ref"]] <= s]
+        if len(matches) == 1:
+            groups[matches[0]].append(row)
+        else:
+            unresolved.add(row["ref"])
+
+    merged = []
+    skipped = len(unresolved)
+    for versions in groups.values():
+        known = {field: value for row in versions for field, value in facts[row["ref"]].items()}
+        ref = _dated_booking_ref(dated_ref, known)
+        row = min(versions, key=lambda version: (version["ref"] != ref, version["description"])) | known
+        row["ref"] = ref
+        row["booked_day"] = next((copy["booked_day"] for copy in versions if copy["booked_day"]), None)
+        row["bank_groups"] = {day: group for copy in versions for day, group in copy["bank_groups"].items()}
+        # Keep the original lookup day if a later copy supplied the posting date.
+        row["bank_group"] = min((copy["bank_group"] for copy in versions if not copy["booked_day"]),
+                                default=row["bank_group"])
+        row["prior_refs"] = list(dict.fromkeys(ref for copy in versions for ref in copy["prior_refs"]))
+        skipped += len({copy["description"] for copy in versions}) - 1
+        merged.append(row)
+    return sorted(merged, key=lambda row: row["ref"]), skipped
+
+
 def transaction_rows(account_key, transactions):
     """Keep the multiplicity of identical reference-less booked transactions."""
     occurrences = Counter()
-    references = {}
-    rows = []
+    bookings = {}
     skipped = 0
     for tx in transactions:
         if not isinstance(tx, dict):
@@ -169,22 +249,18 @@ def transaction_rows(account_key, transactions):
         reference = tx.get("reference_number")
         creditor_ref = fingerprint(reference.strip()) if isinstance(reference, str) and reference.strip() else None
         schema = tx.get("reference_number_schema") if creditor_ref else None
+        facts = {"balance_key": balance_key, "creditor_ref": creditor_ref,
+                 "reference_schema": schema if isinstance(schema, str) and schema else None}
         if isinstance(entry_ref, str) and entry_ref.strip():
             entry_ref = entry_ref.strip()
             provider_ref = fingerprint(account_key, "entry", entry_ref, amount_key, currency)
             dated_ref = fingerprint(account_key, "entry", entry_ref, booking, amount_key, currency)
-            identity = fingerprint(dated_ref, balance_key, creditor_ref, schema) if balance_key or creditor_ref else dated_ref
+            ref = _dated_booking_ref(dated_ref, facts)
+            booking_key = dated_ref
             # Match earlier ledgers whose IDs used only the effective date and amount.
             prior_refs = [core.ENABLE_BANKING_REF_PREFIX + fingerprint(
                 account_key, "entry", entry_ref, day, amount_key, currency
             ) for day in dict.fromkeys(day for day in dates if day)]
-            description_version = (name, details)
-            if identity in references:
-                if references[identity] != description_version:
-                    # Same provider reference and booking facts with conflicting metadata.
-                    skipped += 1
-                continue
-            references[identity] = description_version
         else:
             # transaction_id is a temporary lookup ID according to the provider.
             fields = (account_key, dates, amount_key, currency, name, details,
@@ -195,17 +271,27 @@ def transaction_rows(account_key, transactions):
                 occurrences[legacy_key] += 1
                 prior_refs.append(core.ENABLE_BANKING_REF_PREFIX + fingerprint(legacy_key, occurrences[legacy_key]))
             occurrences[key] += 1
-            identity = fingerprint(key, occurrences[key])
-        row = {"ref": core.ENABLE_BANKING_REF_PREFIX + identity, "date": booking,
+            booking_key = fingerprint(key, occurrences[key])
+            ref = core.ENABLE_BANKING_REF_PREFIX + booking_key
+        row = {"ref": ref, "date": booking, **facts,
                "amount": str(amount), "currency": currency,
                "description": description or "Bankumsatz", "tx_type": "Enable Banking"}
-        row["bank_groups"] = [fingerprint(account_key, day, amount_key, currency)
-                              for day in dict.fromkeys([booking, *(day for day in dates if day)])]
+        row["bank_groups"] = {day: fingerprint(account_key, day, amount_key, currency)
+                              for day in dict.fromkeys([booking, *(day for day in dates if day)])}
+        row["bank_group"] = row["bank_groups"][booking]
         row["provider_ref"] = provider_ref
         row["booked_day"] = dates[0] or None
-        row["balance_key"] = balance_key
-        row["creditor_ref"] = creditor_ref
-        row["reference_schema"] = schema
+        row["_value_day"], row["_transaction_day"] = dates[1:]
         row["prior_refs"] = prior_refs
-        rows.append(row)
+        bookings.setdefault(booking_key, []).append(row)
+    rows = []
+    aligned, warnings = _align_partial_booking_dates(bookings)
+    skipped += warnings
+    for booking_key, copies in aligned.items():
+        if len(copies) == 1:
+            rows.extend(copies)
+        else:
+            merged, warnings = _merge_dated_bookings(booking_key, copies)
+            rows.extend(merged)
+            skipped += warnings
     return rows, skipped

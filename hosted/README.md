@@ -30,11 +30,15 @@ The first import retrieves the longest available history. With the tenant runnin
 scheduler checks daily, even with every browser closed. **Jetzt synchronisieren** requests
 an additional check. Reload **Banking** for the result. Each check follows all pages of
 booked transactions. Pending entries stay at the bank until booked. Under **Zahlungen**,
-new entries are open for categorization. Repeated checks preserve assignments. If the
-bank omits a permanent reference and the overlap leaves multiple possible matches,
-**Banking** shows the number of ambiguous entries. Compare them with the statement.
-The next fetch retries them as the bank supplies more detail. Reauthorizing the same
-account preserves its payment history, including when the bank adds an IBAN.
+new entries are open for categorization. Repeated checks preserve assignments. A bank
+reference can be reused on another date. Compatible copies of a booking with the same
+dated reference count once. A copy can add a posting date, balance or structured
+reference when the matching dates and known details agree.
+Different known balances or structured references can distinguish separate payments.
+**Banking** flags conflicting memos and entries with multiple possible matches. Compare
+them with the statement. The next fetch retries them as the bank supplies more detail.
+Reauthorizing the same account preserves its payment history, including when the bank
+adds an IBAN.
 
 When a consent expires, use **Bank verbinden** and complete consent again. **Verbindung
 trennen** stops imports for that connection. Its payments and their categories remain in
