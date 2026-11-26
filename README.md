@@ -56,7 +56,7 @@ laufenden Kosten — eine SQLite-Datei und deine Belege als PDF.
 
 ## Installieren
 
-Fertige Pakete liegen unter [Releases](../../releases).
+Fertige Pakete liegen unter [Releases](https://github.com/lennardevertz/klarbuchhaltung/releases).
 
 | System | Datei | Start |
 |--------|-------|-------|
@@ -398,6 +398,8 @@ oder `www` an (passiert beim Import von einem anderen Anbieter), müssen die weg
 
 Die Testsuite läuft bei jedem Push auf allen drei Systemen. Kein Test fasst
 echte Daten an: sämtliche Pfade zeigen währenddessen in ein Wegwerf-Verzeichnis.
+
+[Contribution guide](CONTRIBUTING.md) and [project documentation](docs/README.md).
 
 ---
 

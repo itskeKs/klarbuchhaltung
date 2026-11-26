@@ -1,0 +1,18 @@
+---
+description: Pytest fixture and regression practice
+paths:
+  - "tests/**"
+  - "conftest.py"
+  - "pytest.ini"
+---
+
+Begin a behavior change with a failing scenario, then pass it with the smallest implementation
+and refactor with tests green. Prefer an existing pytest fixture and observable assertions.
+Use the Flask request path for route behavior and both tenant processes for cross-tenant checks.
+Keep test paths temporary and stub network boundaries. Derive amounts and dates from the
+scenario. Assert the prior state is preserved when an operation fails.
+
+Use targeted pytest during work and `make test` before merge. Add confirmed acceptance
+findings as regression tests first. Use the actual German UI labels when they are asserted.
+
+See [pytest conventions](../../features/README.md).

@@ -1,0 +1,20 @@
+---
+description: SQLite storage and bookkeeping behavior
+paths:
+  - "core.py"
+  - "bookkeeping.py"
+  - "assistant.py"
+  - "mcp_server.py"
+  - "wirex.py"
+---
+
+Keep persistence, report arithmetic and booking rules in `core.py`. Web, desktop, CLI,
+chat and MCP callers should use the same rules. Change the domain and storage first,
+then update callers and documentation that depend on the changed behavior.
+
+Keep upgrades compatible with existing SQLite databases and older attachment paths. Exercise
+legacy upgrades and locally generated profiles with the fixtures. For imported earnings and
+invoice assignment, cover payment date, VAT rate, duplicates, reassignment and closed periods
+as applicable. Calculate expected amounts independently from the code.
+
+See [architecture](../../docs/architecture.md) and [tests](../../features/README.md).
