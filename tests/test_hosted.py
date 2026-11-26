@@ -921,6 +921,95 @@ def test_coexisting_bookings_keep_identity_with_discriminating_evidence(sandbox,
             assert tuple(ledger.execute("SELECT id, ref, description, category FROM transactions WHERE id = 1").fetchone()) == original
 
 
+@pytest.mark.parametrize("reverse", [True, False])
+@pytest.mark.parametrize("learned", ["invoice", "balance"])
+def test_learned_booking_evidence_outweighs_another_payments_storage_key(sandbox, reverse, learned):
+    import core
+
+    rent = bank_row(entry_reference="reused", booking_date="2026-11-23", transaction_date="2026-11-20",
+                    debtor_account={"iban": "DE00FIXTURE0001"}, remittance_information=["Rent"])
+    corrected = rent | {"transaction_date": "2026-11-19", "transaction_id": "current-rent"}
+    if learned == "invoice":
+        corrected["reference_number"] = "INV-RENT"
+    else:
+        corrected["balance_after_transaction"] = {"currency": "EUR", "amount": "119"}
+    supplies = rent | {"transaction_id": "current-supplies", "remittance_information": ["Supplies"]}
+    debit = bank_row(entry_reference="debit", booking_date="2026-11-23", credit_debit_indicator="DBIT",
+                     transaction_amount={"currency": "EUR", "amount": "23.00"}, remittance_information=["Offset"])
+    with closing(core.db()) as ledger:
+        rows, _ = transaction_rows("account-a", [rent, debit])
+        assert core.import_bank_rows(ledger, rows, auto_match=False)["imported"] == 2
+        core.set_tx_category(ledger, 1, "einnahme_sonstige")
+        original = tuple(ledger.execute("SELECT id, ref FROM transactions WHERE id = 1").fetchone())
+        assert transaction_rows("account-a", [supplies])[0][0]["ref"] == original[1]
+        rows, skipped = transaction_rows("account-a", [corrected, debit])
+        result = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True)
+        assert (result["imported"], skipped + result["ambiguous"]) == (0, 0)
+        assert [tuple(row) for row in ledger.execute("SELECT amount, description, category FROM transactions ORDER BY id")] == [
+            (119, "Rent", "einnahme_sonstige"), (-23, "Offset", "offen"),
+        ]
+
+        batch = [supplies, corrected, debit] if reverse else [corrected, supplies, debit]
+        for page, expected in ((batch, 1), (batch[::-1], 0), ([supplies, debit], 0), ([corrected, debit], 0),
+                               ([rent, debit], 0), (batch, 0)):
+            rows, skipped = transaction_rows("account-a", page)
+            result = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True)
+            assert (result["imported"], skipped + result["ambiguous"]) == (expected, 0)
+            assert [tuple(row) for row in ledger.execute("SELECT amount, description, category FROM transactions ORDER BY id")] == [
+                (119, "Rent", "einnahme_sonstige"), (-23, "Offset", "offen"), (119, "Supplies", "offen"),
+            ]
+            assert tuple(ledger.execute("SELECT id, ref FROM transactions WHERE id = 1").fetchone()) == original
+
+
+@pytest.mark.parametrize("reverse", [True, False])
+@pytest.mark.parametrize("direction", ["CRDT", "DBIT"])
+@pytest.mark.parametrize("with_sparse_version", [True, False])
+@pytest.mark.parametrize("reference_number", ["INV-RENT", None])
+def test_same_fetch_financial_evidence_reconciles_acquiring_date_change(
+    sandbox, reverse, direction, with_sparse_version, reference_number,
+):
+    import core
+
+    party_key = "debtor_account" if direction == "CRDT" else "creditor_account"
+    first = bank_row(entry_reference="stable", booking_date="2026-11-23", value_date="2026-11-22",
+                     transaction_date="2026-11-20", transaction_id="current-rent", credit_debit_indicator=direction,
+                     **{party_key: {"iban": "DE00FIXTURE0001"}}, remittance_information=["Rent"],
+                     balance_after_transaction={"currency": "EUR", "amount": "119"}, reference_number=reference_number)
+    corrected = first | {"transaction_date": "2026-11-21"}
+    versions = [first, corrected] + ([first | {"transaction_date": None}] if with_sparse_version else [])
+    if reverse:
+        versions.reverse()
+    opposite = "DBIT" if direction == "CRDT" else "CRDT"
+    offset = bank_row(entry_reference="offset", booking_date="2026-11-23", credit_debit_indicator=opposite,
+                      transaction_amount={"currency": "EUR", "amount": "23"}, remittance_information=["Offset"])
+    sign = 1 if direction == "CRDT" else -1
+    with closing(core.db()) as ledger:
+        rows, skipped = transaction_rows("account-a", versions + [offset])
+        result = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True)
+        assert (result["imported"], skipped + result["ambiguous"]) == (2, 0)
+        core.set_tx_category(ledger, 1, "einnahme_sonstige")
+        original = tuple(ledger.execute("SELECT id, ref FROM transactions WHERE id = 1").fetchone())
+        for page in ([corrected, offset], [first, offset], versions[::-1] + [offset]):
+            rows, skipped = transaction_rows("account-a", page)
+            result = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True)
+            assert (result["imported"], skipped + result["ambiguous"]) == (0, 0)
+            assert [tuple(row) for row in ledger.execute("SELECT amount, description, category FROM transactions ORDER BY id")] == [
+                (119 * sign, "Rent", "einnahme_sonstige"), (-23 * sign, "Offset", "offen"),
+            ]
+            assert tuple(ledger.execute("SELECT id, ref FROM transactions WHERE id = 1").fetchone()) == original
+
+
+def test_fetch_local_invoice_reference_alone_keeps_distinct_known_dates():
+    first = bank_row(entry_reference="reused", booking_date="2026-11-23", transaction_date="2026-11-20",
+                     debtor_account={"iban": "DE00FIXTURE0001"}, transaction_id="lookup", reference_number="INV123")
+    second = first | {"transaction_date": "2026-11-21"}
+    for page in ([first, second], [second, first]):
+        rows, skipped = transaction_rows("account-a", page)
+        assert skipped == 0
+        assert len({row["ref"] for row in rows}) == 2
+        assert {row["transaction_day"] for row in rows} == {"2026-11-20", "2026-11-21"}
+
+
 def test_indistinguishable_dated_contenders_leave_old_booking_for_statement_review(sandbox):
     import core
 

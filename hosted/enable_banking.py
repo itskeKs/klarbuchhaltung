@@ -132,6 +132,7 @@ _SECONDARY_BANK_DATES = core._BANK_SECONDARY_DATES
 _OPTIONAL_BOOKING_FACTS = (*_FINANCIAL_BOOKING_FACTS, "counterparty_iban", *_SECONDARY_BANK_DATES)
 _REFERENCE_COPY_FACTS = ("balance_key", "creditor_ref")
 _FETCH_COPY_FACTS = ("provider_ref", "booked_day", *_OPTIONAL_BOOKING_FACTS)
+_FETCH_FIXED_FACTS = tuple(field for field in _FETCH_COPY_FACTS if field not in _SECONDARY_BANK_DATES)
 
 
 def _optional_bank_day(value):
@@ -301,6 +302,16 @@ def _corroborated_fetch_groups(copies):
     return groups
 
 
+def _fetch_copies_conflict(first, second):
+    same_balance = first["balance_key"] and first["balance_key"] == second["balance_key"]
+    same_reference = first["creditor_ref"] and first["creditor_ref"] == second["creditor_ref"]
+    same_booking = (all(first[field] and first[field] == second[field] for field in ("booked_day", "provider_ref"))
+                    and core._bank_account_match(first["counterparty_ids"], second["counterparty_ids"]) is True)
+    # A shared balance and corroborating bank facts can establish a date correction.
+    fields = _FETCH_FIXED_FACTS if same_balance and (same_reference or same_booking) else _FETCH_COPY_FACTS
+    return _conflicting_facts(first, second, fields) or _conflicting_counterparties(first, second)
+
+
 def _merge_fetch_copies(account_key, rows):
     """Use the current lookup ID within one account fetch, before numbering source occurrences."""
     batches = defaultdict(list)
@@ -315,16 +326,16 @@ def _merge_fetch_copies(account_key, rows):
         if len(copies) == 1:
             merged.extend(copies)
             continue
-        groups, unresolved = _compatible_copy_groups(
-            copies, lambda a, b: _conflicting_facts(a, b, _FETCH_COPY_FACTS) or _conflicting_counterparties(a, b),
-        )
+        groups, unresolved = _compatible_copy_groups(copies, _fetch_copies_conflict)
         skipped += len(unresolved)
         payments = []
         for versions in groups:
             preferred = min(versions, key=lambda row: (not row["provider_ref"], not row["booked_day"],
                                                         -sum(bool(row[field]) for field in _OPTIONAL_BOOKING_FACTS),
                                                         row["description"], row["ref"] or row["_source_key"]))
-            known = {field: row[field] for row in versions for field in _FETCH_COPY_FACTS if row[field]}
+            known = {field: row[field] for row in versions for field in _FETCH_FIXED_FACTS if row[field]}
+            for field in _SECONDARY_BANK_DATES:
+                known[field] = preferred[field] or min((copy[field] for copy in versions if copy[field]), default=None)
             row = preferred | known
             _merge_copy_metadata(row, versions)
             effective_day = row["booked_day"] or row["value_day"] or row["transaction_day"]

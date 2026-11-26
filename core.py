@@ -1995,20 +1995,25 @@ def _bank_match_rank(row, old, ref, source_refs):
     return 6  # Financial facts agree but there is no positive identifying evidence.
 
 
-def _bank_candidate_priority(row, old, rank, source_refs=()):
+def _bank_candidate_priority(row, old, rank, source_refs=(), observed_refs=()):
     if rank == 6:
         return None
-    if rank == 0:
-        return (0,)
     if old.ref in source_refs:
-        return (1,)
+        return (0,)
     financial_matches = sum(bool(row[field] and row[field] == getattr(old, field))
                             for field in ("balance_key", "creditor_ref"))
     account_match = _bank_account_match(row["counterparty_ids"], old.counterparty_ids) is True
-    # Compare corroboration only on eligible edges. A different secondary date
-    # is not a veto when another coexisting booking cannot match these facts.
-    return (2, -(financial_matches + account_match), _stored_secondary_match(row, old) is not True,
-            rank, not _bank_description_matches(row, old))
+    description_match = _bank_description_matches(row, old)
+    # The storage key describes the first import. Previously observed date aliases
+    # and independent facts can identify the booking after a bank correction.
+    return (1, -(financial_matches + account_match), not (old.ref in observed_refs and description_match),
+            rank != 0, _stored_secondary_match(row, old) is not True, rank, not description_match)
+
+
+def _bank_observed_secondary_refs(row, by_day):
+    groups = {row["bank_groups"][row[field]] for field in _BANK_SECONDARY_DATES
+              if row[field] and row[field] != row["date"]}
+    return set.intersection(*({old.ref for old in by_day[group]} for group in groups)) if groups else set()
 
 
 def _occupied_bank_reference(ref, row):
@@ -2067,7 +2072,6 @@ def _bank_matches(conn, rows):
     )
     by_provider = lookup("WHERE f.provider_ref = ?", {r["provider_ref"] for r in bank_rows if r["provider_ref"]})
     options = {}
-    storage_refs = {}
     unconfirmed_payers = defaultdict(list)
     for row in bank_rows:
         # The stored posting date still matches after the bank drops the original value date.
@@ -2082,11 +2086,12 @@ def _bank_matches(conn, rows):
                 candidates.add(existing)
                 break
             ref = _occupied_bank_reference(ref, row)
-        storage_refs[row["ref"]] = ref
         source_refs = _bank_source_refs(row, candidates)
+        observed_refs = _bank_observed_secondary_refs(row, by_day)
         ranked = [(old, rank) for old in candidates
                   if (rank := _bank_match_rank(row, old, ref, source_refs)) is not None]
-        options[row["ref"]] = {old.ref: _bank_candidate_priority(row, old, rank, source_refs) for old, rank in ranked}
+        options[row["ref"]] = {old.ref: _bank_candidate_priority(row, old, rank, source_refs, observed_refs)
+                               for old, rank in ranked}
         if row["counterparty_ids"] and row["creditor_ref"]:
             for old, rank in ranked:
                 if (rank == 6 and old.creditor_ref == row["creditor_ref"]
@@ -2100,7 +2105,9 @@ def _bank_matches(conn, rows):
             matching = [row for row in contenders if _bank_description_matches(row, old)]
             if len(matching) == 1:
                 row = matching[0]
-                options[row["ref"]][old.ref] = _bank_candidate_priority(row, old, 4)
+                options[row["ref"]][old.ref] = _bank_candidate_priority(
+                    row, old, 4, observed_refs=_bank_observed_secondary_refs(row, by_day),
+                )
 
     matched = {}
     used = set()
@@ -2119,9 +2126,18 @@ def _bank_matches(conn, rows):
                 used.add(old)
                 del options[ref]
     ambiguous = {ref for ref, candidates in options.items() if candidates.keys() - used}
+    storage_refs = {}
+    reserved = set()
     for row in bank_rows:
-        if row["ref"] in matched:
-            _remember_bank_booking(conn, matched[row["ref"]], row)
+        source_ref = row["ref"]
+        if source_ref in matched:
+            _remember_bank_booking(conn, matched[source_ref], row)
+        elif source_ref not in ambiguous:
+            ref = source_ref
+            while ref in reserved or conn.execute("SELECT 1 FROM transactions WHERE ref = ?", (ref,)).fetchone():
+                ref = _occupied_bank_reference(ref, row)
+            storage_refs[source_ref] = ref
+            reserved.add(ref)
     return matched, ambiguous, storage_refs
 
 
