@@ -10,7 +10,7 @@ import os
 import sqlite3
 import sys
 import tomllib
-from collections import Counter
+from collections import Counter, namedtuple
 from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
@@ -1115,10 +1115,13 @@ def init_schema(conn: sqlite3.Connection) -> None:
             ref TEXT PRIMARY KEY REFERENCES transactions(ref) ON DELETE CASCADE,
             booking_group TEXT NOT NULL
         );
-        CREATE TABLE IF NOT EXISTS bank_import_provider_ref (
-            provider_ref TEXT PRIMARY KEY,
-            ref TEXT UNIQUE NOT NULL REFERENCES transactions(ref) ON DELETE CASCADE
+        CREATE TABLE IF NOT EXISTS bank_import_facts (
+            ref TEXT PRIMARY KEY REFERENCES transactions(ref) ON DELETE CASCADE,
+            provider_ref TEXT,
+            booked_day TEXT,
+            balance_key TEXT
         );
+        CREATE INDEX IF NOT EXISTS idx_bank_provider_ref ON bank_import_facts(provider_ref);
         CREATE INDEX IF NOT EXISTS idx_bank_import_group ON bank_import_identity(booking_group);
         CREATE TABLE IF NOT EXISTS fx_rates (
             date   TEXT NOT NULL,   -- Kursdatum (YYYY-MM-DD)
@@ -1868,72 +1871,89 @@ def import_bank_csv(conn, text: str) -> dict:
 ENABLE_BANKING_REF_PREFIX = "enablebanking:"
 
 
+_BankBooking = namedtuple("_BankBooking", "ref description provider_ref booked_day balance_key")
+
+
+def _remember_bank_booking(conn, ref, row):
+    conn.execute("INSERT OR IGNORE INTO bank_import_identity (ref, booking_group) VALUES (?, ?)",
+                 (ref, row["bank_groups"][0]))
+    conn.execute(
+        "INSERT INTO bank_import_facts (ref, provider_ref, booked_day, balance_key) VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(ref) DO UPDATE SET provider_ref = COALESCE(provider_ref, excluded.provider_ref), "
+        "booked_day = COALESCE(booked_day, excluded.booked_day), "
+        "balance_key = COALESCE(balance_key, excluded.balance_key)",
+        (ref, row["provider_ref"], row["booked_day"], row["balance_key"]),
+    )
+
+
+def _bank_match_rank(row, old):
+    """Stronger evidence wins first. Conflicting known facts identify separate bookings."""
+    if any(row[field] and getattr(old, field) and row[field] != getattr(old, field)
+           for field in ("booked_day", "balance_key", "provider_ref")):
+        return None
+    if row["ref"] == old.ref:
+        return 0
+    if old.ref in row["prior_refs"] or (old.provider_ref and row["provider_ref"] == old.provider_ref):
+        return 1
+    if old.balance_key and row["balance_key"] == old.balance_key:
+        return 2
+    if old.description and old.description != "Bankumsatz":
+        if old.description == row["description"]:
+            return 3
+        if set(old.description.split(" · ")) < set(row["description"].split(" · ")):
+            return 4
+    return 5  # Financial facts agree but there is no positive identifying evidence.
+
+
 def _bank_matches(conn, rows):
     """Resolve identities for the whole overlap before inserting any new payments."""
     bank_rows = [r for r in rows if r.get("bank_groups")]
     if not bank_rows:
         return {}, set()
 
+    for row in bank_rows:
+        # Attach known refs from older ledgers to their account without rewriting payments.
+        conn.executemany(
+            "INSERT OR IGNORE INTO bank_import_identity (booking_group, ref) "
+            "SELECT ?, ref FROM transactions WHERE ref = ?",
+            ((row["bank_groups"][0], candidate) for candidate in (row["ref"], *row["prior_refs"])),
+        )
+    select = ("SELECT i.ref, t.description, f.provider_ref, f.booked_day, f.balance_key "
+              "FROM bank_import_identity i JOIN transactions t USING (ref) "
+              "LEFT JOIN bank_import_facts f USING (ref) ")
+    def lookup(clause, keys):
+        return {key: [_BankBooking(*r) for r in conn.execute(select + clause, (key,))]
+                for key in keys}
+
+    by_day = lookup("WHERE i.booking_group = ?", {g for row in bank_rows for g in row["bank_groups"]})
+    by_provider = lookup("WHERE f.provider_ref = ?", {r["provider_ref"] for r in bank_rows if r["provider_ref"]})
+    options = {}
+    for row in bank_rows:
+        candidates = set(by_provider.get(row["provider_ref"], []))
+        for group in row["bank_groups"]:
+            candidates.update(by_day[group])
+        options[row["ref"]] = {old.ref: rank for old in candidates
+                               if (rank := _bank_match_rank(row, old)) is not None}
+
     matched = {}
     used = set()
-    for row in bank_rows:
-        ref = row["ref"]
-        # Seed tracking for an existing ledger without changing its public refs.
-        for candidate in (ref, *row["prior_refs"]):
-            conn.execute("INSERT OR IGNORE INTO bank_import_identity (booking_group, ref) "
-                         "SELECT ?, ref FROM transactions WHERE ref = ?", (row["bank_groups"][0], candidate))
-            if conn.execute("SELECT 1 FROM bank_import_identity WHERE ref = ?", (candidate,)).fetchone():
-                matched[ref] = candidate
-                break
-        if row["provider_ref"] and ref not in matched:
-            saved = conn.execute("SELECT ref FROM bank_import_provider_ref WHERE provider_ref = ?",
-                                 (row["provider_ref"],)).fetchone()
-            if saved:
-                matched[ref] = saved[0]
-    used.update(matched.values())
-
-    by_group = {}
-    for group in {g for row in bank_rows for g in row["bank_groups"]}:
-        by_group[group] = conn.execute(
-            "SELECT i.ref, t.description, p.provider_ref FROM bank_import_identity i "
-            "JOIN transactions t ON t.ref = i.ref LEFT JOIN bank_import_provider_ref p ON p.ref = i.ref "
-            "WHERE i.booking_group = ?", (group,),
-        ).fetchall()
-
-    def candidates(row):
-        return {ref: desc for group in row["bank_groups"] for ref, desc, provider in by_group[group]
-                if ref not in used and not (provider and row["provider_ref"] and provider != row["provider_ref"])}
-
-    def pieces(description):
-        return set(description.split(" · ")) if description and description != "Bankumsatz" else set()
-
-    unresolved = {row["ref"]: row for row in bank_rows if row["ref"] not in matched}
-    # Reserve exact descriptions first, then unique enrichments. A match must be
-    # unique in both directions, independent of the bank's ordering or page breaks.
-    for enrichment in (False, True):
-        choices = {}
+    for rank in range(5):
         contenders = Counter()
-        for ref, row in unresolved.items():
-            incoming = pieces(row["description"])
-            options = []
-            for old_ref, description in candidates(row).items():
-                prior = pieces(description)
-                if incoming and prior and (prior < incoming if enrichment else prior == incoming):
-                    options.append(old_ref)
-            contenders.update(options)
-            if len(options) == 1:
-                choices[ref] = options[0]
-        for ref, old_ref in choices.items():
-            if contenders[old_ref] == 1:
-                matched[ref] = old_ref
-                used.add(old_ref)
-                del unresolved[ref]
-
-    ambiguous = {ref for ref, row in unresolved.items() if candidates(row)}
+        choices = {}
+        for ref, candidates in options.items():
+            available = [old for old, priority in candidates.items() if priority == rank and old not in used]
+            contenders.update(available)
+            if len(available) == 1:
+                choices[ref] = available[0]
+        for ref, old in choices.items():
+            if contenders[old] == 1:
+                matched[ref] = old
+                used.add(old)
+                del options[ref]
+    ambiguous = {ref for ref, candidates in options.items() if candidates.keys() - used}
     for row in bank_rows:
-        if row["provider_ref"] and row["ref"] in matched:
-            conn.execute("INSERT OR IGNORE INTO bank_import_provider_ref VALUES (?, ?)",
-                         (row["provider_ref"], matched[row["ref"]]))
+        if row["ref"] in matched:
+            _remember_bank_booking(conn, matched[row["ref"]], row)
     return matched, ambiguous
 
 
@@ -1970,10 +1990,7 @@ def import_bank_rows(conn, rows: list, *, auto_match: bool = True, require_fx: b
              r.get("description") or "", r.get("tx_type") or "", _now()),
         )
         if inserted.rowcount and r.get("bank_groups"):
-            conn.execute("INSERT INTO bank_import_identity (ref, booking_group) VALUES (?, ?)",
-                         (ref, r["bank_groups"][0]))
-            if r["provider_ref"]:
-                conn.execute("INSERT INTO bank_import_provider_ref VALUES (?, ?)", (r["provider_ref"], ref))
+            _remember_bank_booking(conn, ref, r)
         imported += inserted.rowcount
         dups += 1 - inserted.rowcount
     conn.commit()

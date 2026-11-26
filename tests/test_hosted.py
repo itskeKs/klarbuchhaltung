@@ -353,6 +353,92 @@ def test_new_equal_payment_precedes_enriched_memo(sandbox):
         )] == [("Rent", "einnahme_sonstige"), ("Supplies", "offen")]
 
 
+def test_reference_reused_on_another_booking_date(sandbox):
+    import core
+
+    ledger = core.db()
+    first = bank_row(entry_reference="monthly", booking_date="2026-11-01")
+    second = first | {"booking_date": "2026-11-07"}
+    debit = bank_row(entry_reference="debit", credit_debit_indicator="DBIT",
+                     transaction_amount={"currency": "EUR", "amount": "23.00"})
+
+    for batch, expected in (([first, debit], 2), ([second, debit, first], 1), ([first, second, debit], 0)):
+        rows, skipped = transaction_rows("account-a", batch)
+        assert skipped == 0
+        assert core.import_bank_rows(ledger, rows, auto_match=False)["imported"] == expected
+    assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (3, 215)
+
+
+def test_balance_distinguishes_equal_bookings_when_a_memo_arrives(sandbox):
+    import core
+
+    ledger = core.db()
+    first = bank_row(remittance_information=[], balance_after_transaction={"amount": "119", "currency": "EUR"})
+    second = first | {"balance_after_transaction": {"amount": "238", "currency": "EUR"}}
+    enriched = first | {"remittance_information": ["Rent"]}
+    for batch, expected in (([first], 1), ([second, enriched], 1), ([enriched, second], 0)):
+        rows, _ = transaction_rows("account-a", batch)
+        result = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True)
+        assert (result["imported"], result["ambiguous"]) == (expected, 0)
+    assert len(core.list_transactions(ledger)) == 2
+
+
+def test_reconnecting_preserves_account_identity_when_iban_appears(sandbox):
+    import core
+    from hosted.bank_service import BankingService
+
+    class Reconnected(StubProvider):
+        iban = None
+
+        def request(self, method, path, *, query=None, data=None):
+            response = super().request(method, path, query=query, data=data)
+            if path == "/sessions" and self.iban:
+                response["accounts"][1]["account_id"] = {"iban": self.iban}
+            return response
+
+    service = BankingService(sandbox, sandbox, SITE + "/api/bank/callback", client_factory=Reconnected)
+    service.save_credentials(APP_ID, b"fixture-key")
+    for iban, count in ((None, 2), ("DE00FIXTURE0001", 0), (None, 0)):
+        Reconnected.iban = iban
+        state = parse_qs(urlsplit(service.begin("login-a", "DE", BANK, "business")).query)["state"][0]
+        service.finish("login-a", state, "fixture-code", "")
+        assert service.sync(force=True) == count
+        service.disconnect(SESSION)
+    ledger = core.db()
+    assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (2, 96)
+
+
+def test_existing_iban_key_is_retained_after_reauthorization(sandbox):
+    from hosted.bank_service import BankingService
+
+    class WithIban(StubProvider):
+        def request(self, method, path, *, query=None, data=None):
+            response = super().request(method, path, query=query, data=data)
+            if path == "/sessions":
+                response["accounts"][1]["account_id"] = {"iban": "DE00FIXTURE0001"}
+            return response
+
+    from hosted.enable_banking import fingerprint
+
+    callback = SITE + "/api/bank/callback"
+    service = BankingService(sandbox, sandbox, callback, client_factory=WithIban)
+    service.save_credentials(APP_ID, b"fixture-key")
+    def connect():
+        state = parse_qs(urlsplit(service.begin("login-a", "DE", BANK, "business")).query)["state"][0]
+        service.finish("login-a", state, "fixture-code", "")
+    connect()
+    accounts = service.consents()[0]["accounts"]
+    accounts[0]["key"] = fingerprint("DE00FIXTURE0001")
+    with sqlite3.connect(service.path) as db:
+        db.execute("DELETE FROM account_aliases")
+        db.execute("UPDATE consents SET accounts = ?", (json.dumps(accounts),))
+    assert service.sync(force=True) == 2
+    service = BankingService(sandbox, sandbox, callback, client_factory=WithIban)
+    connect()
+    assert service.consents()[0]["accounts"][0]["key"] == accounts[0]["key"]
+    assert service.sync(force=True) == 0
+
+
 def test_ambiguous_overlap_waits_for_bank_details(sandbox):
     import core
 

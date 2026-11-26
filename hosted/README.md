@@ -33,7 +33,8 @@ booked transactions. Pending entries stay at the bank until booked. Under **Zahl
 new entries are open for categorization. Repeated checks preserve assignments. If the
 bank omits a permanent reference and the overlap leaves multiple possible matches,
 **Banking** shows the number of ambiguous entries. Compare them with the statement.
-The next fetch retries them as the bank supplies more detail.
+The next fetch retries them as the bank supplies more detail. Reauthorizing the same
+account preserves its payment history, including when the bank adds an IBAN.
 
 When a consent expires, use **Bank verbinden** and complete consent again. **Verbindung
 trennen** stops imports for that connection. Its payments and their categories remain in

@@ -152,11 +152,14 @@ def transaction_rows(account_key, transactions):
         entry_ref = tx.get("entry_reference")
         provider_ref = None
         prior_refs = []
+        balance = tx.get("balance_after_transaction")
+        balance_key = fingerprint(balance) if balance else None
         if isinstance(entry_ref, str) and entry_ref.strip():
             entry_ref = entry_ref.strip()
             provider_ref = fingerprint(account_key, "entry", entry_ref, amount_key, currency)
-            identity = provider_ref
-            # Older imports included the effective date in their provider reference.
+            dated_ref = fingerprint(account_key, "entry", entry_ref, booking, amount_key, currency)
+            identity = fingerprint(dated_ref, balance_key) if balance_key else dated_ref
+            # Match earlier ledgers whose IDs used only the effective date and amount.
             prior_refs = [core.ENABLE_BANKING_REF_PREFIX + fingerprint(
                 account_key, "entry", entry_ref, day, amount_key, currency
             ) for day in dict.fromkeys(day for day in dates if day)]
@@ -180,6 +183,8 @@ def transaction_rows(account_key, transactions):
         row["bank_groups"] = [fingerprint(account_key, day, amount_key, currency)
                               for day in dict.fromkeys([booking, *(day for day in dates if day)])]
         row["provider_ref"] = provider_ref
+        row["booked_day"] = dates[0] or None
+        row["balance_key"] = balance_key
         row["prior_refs"] = prior_refs
         rows.append(row)
     return rows, skipped

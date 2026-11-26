@@ -42,6 +42,9 @@ class BankingService:
                 CREATE TABLE IF NOT EXISTS credentials (
                     id INTEGER PRIMARY KEY CHECK(id = 1), application_id TEXT NOT NULL, pem BLOB NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS account_aliases (
+                    alias TEXT PRIMARY KEY, account_key TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS pending (
                     state TEXT PRIMARY KEY, login TEXT NOT NULL, expires INTEGER NOT NULL,
                     country TEXT NOT NULL, bank TEXT NOT NULL, psu_type TEXT NOT NULL, valid_until TEXT NOT NULL
@@ -53,6 +56,10 @@ class BankingService:
                     UNIQUE (bank, country, psu_type)
                 );
             """)
+            # Seed original keys from existing consents, including legacy IBAN-based keys.
+            for saved in db.execute("SELECT accounts FROM consents"):
+                db.executemany("INSERT OR IGNORE INTO account_aliases VALUES (?, ?)",
+                               ((a["key"], a["key"]) for a in json.loads(saved[0])))
         self.path.chmod(0o600)
 
     def connect(self):
@@ -184,8 +191,11 @@ class BankingService:
                 except (KeyError, TypeError, ValueError, AttributeError):
                     continue
                 iban = (account.get("account_id") or {}).get("iban")
-                stable = iban or account.get("identification_hash") or uid
-                accounts.append({"uid": uid, "key": fingerprint(stable),
+                identifiers = [account.get("identification_hash"), *(account.get("identification_hashes") or []), iban]
+                aliases = list(dict.fromkeys(fingerprint(v) for v in identifiers if isinstance(v, str) and v))
+                if not aliases:
+                    continue
+                accounts.append({"uid": uid, "aliases": aliases,
                                  "label": (account.get("name") or account.get("product") or "Konto"),
                                  "suffix": iban[-4:] if iban else None})
             valid_until = (authorized.get("access") or {}).get("valid_until") or pending["valid_until"]
@@ -195,6 +205,17 @@ class BankingService:
         if not accounts:
             raise BankingError("Die Bank hat keine Konten freigegeben.")
         with closing(self.connect()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            for account in accounts:
+                aliases = account.pop("aliases")
+                known = {found[0] for alias in aliases for found in db.execute(
+                    "SELECT account_key FROM account_aliases WHERE alias = ?", (alias,)
+                )}
+                if len(known) > 1:
+                    raise BankingError("Die Kontokennung ist mehrdeutig. Prüfe die Bankverbindung.")
+                key = next(iter(known), aliases[0])
+                db.executemany("INSERT OR IGNORE INTO account_aliases VALUES (?, ?)", ((a, key) for a in aliases))
+                account["key"] = key
             previous = db.execute(
                 "SELECT id FROM consents WHERE bank = ? AND country = ? AND psu_type = ?",
                 (pending["bank"], pending["country"], pending["psu_type"]),
