@@ -1900,16 +1900,18 @@ def _bank_match_rank(row, old):
         return None
     if row["ref"] == old.ref:
         return 0
-    if old.ref in row["prior_refs"] or (old.provider_ref and row["provider_ref"] == old.provider_ref):
+    if old.ref in row["prior_refs"]:
         return 1
-    if (old.balance_key and row["balance_key"] == old.balance_key) or (old.creditor_ref and row["creditor_ref"] == old.creditor_ref):
+    if old.provider_ref and row["provider_ref"] == old.provider_ref:
         return 2
+    if (old.balance_key and row["balance_key"] == old.balance_key) or (old.creditor_ref and row["creditor_ref"] == old.creditor_ref):
+        return 3
     if old.description and old.description != "Bankumsatz":
         if old.description == row["description"]:
-            return 3
-        if set(old.description.split(" · ")) < set(row["description"].split(" · ")):
             return 4
-    return 5  # Financial facts agree but there is no positive identifying evidence.
+        if set(old.description.split(" · ")) < set(row["description"].split(" · ")):
+            return 5
+    return 6  # Financial facts agree but there is no positive identifying evidence.
 
 
 def _bank_matches(conn, rows):
@@ -1944,7 +1946,7 @@ def _bank_matches(conn, rows):
 
     matched = {}
     used = set()
-    for rank in range(5):
+    for rank in range(6):
         contenders = Counter()
         choices = {}
         for ref, candidates in options.items():

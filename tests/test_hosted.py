@@ -353,6 +353,30 @@ def test_new_equal_payment_precedes_enriched_memo(sandbox):
         )] == [("Rent", "einnahme_sonstige"), ("Supplies", "offen")]
 
 
+@pytest.mark.parametrize("reverse", [True, False])
+def test_dated_match_precedes_reused_bank_reference(sandbox, reverse):
+    import core
+
+    ledger = core.db()
+    first = bank_row(entry_reference="reused", booking_date=None, value_date="2026-11-22")
+    later = bank_row(entry_reference="reused", booking_date="2026-11-24", value_date="2026-11-24")
+    debit = bank_row(entry_reference="debit", credit_debit_indicator="DBIT",
+                     transaction_amount={"currency": "EUR", "amount": "23.00"})
+    rows, _ = transaction_rows("account-a", [first, debit])
+    core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True)
+    core.set_tx_category(ledger, 1, "einnahme_sonstige")
+    enriched = first | {"booking_date": "2026-11-23"}
+    batch = [later, enriched, debit]
+    if reverse:
+        batch.reverse()
+    for expected in (1, 0):
+        rows, skipped = transaction_rows("account-a", batch)
+        result = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True)
+        assert (result["imported"], skipped + result["ambiguous"]) == (expected, 0)
+        assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (3, 215)
+        assert core.get_transaction(ledger, 1)["category"] == "einnahme_sonstige"
+
+
 def test_reference_reused_on_another_booking_date(sandbox):
     import core
 
