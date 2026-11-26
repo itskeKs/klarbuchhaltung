@@ -56,7 +56,7 @@ laufenden Kosten — eine SQLite-Datei und deine Belege als PDF.
 
 ## Installieren
 
-Fertige Pakete liegen unter [Releases](../../releases).
+Fertige Pakete liegen unter [Releases](https://github.com/itskeKs/klarbuchhaltung/releases).
 
 | System | Datei | Start |
 |--------|-------|-------|
@@ -162,7 +162,7 @@ Darunter liegt je Profil `profiles/<name>/` mit `config.toml` und `data/`.
   Duplikate erkennt die App per Prüfsumme.
 - **Automatischer Abgleich**: Eingänge werden offenen Rechnungen mit gleichem
   Betrag zugeordnet, die Rechnung gilt damit als bezahlt.
-- **Regeln, die sich selbst lernen**: Sobald du eine Buchung zuordnest, merkt
+- **[Regeln, die sich selbst lernen](docs/acceptance/recurring-payments.md)**: Sobald du eine Buchung zuordnest, merkt
   sich die App die Zuordnung je Beschreibung und schlägt sie beim nächsten Mal
   vor — bestätigen musst du weiterhin selbst.
 ![Banking](docs/screenshots/banking.jpg)
