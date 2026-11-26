@@ -313,6 +313,65 @@ def test_unreferenced_booking_survives_enrichment_and_new_equal_payments(sandbox
            ("Third transfer", "offen")]
 
 
+@pytest.mark.parametrize("initial_ref", ["credit", None])
+def test_provider_enrichment_preserves_open_total_and_category(sandbox, initial_ref):
+    import core
+
+    conn = core.db()
+    first = bank_row(booking_date=None, value_date="2026-11-24", entry_reference=initial_ref)
+    debit = bank_row(booking_date="2026-11-24", entry_reference="debit", credit_debit_indicator="DBIT",
+                     transaction_amount={"currency": "EUR", "amount": "23.00"})
+    def ingest(page):
+        rows, skipped = transaction_rows("account-a", page)
+        assert skipped == 0
+        return core.import_bank_rows(conn, rows, auto_match=False)["imported"]
+
+    assert ingest([first, debit]) == 2
+    core.set_tx_category(conn, 1, "einnahme_sonstige")
+    enriched = first | {"entry_reference": "credit", "booking_date": "2026-11-25"}
+    assert ingest([debit, enriched]) == 0
+    assert ingest([enriched | {"remittance_information": ["Updated memo"]}, debit]) == 0
+    assert tuple(conn.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (2, 96)
+    assert core.get_transaction(conn, 1)["category"] == "einnahme_sonstige"
+
+
+def test_new_equal_payment_precedes_enriched_memo(sandbox):
+    import core
+
+    conn = core.db()
+    rent = bank_row(remittance_information=["Rent"])
+    supplies = bank_row(remittance_information=["Supplies"])
+    rows, _ = transaction_rows("account-a", [rent])
+    core.import_bank_rows(conn, rows, auto_match=False)
+    core.set_tx_category(conn, 1, "einnahme_sonstige")
+    enriched = rent | {"remittance_information": ["Rent", "November"]}
+    for batch, expected in (([supplies, enriched], 1), ([enriched, supplies], 0)):
+        rows, _ = transaction_rows("account-a", batch)
+        assert core.import_bank_rows(conn, rows, auto_match=False)["imported"] == expected
+        assert [tuple(row) for row in conn.execute(
+            "SELECT description, category FROM transactions ORDER BY id"
+        )] == [("Rent", "einnahme_sonstige"), ("Supplies", "offen")]
+
+
+def test_ambiguous_overlap_waits_for_bank_details(sandbox):
+    import core
+
+    conn = core.db()
+    rent = bank_row(remittance_information=["Rent"])
+    initial, _ = transaction_rows("account-a", [rent])
+    core.import_bank_rows(conn, initial, auto_match=False, require_fx=True)
+    core.set_tx_category(conn, 1, "einnahme_sonstige")
+    unclear = [bank_row(remittance_information=[memo]) for memo in ("New memo", "Supplies")]
+    rows, _ = transaction_rows("account-a", unclear)
+    result = core.import_bank_rows(conn, rows, auto_match=False, require_fx=True)
+    assert (result["imported"], result["ambiguous"]) == (0, 2)
+    assert core.get_transaction(conn, 1)["category"] == "einnahme_sonstige"
+
+    rows, _ = transaction_rows("account-a", [rent, unclear[1]])
+    result = core.import_bank_rows(conn, rows, auto_match=False, require_fx=True)
+    assert (result["imported"], result["ambiguous"]) == (1, 0)
+
+
 def test_provider_reference_survives_optional_details_and_detects_conflicts():
     initial = bank_row(entry_reference="stable")
     enriched = initial | {"remittance_information": ["Enriched on later fetch"]}

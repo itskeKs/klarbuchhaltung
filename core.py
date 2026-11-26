@@ -10,7 +10,7 @@ import os
 import sqlite3
 import sys
 import tomllib
-from collections import Counter, defaultdict
+from collections import Counter
 from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
@@ -1115,6 +1115,10 @@ def init_schema(conn: sqlite3.Connection) -> None:
             ref TEXT PRIMARY KEY REFERENCES transactions(ref) ON DELETE CASCADE,
             booking_group TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS bank_import_provider_ref (
+            provider_ref TEXT PRIMARY KEY,
+            ref TEXT UNIQUE NOT NULL REFERENCES transactions(ref) ON DELETE CASCADE
+        );
         CREATE INDEX IF NOT EXISTS idx_bank_import_group ON bank_import_identity(booking_group);
         CREATE TABLE IF NOT EXISTS fx_rates (
             date   TEXT NOT NULL,   -- Kursdatum (YYYY-MM-DD)
@@ -1864,41 +1868,73 @@ def import_bank_csv(conn, text: str) -> dict:
 ENABLE_BANKING_REF_PREFIX = "enablebanking:"
 
 
-def _seen_bank_rows(conn, rows):
-    """Reconcile complete daily batches when the bank supplies no permanent reference."""
-    groups = defaultdict(list)
-    for row in rows:
-        if row.get("bank_group"):
-            groups[row["bank_group"]].append(row)
+def _bank_matches(conn, rows):
+    """Resolve identities for the whole overlap before inserting any new payments."""
+    bank_rows = [r for r in rows if r.get("bank_groups")]
+    if not bank_rows:
+        return {}, set()
 
-    seen = set()
-    for group, batch in groups.items():
-        # Recognize existing-format refs on upgrade without touching user assignments.
-        conn.executemany(
-            "INSERT OR IGNORE INTO bank_import_identity (booking_group, ref) "
-            "SELECT ?, ref FROM transactions WHERE ref = ?",
-            ((group, row["ref"]) for row in batch),
-        )
-        saved = dict(conn.execute(
-            "SELECT ref, description FROM bank_import_identity JOIN transactions USING (ref) "
-            "WHERE booking_group = ?", (group,),
-        ))
-        exact = saved.keys() & {row["ref"] for row in batch}
-        seen.update(exact)
-        descriptions = Counter(desc for ref, desc in saved.items() if ref not in exact)
-        unmatched = []
-        for row in batch:
-            if row["ref"] in exact:
-                continue
-            if descriptions[row["description"]]:
-                seen.add(row["ref"])
-                descriptions[row["description"]] -= 1
-            else:
-                unmatched.append(row["ref"])
-        # The whole posting date is fetched together. Changed optional details can
-        # account for existing payments; only additional occurrences are new.
-        seen.update(unmatched[:descriptions.total()])
-    return seen
+    matched = {}
+    used = set()
+    for row in bank_rows:
+        ref = row["ref"]
+        # Seed tracking for an existing ledger without changing its public refs.
+        for candidate in (ref, *row["prior_refs"]):
+            conn.execute("INSERT OR IGNORE INTO bank_import_identity (booking_group, ref) "
+                         "SELECT ?, ref FROM transactions WHERE ref = ?", (row["bank_groups"][0], candidate))
+            if conn.execute("SELECT 1 FROM bank_import_identity WHERE ref = ?", (candidate,)).fetchone():
+                matched[ref] = candidate
+                break
+        if row["provider_ref"] and ref not in matched:
+            saved = conn.execute("SELECT ref FROM bank_import_provider_ref WHERE provider_ref = ?",
+                                 (row["provider_ref"],)).fetchone()
+            if saved:
+                matched[ref] = saved[0]
+    used.update(matched.values())
+
+    by_group = {}
+    for group in {g for row in bank_rows for g in row["bank_groups"]}:
+        by_group[group] = conn.execute(
+            "SELECT i.ref, t.description, p.provider_ref FROM bank_import_identity i "
+            "JOIN transactions t ON t.ref = i.ref LEFT JOIN bank_import_provider_ref p ON p.ref = i.ref "
+            "WHERE i.booking_group = ?", (group,),
+        ).fetchall()
+
+    def candidates(row):
+        return {ref: desc for group in row["bank_groups"] for ref, desc, provider in by_group[group]
+                if ref not in used and not (provider and row["provider_ref"] and provider != row["provider_ref"])}
+
+    def pieces(description):
+        return set(description.split(" · ")) if description and description != "Bankumsatz" else set()
+
+    unresolved = {row["ref"]: row for row in bank_rows if row["ref"] not in matched}
+    # Reserve exact descriptions first, then unique enrichments. A match must be
+    # unique in both directions, independent of the bank's ordering or page breaks.
+    for enrichment in (False, True):
+        choices = {}
+        contenders = Counter()
+        for ref, row in unresolved.items():
+            incoming = pieces(row["description"])
+            options = []
+            for old_ref, description in candidates(row).items():
+                prior = pieces(description)
+                if incoming and prior and (prior < incoming if enrichment else prior == incoming):
+                    options.append(old_ref)
+            contenders.update(options)
+            if len(options) == 1:
+                choices[ref] = options[0]
+        for ref, old_ref in choices.items():
+            if contenders[old_ref] == 1:
+                matched[ref] = old_ref
+                used.add(old_ref)
+                del unresolved[ref]
+
+    ambiguous = {ref for ref, row in unresolved.items() if candidates(row)}
+    for row in bank_rows:
+        if row["provider_ref"] and row["ref"] in matched:
+            conn.execute("INSERT OR IGNORE INTO bank_import_provider_ref VALUES (?, ?)",
+                         (row["provider_ref"], matched[row["ref"]]))
+    return matched, ambiguous
 
 
 def import_bank_rows(conn, rows: list, *, auto_match: bool = True, require_fx: bool = False) -> dict:
@@ -1907,11 +1943,13 @@ def import_bank_rows(conn, rows: list, *, auto_match: bool = True, require_fx: b
     Auto-match is optional. Enable Banking rows are always left for review.
     'ref' ist UNIQUE, ein erneuter Abruf legt also nichts doppelt an."""
     imported = dups = deferred = 0
-    seen = _seen_bank_rows(conn, rows)
+    seen, ambiguous = _bank_matches(conn, rows)
     for r in rows:
         ref = (r.get("ref") or "").strip()
         date_ = (r.get("date") or "")[:10]
         if not ref or not date_:
+            continue
+        if ref in ambiguous:
             continue
         if ref in seen or conn.execute("SELECT 1 FROM transactions WHERE ref = ?", (ref,)).fetchone():
             dups += 1
@@ -1931,9 +1969,11 @@ def import_bank_rows(conn, rows: list, *, auto_match: bool = True, require_fx: b
             (ref, date_, amount, float(r.get("fee") or 0), currency, amount_home, fx,
              r.get("description") or "", r.get("tx_type") or "", _now()),
         )
-        if inserted.rowcount and r.get("bank_group"):
+        if inserted.rowcount and r.get("bank_groups"):
             conn.execute("INSERT INTO bank_import_identity (ref, booking_group) VALUES (?, ?)",
-                         (ref, r["bank_group"]))
+                         (ref, r["bank_groups"][0]))
+            if r["provider_ref"]:
+                conn.execute("INSERT INTO bank_import_provider_ref VALUES (?, ?)", (r["provider_ref"], ref))
         imported += inserted.rowcount
         dups += 1 - inserted.rowcount
     conn.commit()
@@ -1941,6 +1981,7 @@ def import_bank_rows(conn, rows: list, *, auto_match: bool = True, require_fx: b
     result = {"imported": imported, "duplicates": dups, "matched": matched}
     if require_fx:
         result["deferred"] = deferred
+        result["ambiguous"] = len(ambiguous)
     return result
 
 

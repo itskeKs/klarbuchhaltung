@@ -270,6 +270,7 @@ class BankingService:
                         continue
                     with closing(core.db()) as ledger:
                         result = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True)
+                skipped += result["ambiguous"]
                 imported, deferred = result["imported"], result["deferred"]
                 message = f"{imported} neue Umsätze importiert."
                 if deferred:

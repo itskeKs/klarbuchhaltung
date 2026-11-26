@@ -148,10 +148,18 @@ def transaction_rows(account_key, transactions):
         remittance = tx.get("remittance_information")
         details = [s.strip() for s in remittance if isinstance(s, str) and s.strip()] if isinstance(remittance, list) else []
         description = " · ".join(dict.fromkeys([*([name] if isinstance(name, str) and name else []), *details]))
+        amount_key = str(amount.normalize())
         entry_ref = tx.get("entry_reference")
+        provider_ref = None
+        prior_refs = []
         if isinstance(entry_ref, str) and entry_ref.strip():
-            identity = fingerprint(account_key, "entry", entry_ref.strip(), booking,
-                                   str(amount.normalize()), currency)
+            entry_ref = entry_ref.strip()
+            provider_ref = fingerprint(account_key, "entry", entry_ref, amount_key, currency)
+            identity = provider_ref
+            # Older imports included the effective date in their provider reference.
+            prior_refs = [core.ENABLE_BANKING_REF_PREFIX + fingerprint(
+                account_key, "entry", entry_ref, day, amount_key, currency
+            ) for day in dict.fromkeys(day for day in dates if day)]
             description_version = (name, details)
             if identity in references:
                 if references[identity] != description_version:
@@ -167,9 +175,11 @@ def transaction_rows(account_key, transactions):
             occurrences[key] += 1
             identity = fingerprint(key, occurrences[key])
         row = {"ref": core.ENABLE_BANKING_REF_PREFIX + identity, "date": booking,
-                     "amount": str(amount), "currency": currency,
-                     "description": description or "Bankumsatz", "tx_type": "Enable Banking"}
-        if not isinstance(entry_ref, str) or not entry_ref.strip():
-            row["bank_group"] = fingerprint(account_key, booking, str(amount.normalize()), currency)
+               "amount": str(amount), "currency": currency,
+               "description": description or "Bankumsatz", "tx_type": "Enable Banking"}
+        row["bank_groups"] = [fingerprint(account_key, day, amount_key, currency)
+                              for day in dict.fromkeys([booking, *(day for day in dates if day)])]
+        row["provider_ref"] = provider_ref
+        row["prior_refs"] = prior_refs
         rows.append(row)
     return rows, skipped
