@@ -17,6 +17,10 @@ from hosted.common import digest
 from hosted.enable_banking import BankingError, EnableBanking, fingerprint, transaction_rows
 
 
+# Enable Banking is migrating its consent pages from tilisy to auth.
+CONSENT_HOSTS = {"auth.enablebanking.com", "tilisy.enablebanking.com"}
+
+
 def utc_now():
     return datetime.now(timezone.utc)
 
@@ -148,7 +152,7 @@ class BankingService:
         })
         url = response.get("url")
         parsed = urlsplit(url or "")
-        if parsed.scheme != "https" or parsed.netloc != "auth.enablebanking.com":
+        if parsed.scheme != "https" or parsed.netloc.lower().removesuffix(":443") not in CONSENT_HOSTS:
             raise BankingError("Enable Banking lieferte keine gültige Freigabeadresse.")
         with closing(self.connect()) as db, db:
             db.execute("DELETE FROM pending WHERE expires < ? OR login = ?", (int(now.timestamp()), login))

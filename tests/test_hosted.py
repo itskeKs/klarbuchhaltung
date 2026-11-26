@@ -35,6 +35,8 @@ def bank_row(**fields):
 
 
 class StubProvider(EnableBanking):
+    auth_origin = "https://auth.enablebanking.com"
+
     def __init__(self, application_id, pem):
         if application_id != APP_ID or pem != b"fixture-key":
             raise BankingError("Fixture credentials rejected")
@@ -49,7 +51,7 @@ class StubProvider(EnableBanking):
                                 "maximum_consent_validity": 86400 * 60}]}
         if (method, path) == ("POST", "/auth"):
             assert data["redirect_url"] == SITE + "/api/bank/callback"
-            return {"url": "https://auth.enablebanking.com/ais/start?" + urlencode({"state": data["state"]})}
+            return {"url": self.auth_origin + "/ais/start?" + urlencode({"state": data["state"]})}
         if (method, path) == ("POST", "/sessions"):
             assert data == {"code": "fixture-code"}
             return {"session_id": SESSION, "accounts": [{"name": "No account identifier"}, {"uid": ACCOUNT,
@@ -251,12 +253,14 @@ def test_reference_fallback_and_previous_vendor_matching(sandbox):
         assert ledger.execute("SELECT count(*) FROM transactions WHERE invoice_id IS NULL").fetchone()[0] == 4
 
 
-def test_daily_sync_catches_up_after_browser_closes(sandbox):
+def test_daily_sync_catches_up_after_browser_closes(sandbox, monkeypatch):
     from hosted.bank_service import BankingService
 
+    monkeypatch.setattr(StubProvider, "auth_origin", "https://tilisy.enablebanking.com")
     service = BankingService(sandbox, sandbox, SITE + "/api/bank/callback", client_factory=StubProvider)
     service.save_credentials(APP_ID, b"fixture-key")
     begin = service.begin("login-a", "DE", BANK, "business")
+    assert urlsplit(begin).netloc == "tilisy.enablebanking.com"
     state = parse_qs(urlsplit(begin).query)["state"][0]
     service.finish("login-a", state, "fixture-code", "")
     today = datetime.now(timezone.utc)
@@ -264,6 +268,20 @@ def test_daily_sync_catches_up_after_browser_closes(sandbox):
     assert service.sync(now=today + timedelta(minutes=5)) == 0
     assert service.sync(now=today + timedelta(days=1)) == 0
     assert service.consents()[0]["last_synced"] == (today + timedelta(days=1)).date().isoformat()
+
+
+@pytest.mark.parametrize("origin", ["http://tilisy.enablebanking.com", "https://other.example",
+                                    "https://auth.enablebanking.com:8443"])
+def test_consent_requires_provider_https_origin(tmp_path, monkeypatch, origin):
+    from hosted.bank_service import BankingService
+
+    monkeypatch.setattr(StubProvider, "auth_origin", origin)
+    service = BankingService(tmp_path, tmp_path, SITE + "/api/bank/callback", client_factory=StubProvider)
+    service.save_credentials(APP_ID, b"fixture-key")
+    with pytest.raises(BankingError, match="Freigabeadresse"):
+        service.begin("login-a", "DE", BANK, "business")
+    with sqlite3.connect(service.path) as db:
+        assert db.execute("SELECT COUNT(*) FROM pending").fetchone()[0] == 0
 
 
 def test_provider_reference_survives_optional_details_and_detects_conflicts():
