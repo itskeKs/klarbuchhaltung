@@ -439,6 +439,61 @@ def test_existing_iban_key_is_retained_after_reauthorization(sandbox):
     assert service.sync(force=True) == 0
 
 
+@pytest.mark.parametrize("entry_ref", ["credit", None])
+def test_balance_format_changes_preserve_payment(sandbox, entry_ref):
+    import core
+
+    ledger = core.db()
+    credit = bank_row(entry_reference=entry_ref)
+    for amount, expected in (("238.00", 1), ("238", 0), ("238.0", 0)):
+        rows, _ = transaction_rows("account-a", [credit | {
+            "balance_after_transaction": {"amount": amount, "currency": "EUR"}
+        }])
+        result = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True)
+        assert (result["imported"], result["ambiguous"]) == (expected, 0)
+
+
+def test_structured_references_distinguish_equal_payments(sandbox):
+    import core
+
+    ledger = core.db()
+    first = bank_row(reference_number="INV123", reference_number_schema="SCOR")
+    second = first | {"reference_number": "INV456"}
+    enriched = first | {"debtor_account": {"iban": "DE00FIXTURE0001"}}
+    for page, expected in (([first], 1), ([second, enriched], 1), ([enriched, second], 0)):
+        rows, _ = transaction_rows("account-a", page)
+        result = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True)
+        assert (result["imported"], result["ambiguous"]) == (expected, 0)
+
+
+@pytest.mark.parametrize("reverse", [True, False])
+def test_accounts_with_shared_secondary_hash_keep_separate_payments(sandbox, reverse):
+    import core
+    from hosted.bank_service import BankingService
+
+    second_uid = "11841a03-5418-4ec3-9c8a-16c88fcd0fd8"
+
+    class TwoAccounts(StubProvider):
+        def request(self, method, path, *, query=None, data=None):
+            if path == "/sessions":
+                accounts = [{"uid": uid, "identification_hash": identifier,
+                             "identification_hashes": [identifier, "shared-secondary"]}
+                            for uid, identifier in ((ACCOUNT, "first-account"), (second_uid, "second-account"))]
+                return {"session_id": SESSION, "accounts": accounts[::-1] if reverse else accounts}
+            if path == f"/accounts/{second_uid}/transactions":
+                return {"transactions": [bank_row(entry_reference="credit")]}
+            return super().request(method, path, query=query, data=data)
+
+    service = BankingService(sandbox, sandbox, SITE + "/api/bank/callback", client_factory=TwoAccounts)
+    service.save_credentials(APP_ID, b"fixture-key")
+    state = parse_qs(urlsplit(service.begin("login-a", "DE", BANK, "personal")).query)["state"][0]
+    service.finish("login-a", state, "fixture-code", "")
+    assert service.sync(force=True) == 3
+    assert service.sync(force=True) == 0
+    ledger = core.db()
+    assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (3, 215)
+
+
 def test_ambiguous_overlap_waits_for_bank_details(sandbox):
     import core
 

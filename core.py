@@ -1190,6 +1190,10 @@ def init_schema(conn: sqlite3.Connection) -> None:
     if dcols and "suggest_tx" not in dcols:
         conn.execute("ALTER TABLE documents ADD COLUMN suggest_tx INTEGER")
     tcols = {r["name"] for r in conn.execute("PRAGMA table_info(transactions)")}
+    bank_cols = {r["name"] for r in conn.execute("PRAGMA table_info(bank_import_facts)")}
+    if "creditor_ref" not in bank_cols:
+        conn.execute("ALTER TABLE bank_import_facts ADD COLUMN creditor_ref TEXT")
+        conn.execute("ALTER TABLE bank_import_facts ADD COLUMN reference_schema TEXT")
     if "amount_home" not in tcols:
         conn.execute("ALTER TABLE transactions ADD COLUMN amount_home REAL")
         conn.execute("ALTER TABLE transactions ADD COLUMN fx_rate REAL")
@@ -1871,31 +1875,34 @@ def import_bank_csv(conn, text: str) -> dict:
 ENABLE_BANKING_REF_PREFIX = "enablebanking:"
 
 
-_BankBooking = namedtuple("_BankBooking", "ref description provider_ref booked_day balance_key")
+_BankBooking = namedtuple("_BankBooking", "ref description provider_ref booked_day balance_key creditor_ref reference_schema")
 
 
 def _remember_bank_booking(conn, ref, row):
     conn.execute("INSERT OR IGNORE INTO bank_import_identity (ref, booking_group) VALUES (?, ?)",
                  (ref, row["bank_groups"][0]))
     conn.execute(
-        "INSERT INTO bank_import_facts (ref, provider_ref, booked_day, balance_key) VALUES (?, ?, ?, ?) "
+        "INSERT INTO bank_import_facts (ref, provider_ref, booked_day, balance_key, creditor_ref, reference_schema) "
+        "VALUES (?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(ref) DO UPDATE SET provider_ref = COALESCE(provider_ref, excluded.provider_ref), "
         "booked_day = COALESCE(booked_day, excluded.booked_day), "
-        "balance_key = COALESCE(balance_key, excluded.balance_key)",
-        (ref, row["provider_ref"], row["booked_day"], row["balance_key"]),
+        "balance_key = COALESCE(balance_key, excluded.balance_key), "
+        "creditor_ref = COALESCE(creditor_ref, excluded.creditor_ref), "
+        "reference_schema = COALESCE(reference_schema, excluded.reference_schema)",
+        (ref, row["provider_ref"], row["booked_day"], row["balance_key"], row["creditor_ref"], row["reference_schema"]),
     )
 
 
 def _bank_match_rank(row, old):
     """Stronger evidence wins first. Conflicting known facts identify separate bookings."""
     if any(row[field] and getattr(old, field) and row[field] != getattr(old, field)
-           for field in ("booked_day", "balance_key", "provider_ref")):
+           for field in ("booked_day", "balance_key", "provider_ref", "creditor_ref", "reference_schema")):
         return None
     if row["ref"] == old.ref:
         return 0
     if old.ref in row["prior_refs"] or (old.provider_ref and row["provider_ref"] == old.provider_ref):
         return 1
-    if old.balance_key and row["balance_key"] == old.balance_key:
+    if (old.balance_key and row["balance_key"] == old.balance_key) or (old.creditor_ref and row["creditor_ref"] == old.creditor_ref):
         return 2
     if old.description and old.description != "Bankumsatz":
         if old.description == row["description"]:
@@ -1918,7 +1925,7 @@ def _bank_matches(conn, rows):
             "SELECT ?, ref FROM transactions WHERE ref = ?",
             ((row["bank_groups"][0], candidate) for candidate in (row["ref"], *row["prior_refs"])),
         )
-    select = ("SELECT i.ref, t.description, f.provider_ref, f.booked_day, f.balance_key "
+    select = ("SELECT i.ref, t.description, f.provider_ref, f.booked_day, f.balance_key, f.creditor_ref, f.reference_schema "
               "FROM bank_import_identity i JOIN transactions t USING (ref) "
               "LEFT JOIN bank_import_facts f USING (ref) ")
     def lookup(clause, keys):

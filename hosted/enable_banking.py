@@ -114,6 +114,19 @@ class EnableBanking:
             query["continuation_key"] = cursor
 
 
+def _balance_key(balance):
+    if not isinstance(balance, dict):
+        return None
+    try:
+        amount = Decimal(balance["amount"])
+        currency = balance["currency"].upper()
+        if amount.is_finite() and re.fullmatch("[A-Z]{3}", currency):
+            return fingerprint(currency, str(amount.normalize()) if amount else "0")
+    except (AttributeError, InvalidOperation, KeyError, TypeError, ValueError):
+        pass
+    return None
+
+
 def transaction_rows(account_key, transactions):
     """Keep the multiplicity of identical reference-less booked transactions."""
     occurrences = Counter()
@@ -152,13 +165,15 @@ def transaction_rows(account_key, transactions):
         entry_ref = tx.get("entry_reference")
         provider_ref = None
         prior_refs = []
-        balance = tx.get("balance_after_transaction")
-        balance_key = fingerprint(balance) if balance else None
+        balance_key = _balance_key(tx.get("balance_after_transaction"))
+        reference = tx.get("reference_number")
+        creditor_ref = fingerprint(reference.strip()) if isinstance(reference, str) and reference.strip() else None
+        schema = tx.get("reference_number_schema") if creditor_ref else None
         if isinstance(entry_ref, str) and entry_ref.strip():
             entry_ref = entry_ref.strip()
             provider_ref = fingerprint(account_key, "entry", entry_ref, amount_key, currency)
             dated_ref = fingerprint(account_key, "entry", entry_ref, booking, amount_key, currency)
-            identity = fingerprint(dated_ref, balance_key) if balance_key else dated_ref
+            identity = fingerprint(dated_ref, balance_key, creditor_ref, schema) if balance_key or creditor_ref else dated_ref
             # Match earlier ledgers whose IDs used only the effective date and amount.
             prior_refs = [core.ENABLE_BANKING_REF_PREFIX + fingerprint(
                 account_key, "entry", entry_ref, day, amount_key, currency
@@ -172,9 +187,13 @@ def transaction_rows(account_key, transactions):
             references[identity] = description_version
         else:
             # transaction_id is a temporary lookup ID according to the provider.
-            key = fingerprint(account_key, dates, str(amount.normalize()), currency, name, details,
-                              tx.get(party_key + "_account"), tx.get("reference_number"),
-                              tx.get("bank_transaction_code"), tx.get("balance_after_transaction"))
+            fields = (account_key, dates, amount_key, currency, name, details,
+                      tx.get(party_key + "_account"), reference, tx.get("bank_transaction_code"))
+            key = fingerprint(*fields, balance_key)
+            if balance_key:
+                legacy_key = fingerprint(*fields, tx.get("balance_after_transaction"))
+                occurrences[legacy_key] += 1
+                prior_refs.append(core.ENABLE_BANKING_REF_PREFIX + fingerprint(legacy_key, occurrences[legacy_key]))
             occurrences[key] += 1
             identity = fingerprint(key, occurrences[key])
         row = {"ref": core.ENABLE_BANKING_REF_PREFIX + identity, "date": booking,
@@ -185,6 +204,8 @@ def transaction_rows(account_key, transactions):
         row["provider_ref"] = provider_ref
         row["booked_day"] = dates[0] or None
         row["balance_key"] = balance_key
+        row["creditor_ref"] = creditor_ref
+        row["reference_schema"] = schema
         row["prior_refs"] = prior_refs
         rows.append(row)
     return rows, skipped

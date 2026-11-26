@@ -1,4 +1,5 @@
 """Tenant-local credentials, consent and scheduled bank imports."""
+from collections import Counter
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
@@ -191,7 +192,8 @@ class BankingService:
                 except (KeyError, TypeError, ValueError, AttributeError):
                     continue
                 iban = (account.get("account_id") or {}).get("iban")
-                identifiers = [account.get("identification_hash"), *(account.get("identification_hashes") or []), iban]
+                # Secondary provider hashes can be shared by distinct accounts.
+                identifiers = [account.get("identification_hash"), iban]
                 aliases = list(dict.fromkeys(fingerprint(v) for v in identifiers if isinstance(v, str) and v))
                 if not aliases:
                     continue
@@ -206,8 +208,11 @@ class BankingService:
             raise BankingError("Die Bank hat keine Konten freigegeben.")
         with closing(self.connect()) as db, db:
             db.execute("BEGIN IMMEDIATE")
+            alias_counts = Counter(alias for account in accounts for alias in account["aliases"])
             for account in accounts:
-                aliases = account.pop("aliases")
+                aliases = [alias for alias in account.pop("aliases") if alias_counts[alias] == 1]
+                if not aliases:
+                    raise BankingError("Die Kontokennung ist mehrdeutig. Prüfe die Bankverbindung.")
                 known = {found[0] for alias in aliases for found in db.execute(
                     "SELECT account_key FROM account_aliases WHERE alias = ?", (alias,)
                 )}
