@@ -1071,6 +1071,154 @@ def test_independent_lookup_ids_do_not_split_corroborated_dated_copies(sandbox, 
             assert tuple(ledger.execute("SELECT id, ref, category FROM transactions WHERE id = 1").fetchone()) == saved
 
 
+@pytest.mark.parametrize("sign", [-1, 1])
+@pytest.mark.parametrize("seed", [False, True])
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("evidence", [
+    "one-movement", "two-movements", "shared-lookup-and-two-movements", "copy-adds-balance", "posting-dates",
+])
+def test_intervening_booked_movement_distinguishes_repeated_statement_balances(sandbox, sign, seed, reverse, evidence):
+    import core
+
+    direction, opposite = ("CRDT", "DBIT") if sign > 0 else ("DBIT", "CRDT")
+    first = bank_row(entry_reference="batch", booking_date="2026-11-23", value_date="2026-11-19",
+                     transaction_date="2026-11-19", transaction_id="first", credit_debit_indicator=direction,
+                     debtor_account={"iban": "DE00PAYOR"}, creditor_account={"iban": "DE00PAYEE"},
+                     reference_number="INV123", remittance_information=["Settlement"],
+                     balance_after_transaction={"amount": str(119 * sign), "currency": "EUR"})
+    second = first | {"value_date": "2026-11-21", "transaction_date": "2026-11-21", "transaction_id": "second"}
+    adjustment = first | {"entry_reference": "reversal", "reference_number": "REV", "transaction_id": "reversal",
+                          "value_date": "2026-11-20", "transaction_date": "2026-11-20",
+                          "credit_debit_indicator": opposite, "remittance_information": ["Reversal"],
+                          "balance_after_transaction": {"amount": "0", "currency": "EUR"}}
+    offset = adjustment | {"entry_reference": "offset", "transaction_id": "offset", "reference_number": "OFF",
+                           "value_date": "2026-11-22", "transaction_date": "2026-11-22",
+                           "transaction_amount": {"amount": "23", "currency": "EUR"},
+                           "balance_after_transaction": {"amount": str(96 * sign), "currency": "EUR"},
+                           "remittance_information": ["Offset"]}
+    versions = [first]
+    adjustments = [adjustment]
+    if evidence == "shared-lookup-and-two-movements":
+        second["transaction_id"] = first["transaction_id"]
+    if evidence in {"two-movements", "shared-lookup-and-two-movements"}:
+        adjustments = [
+            adjustment | {"entry_reference": "part-1", "transaction_id": "part-1",
+                          "transaction_amount": {"amount": "50", "currency": "EUR"},
+                          "balance_after_transaction": {"amount": str(69 * sign), "currency": "EUR"}},
+            adjustment | {"entry_reference": "part-2", "transaction_id": "part-2",
+                          "transaction_amount": {"amount": "69", "currency": "EUR"}},
+        ]
+    if evidence == "copy-adds-balance":
+        versions = [first | {"balance_after_transaction": None}, first | {"entry_reference": None}]
+    date_field = "transaction_day"
+    if evidence == "posting-dates":
+        date_field = "date"
+        shared_dates = {"transaction_date": "2026-11-17", "value_date": "2026-11-18"}
+        for row, day in ((first, "19"), (adjustment, "20"), (second, "21"), (offset, "22")):
+            row["booking_date"] = "2026-11-" + day
+        first.update(shared_dates)
+        second.update(shared_dates)
+    whole = [*versions, *adjustments, second, offset]
+    expected_count = 3 + len(adjustments)
+    if reverse:
+        whole.reverse()
+    with closing(core.db()) as ledger:
+        def sync(page):
+            rows, skipped = transaction_rows("account-a", page)
+            result = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True)
+            assert skipped + result["ambiguous"] == 0
+            return result["imported"]
+
+        assert sync([first, *adjustments] if seed else whole) == (1 + len(adjustments) if seed else expected_count)
+        original = tuple(ledger.execute(
+            f"SELECT id, ref FROM transactions JOIN bank_import_facts USING (ref) "
+            f"WHERE description = 'Settlement' AND {date_field} = '2026-11-19'",
+        ).fetchone())
+        core.set_tx_category(ledger, original[0], "einnahme_sonstige")
+        for page, expected in ((whole, 2 if seed else 0), (whole[::-1], 0), ([second, first], 0),
+                               ([second, offset], 0), ([first, *adjustments], 0), (whole, 0)):
+            assert sync(page) == expected
+            assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (
+                expected_count, 96 * sign,
+            )
+            assert [tuple(row) for row in ledger.execute(
+                f"SELECT {date_field}, category FROM transactions JOIN bank_import_facts USING (ref) "
+                f"WHERE description = 'Settlement' ORDER BY {date_field}",
+            )] == [("2026-11-19", "einnahme_sonstige"), ("2026-11-21", "offen")]
+            assert tuple(ledger.execute("SELECT id, ref FROM transactions WHERE id = ?", (original[0],)).fetchone()) == original
+
+
+@pytest.mark.parametrize("ending_balance", [None, {"amount": "0", "currency": "USD"}, {"amount": "1", "currency": "EUR"}])
+def test_incomplete_statement_balance_chain_does_not_split_a_date_correction(ending_balance):
+    first = bank_row(entry_reference="batch", booking_date="2026-11-23", transaction_date="2026-11-19",
+                     reference_number="INV123", balance_after_transaction={"amount": "119", "currency": "EUR"})
+    second = first | {"transaction_date": "2026-11-21"}
+    adjustment = bank_row(entry_reference="reversal", booking_date="2026-11-23", transaction_date="2026-11-20",
+                          credit_debit_indicator="DBIT", balance_after_transaction=ending_balance)
+    rows, skipped = transaction_rows("account-a", [second, adjustment, first])
+    assert skipped == 0
+    assert sorted(float(row["amount"]) for row in rows) == [-119, 119]
+
+
+@pytest.mark.parametrize("mode", ["initial", "singleton", "overlap"])
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("omitted", [(), ("debtor_account",), ("reference_number",),
+                                    ("balance_after_transaction",), ("value_date", "transaction_date")])
+def test_corroborated_posting_date_conflict_requires_statement_review(sandbox, mode, reverse, omitted):
+    import core
+
+    original = bank_row(entry_reference="settlement", booking_date="2026-12-31", value_date="2026-12-29",
+                        transaction_date="2026-12-28", transaction_id="old", debtor_account={"iban": "DE00PAYER"},
+                        balance_after_transaction={"amount": "119", "currency": "EUR"}, reference_number="INV123",
+                        reference_number_schema="SCOR", remittance_information=["Settlement"])
+    for field in omitted:
+        original.pop(field)
+    changed = original | {"booking_date": "2027-01-01", "transaction_id": "current"}
+    offset = bank_row(entry_reference="offset", booking_date="2026-12-31", credit_debit_indicator="DBIT",
+                      transaction_amount={"amount": "23", "currency": "EUR"}, remittance_information=["Offset"])
+    whole = [changed, original, offset] if reverse else [original, changed, offset]
+    with closing(core.db()) as ledger:
+        if mode != "initial":
+            rows, _ = transaction_rows("account-a", [original, offset])
+            assert core.import_bank_rows(ledger, rows, auto_match=False)["imported"] == 2
+            saved = tuple(ledger.execute(
+                "SELECT id, ref, date FROM transactions WHERE description = 'Settlement'",
+            ).fetchone())
+            core.set_tx_category(ledger, saved[0], "einnahme_sonstige")
+        first_page = [changed, offset] if mode == "singleton" else whole
+        for page in (first_page, whole[::-1], whole):
+            rows, skipped = transaction_rows("account-a", page)
+            result = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True)
+            assert skipped + result["ambiguous"] > 0
+            expected = (1, -23) if mode == "initial" else (2, 96)
+            assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == expected
+            if mode != "initial":
+                assert tuple(ledger.execute(
+                    "SELECT id, ref, date, category FROM transactions WHERE description = 'Settlement'",
+                ).fetchone()) == (*saved, "einnahme_sonstige")
+
+
+@pytest.mark.parametrize("different_fact", [
+    {"debtor_account": {"iban": "DE00OTHER"}},
+    {"reference_number": "INV456"},
+    {"balance_after_transaction": {"amount": "238", "currency": "EUR"}},
+    {"transaction_date": "2026-12-30"},
+])
+def test_distinct_bank_facts_allow_reused_entry_reference_on_new_posting_date(sandbox, different_fact):
+    import core
+
+    first = bank_row(entry_reference="settlement", booking_date="2026-12-31", value_date="2026-12-29",
+                     transaction_date="2026-12-28", debtor_account={"iban": "DE00PAYER"},
+                     balance_after_transaction={"amount": "119", "currency": "EUR"}, reference_number="INV123")
+    second = first | {"booking_date": "2027-01-01"} | different_fact
+    with closing(core.db()) as ledger:
+        for page, expected in (([first], 1), ([second], 1), ([second, first], 0)):
+            rows, skipped = transaction_rows("account-a", page)
+            result = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True)
+            assert (result["imported"], skipped + result["ambiguous"]) == (expected, 0)
+        assert [row[0] for row in ledger.execute("SELECT date FROM transactions ORDER BY date")] == ["2026-12-31", "2027-01-01"]
+
+
 def test_indistinguishable_dated_contenders_leave_old_booking_for_statement_review(sandbox):
     import core
 

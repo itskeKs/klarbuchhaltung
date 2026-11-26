@@ -1957,6 +1957,33 @@ def _bank_secondary_match(first, second):
     return all(one == two for one, two in shared) if shared else None
 
 
+def _bank_corroborates(first, second):
+    """Independent agreement supports a bank reference when comparing booking dates."""
+    if not first["provider_ref"] or first["provider_ref"] != second["provider_ref"]:
+        return False
+    for field in ("balance_key", "creditor_ref", "reference_schema"):
+        if first[field] and second[field] and first[field] != second[field]:
+            return False
+    same_payer = _bank_account_match(first["counterparty_ids"], second["counterparty_ids"])
+    same_dates = _bank_secondary_match((first[field] for field in _BANK_SECONDARY_DATES),
+                                       (second[field] for field in _BANK_SECONDARY_DATES))
+    if same_payer is False or same_dates is False:
+        return False
+    same_balance = bool(first["balance_key"] and first["balance_key"] == second["balance_key"])
+    same_remittance = same_payer is True and bool(first["creditor_ref"] and first["creditor_ref"] == second["creditor_ref"])
+    return (same_dates is True and (same_balance or same_remittance)) or (same_balance and same_remittance)
+
+
+def _bank_posting_conflict(row, same_reference):
+    if not row["booked_day"]:
+        return False
+    known_dates = {old.booked_day for old in same_reference if old.booked_day and _bank_corroborates(row, old._asdict())}
+    if row["booked_day"] in known_dates:
+        return False
+    peers = row.get("_booked_date_peers", {})
+    return any(not peers.get(day, False) for day in known_dates | peers.keys())
+
+
 def _stored_secondary_match(row, old):
     return _bank_secondary_match((row[field] for field in _BANK_SECONDARY_DATES),
                                  (getattr(old, field) for field in _BANK_SECONDARY_DATES))
@@ -2090,11 +2117,16 @@ def _bank_matches(conn, rows):
     )
     by_provider = lookup("WHERE f.provider_ref = ?", {r["provider_ref"] for r in bank_rows if r["provider_ref"]})
     options = {}
+    posting_conflicts = set()
     unconfirmed_payers = defaultdict(list)
     cohorts = defaultdict(list)
     for row in bank_rows:
+        same_reference = by_provider.get(row["provider_ref"], ())
+        if _bank_posting_conflict(row, same_reference):
+            posting_conflicts.add(row["ref"])
+            continue
         # The stored posting date still matches after the bank drops the original value date.
-        candidates = {old for old in by_provider.get(row["provider_ref"], ()) if old.booked_day in row["bank_groups"]}
+        candidates = {old for old in same_reference if old.booked_day in row["bank_groups"]}
         for group in row["bank_groups"].values():
             candidates.update(by_day[group])
         ref = row["ref"]
@@ -2149,7 +2181,7 @@ def _bank_matches(conn, rows):
                 matched[ref] = old
                 used.add(old)
                 del options[ref]
-    ambiguous = {ref for ref, candidates in options.items() if candidates.keys() - used}
+    ambiguous = posting_conflicts | {ref for ref, candidates in options.items() if candidates.keys() - used}
     storage_refs = {}
     reserved = set()
     for row in bank_rows:

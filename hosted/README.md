@@ -40,10 +40,13 @@ identifiers can distinguish separate payments, even when the bank reuses a refer
 When two bookings with the same reference appear together, different known dates of
 the same kind can identify the separate payments and match later replays. A shared
 running balance and structured reference can corroborate a secondary-date correction.
+Intervening movements can show that a balance recurred after a separate payment.
 The ledger remembers account identifiers as fingerprints and learns missing evidence
 from later matches. Temporary transaction IDs help identify copies within one fetch.
-**Banking** flags conflicting memos and entries with multiple possible matches. Compare
-them with the statement. The next fetch retries them as the bank supplies more detail.
+**Banking** flags conflicting memos, contradictory posting dates for a corroborated
+booking, and entries with multiple possible matches. Compare them with the statement.
+An existing payment keeps its posting date and category while the conflict is reviewed.
+The next fetch retries flagged entries as the bank supplies more detail.
 Reauthorizing the same account preserves its payment history when the bank adds an
 IBAN or reports a previously known primary account hash. If multiple accounts claim
 the same historical identity, Banking asks you to review the connection.

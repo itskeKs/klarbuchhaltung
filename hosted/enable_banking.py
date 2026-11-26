@@ -4,6 +4,7 @@ from collections import Counter, defaultdict
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from http.client import HTTPException, HTTPSConnection
+from itertools import combinations
 import json
 import re
 import time
@@ -114,14 +115,14 @@ class EnableBanking:
             query["continuation_key"] = cursor
 
 
-def _balance_key(balance):
+def _statement_balance(balance):
     if not isinstance(balance, dict):
         return None
     try:
         amount = Decimal(balance["amount"])
         currency = balance["currency"].upper()
         if amount.is_finite() and re.fullmatch("[A-Z]{3}", currency):
-            return fingerprint(currency, str(amount.normalize()) if amount else "0")
+            return currency, amount
     except (AttributeError, InvalidOperation, KeyError, TypeError, ValueError):
         pass
     return None
@@ -246,17 +247,72 @@ def _merge_copy_metadata(row, versions):
     row["prior_refs"] = list(dict.fromkeys(ref for copy in versions for ref in copy["prior_refs"]))
     row["_unreferenced_keys"] = tuple(dict.fromkeys(key for copy in versions for key in copy["_unreferenced_keys"]))
     row["_counterparty_names"] = frozenset().union(*(copy["_counterparty_names"] for copy in versions))
+    if row["balance_key"]:
+        row["_statement_balance"] = next(copy["_statement_balance"] for copy in versions
+                                         if copy["balance_key"] == row["balance_key"])
 
 
-def _dated_copies_conflict(first, second):
+def _advance_statement_balance(currency, running, movements):
+    """Follow a uniquely linked day's movements in balance order."""
+    endings = {}
+    for amount, ending in movements:
+        if ending is None or ending[0] != currency:
+            return None
+        after = ending[1]
+        before = after - amount
+        if before in endings:
+            return None
+        endings[before] = after
+    while running in endings:
+        running = endings.pop(running)
+    return None if endings else running
+
+
+def _balance_repeats(first, second, account_rows, date_fields=_SECONDARY_BANK_DATES):
+    """Use intervening statement movements to distinguish a repeated balance from a copy."""
+    if not first["balance_key"] or first["balance_key"] != second["balance_key"]:
+        return False
+    currency, balance = first["_statement_balance"]
+    settlement = Decimal(second["amount"])
+    if currency != first["currency"] or not settlement:
+        return False
+    for field in date_fields:
+        days = (first[field], second[field])
+        if not all(days) or days[0] == days[1]:
+            continue
+        start, end = sorted(days)
+        movements = defaultdict(set)
+        for row in account_rows:
+            day = row[field]
+            if day and start < day < end and row["currency"] == currency:
+                amount = Decimal(row["amount"])
+                if amount:
+                    movements[day].add((amount, row["_statement_balance"]))
+        if not movements:
+            continue
+        running = balance
+        for day in sorted(movements):
+            running = _advance_statement_balance(currency, running, movements[day])
+            if running is None:
+                break
+        else:
+            if running + settlement == balance:
+                return True
+    return False
+
+
+def _dated_copies_conflict(first, second, account_rows):
     same_financial_facts = all(first[field] and first[field] == second[field] for field in _REFERENCE_COPY_FACTS)
-    fields = _FIXED_BOOKING_FACTS if same_financial_facts else _OPTIONAL_BOOKING_FACTS
+    date_correction = same_financial_facts and not _balance_repeats(first, second, account_rows)
+    fields = _FIXED_BOOKING_FACTS if date_correction else _OPTIONAL_BOOKING_FACTS
     return _conflicting_facts(first, second, fields)
 
 
-def _merge_dated_bookings(dated_ref, copies):
+def _merge_dated_bookings(dated_ref, copies, account_rows):
     """Combine compatible copies and keep payments with conflicting known facts separate."""
-    groups, unresolved = _compatible_copy_groups(copies, _dated_copies_conflict)
+    groups, unresolved = _compatible_copy_groups(
+        copies, lambda first, second: _dated_copies_conflict(first, second, account_rows),
+    )
 
     merged = []
     skipped = len({row["ref"] for row in unresolved})
@@ -312,13 +368,13 @@ def _corroborated_fetch_groups(copies):
     return groups
 
 
-def _fetch_copies_conflict(first, second):
+def _fetch_copies_conflict(first, second, account_rows):
     same_balance = first["balance_key"] and first["balance_key"] == second["balance_key"]
     same_reference = first["creditor_ref"] and first["creditor_ref"] == second["creditor_ref"]
     same_booking = (all(first[field] and first[field] == second[field] for field in ("booked_day", "provider_ref"))
                     and core._bank_account_match(first["counterparty_ids"], second["counterparty_ids"]) is True)
-    # A shared balance and corroborating bank facts can establish a date correction.
-    fields = _FETCH_FIXED_FACTS if same_balance and (same_reference or same_booking) else _FETCH_COPY_FACTS
+    date_correction = same_balance and (same_reference or same_booking) and not _balance_repeats(first, second, account_rows)
+    fields = _FETCH_FIXED_FACTS if date_correction else _FETCH_COPY_FACTS
     return _conflicting_facts(first, second, fields) or _conflicting_counterparties(first, second)
 
 
@@ -336,7 +392,9 @@ def _merge_fetch_copies(account_key, rows):
         if len(copies) == 1:
             merged.extend(copies)
             continue
-        groups, unresolved = _compatible_copy_groups(copies, _fetch_copies_conflict)
+        groups, unresolved = _compatible_copy_groups(
+            copies, lambda first, second: _fetch_copies_conflict(first, second, rows),
+        )
         skipped += len(unresolved)
         payments = []
         for versions in groups:
@@ -395,6 +453,8 @@ def _merge_reference_copies(rows):
             continue
         copy, = copies
         booking = identified[ref]
+        if not booking["balance_key"]:
+            booking["_statement_balance"] = copy["_statement_balance"]
         for field in fields:
             booking[field] = booking[field] or copy[field]
         booking["counterparty_ids"] = tuple(sorted(set(booking["counterparty_ids"]) | set(copy["counterparty_ids"])))
@@ -405,6 +465,22 @@ def _merge_reference_copies(rows):
         omitted.add(copy["ref"])
         skipped += booking["_remittance"] != copy["_remittance"]
     return [row for row in rows if row["ref"] not in omitted], skipped
+
+
+def _compare_posting_dates(rows, account_rows):
+    by_reference = defaultdict(list)
+    for row in rows:
+        if row["provider_ref"] and row["booked_day"]:
+            by_reference[row["provider_ref"]].append(row)
+    for versions in by_reference.values():
+        for first, second in combinations(versions, 2):
+            if first["booked_day"] == second["booked_day"] or not core._bank_corroborates(first, second):
+                continue
+            separate = _balance_repeats(first, second, account_rows, ("booked_day",))
+            for row, other in ((first, second), (second, first)):
+                peers = row.setdefault("_booked_date_peers", {})
+                day = other["booked_day"]
+                peers[day] = peers.get(day, False) or separate
 
 
 def transaction_rows(account_key, transactions):
@@ -453,7 +529,11 @@ def transaction_rows(account_key, transactions):
         source_key = None
         source_keys = ()
         prior_refs = []
-        balance_key = _balance_key(tx.get("balance_after_transaction"))
+        statement_balance = _statement_balance(tx.get("balance_after_transaction"))
+        balance_key = None
+        if statement_balance is not None:
+            balance_currency, balance = statement_balance
+            balance_key = fingerprint(balance_currency, str(balance.normalize()) if balance else "0")
         reference = tx.get("reference_number")
         creditor_ref = fingerprint(reference.strip()) if isinstance(reference, str) and reference.strip() else None
         schema = tx.get("reference_number_schema") if creditor_ref else None
@@ -502,6 +582,7 @@ def transaction_rows(account_key, transactions):
         row["_remittance"] = tuple(dict.fromkeys(details))
         row["_transaction_id"] = transaction_id
         row["_amount_key"] = amount_key
+        row["_statement_balance"] = statement_balance
         row["_entry_reference"] = entry_ref
         row["_source_key"], row["_source_keys"] = source_key, source_keys
         row["_unreferenced_keys"] = unreferenced_keys
@@ -528,8 +609,11 @@ def transaction_rows(account_key, transactions):
         if len(copies) == 1:
             rows.extend(copies)
         else:
-            merged, warnings = _merge_dated_bookings(booking_key, copies)
+            merged, warnings = _merge_dated_bookings(booking_key, copies, drafts)
             rows.extend(merged)
             skipped += warnings
     rows, warnings = _merge_reference_copies(rows)
+    _compare_posting_dates(rows, drafts)
+    for row in rows:
+        del row["_statement_balance"]
     return rows, skipped + warnings
