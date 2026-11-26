@@ -1076,6 +1076,8 @@ def test_independent_lookup_ids_do_not_split_corroborated_dated_copies(sandbox, 
 @pytest.mark.parametrize("reverse", [False, True])
 @pytest.mark.parametrize("evidence", [
     "one-movement", "two-movements", "shared-lookup-and-two-movements", "copy-adds-balance", "posting-dates",
+    "early-reversal", "late-reversal", "cycle", "parallel-cycle", "parallel-reused-reference",
+    "posting-early-reversal", "posting-late-reversal", "posting-cycle",
 ])
 def test_intervening_booked_movement_distinguishes_repeated_statement_balances(sandbox, sign, seed, reverse, evidence):
     import core
@@ -1110,12 +1112,36 @@ def test_intervening_booked_movement_distinguishes_repeated_statement_balances(s
         ]
     if evidence == "copy-adds-balance":
         versions = [first | {"balance_after_transaction": None}, first | {"entry_reference": None}]
+    trail = evidence.removeprefix("posting-")
+    if trail == "early-reversal":
+        adjustment.update(value_date="2026-11-19", transaction_date="2026-11-19")
+        offset.update(value_date="2026-11-19", transaction_date="2026-11-19",
+                      balance_after_transaction={"amount": "0", "currency": "EUR"})
+    if trail == "late-reversal":
+        adjustment.update(value_date="2026-11-21", transaction_date="2026-11-21")
+        offset.update(value_date="2026-11-21", transaction_date="2026-11-21")
+    if trail in {"cycle", "parallel-cycle", "parallel-reused-reference"}:
+        # First and second share an endpoint. Distinct bank references can have identical edges.
+        steps = [(20, 139), (-20, 119), (-119, 0)]
+        if trail != "cycle":
+            steps = [(20, 139), (-20, 119), (20, 139), (20, 159), (-159, 0)]
+        adjustments = [
+            adjustment | {"entry_reference": f"step-{index}", "transaction_id": f"step-{index}",
+                          "credit_debit_indicator": direction if change > 0 else opposite,
+                          "transaction_amount": {"amount": str(abs(change)), "currency": "EUR"},
+                          "balance_after_transaction": {"amount": str(balance * sign), "currency": "EUR"}}
+            for index, (change, balance) in enumerate(steps)
+        ]
+        if trail == "parallel-reused-reference":
+            for index in (0, 2):
+                account = {"iban": f"DE00PART{index}"}
+                adjustments[index].update(entry_reference="reused-part", debtor_account=account, creditor_account=account)
     date_field = "transaction_day"
-    if evidence == "posting-dates":
+    if evidence.startswith("posting-"):
         date_field = "date"
         shared_dates = {"transaction_date": "2026-11-17", "value_date": "2026-11-18"}
-        for row, day in ((first, "19"), (adjustment, "20"), (second, "21"), (offset, "22")):
-            row["booking_date"] = "2026-11-" + day
+        for row in (first, *adjustments, second, offset):
+            row["booking_date"] = row["transaction_date"]
         first.update(shared_dates)
         second.update(shared_dates)
     whole = [*versions, *adjustments, second, offset]
@@ -1158,6 +1184,23 @@ def test_incomplete_statement_balance_chain_does_not_split_a_date_correction(end
     rows, skipped = transaction_rows("account-a", [second, adjustment, first])
     assert skipped == 0
     assert sorted(float(row["amount"]) for row in rows) == [-119, 119]
+
+
+def test_disconnected_same_day_balance_movements_do_not_split_a_date_correction():
+    first = bank_row(entry_reference="batch", booking_date="2026-11-23", transaction_date="2026-11-19",
+                     reference_number="INV123", balance_after_transaction={"amount": "119", "currency": "EUR"})
+    second = first | {"transaction_date": "2026-11-21"}
+    adjustment = second | {"entry_reference": "reversal", "credit_debit_indicator": "DBIT",
+                           "balance_after_transaction": {"amount": "0", "currency": "EUR"}}
+    disconnected = [
+        second | {"entry_reference": ref, "credit_debit_indicator": direction,
+                  "transaction_amount": {"amount": "40", "currency": "EUR"},
+                  "balance_after_transaction": {"amount": finish, "currency": "EUR"}}
+        for ref, direction, finish in (("up", "CRDT", "240"), ("down", "DBIT", "200"))
+    ]
+    rows, skipped = transaction_rows("account-a", [second, *disconnected, adjustment, first])
+    assert skipped == 0
+    assert sorted(float(row["amount"]) for row in rows) == [-119, -40, 40, 119]
 
 
 @pytest.mark.parametrize("mode", ["initial", "singleton", "overlap"])

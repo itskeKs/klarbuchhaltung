@@ -135,6 +135,7 @@ _OPTIONAL_BOOKING_FACTS = (*_FIXED_BOOKING_FACTS, *_SECONDARY_BANK_DATES)
 _REFERENCE_COPY_FACTS = ("balance_key", "creditor_ref")
 _FETCH_COPY_FACTS = ("provider_ref", "booked_day", *_OPTIONAL_BOOKING_FACTS)
 _FETCH_FIXED_FACTS = ("provider_ref", "booked_day", *_FIXED_BOOKING_FACTS)
+_STATEMENT_IDENTITY_FACTS = ("provider_ref", "creditor_ref", "reference_schema")
 
 
 def _optional_bank_day(value):
@@ -247,57 +248,89 @@ def _merge_copy_metadata(row, versions):
     row["prior_refs"] = list(dict.fromkeys(ref for copy in versions for ref in copy["prior_refs"]))
     row["_unreferenced_keys"] = tuple(dict.fromkeys(key for copy in versions for key in copy["_unreferenced_keys"]))
     row["_counterparty_names"] = frozenset().union(*(copy["_counterparty_names"] for copy in versions))
+    row["_statement_sources"] = frozenset().union(*(copy["_statement_sources"] for copy in versions))
     if row["balance_key"]:
         row["_statement_balance"] = next(copy["_statement_balance"] for copy in versions
                                          if copy["balance_key"] == row["balance_key"])
 
 
-def _advance_statement_balance(currency, running, movements):
-    """Follow a uniquely linked day's movements in balance order."""
-    endings = {}
-    for amount, ending in movements:
+def _statement_day_span(currency, movements):
+    """Return valid opening balances and the closing balance, if fixed."""
+    net = Counter()
+    neighbors = defaultdict(set)
+    for (amount, ending), observations in movements.items():
         if ending is None or ending[0] != currency:
-            return None
+            return set(), None
         after = ending[1]
         before = after - amount
-        if before in endings:
-            return None
-        endings[before] = after
-    while running in endings:
-        running = endings.pop(running)
-    return None if endings else running
+        # Conflicting known identities prove parallel movements, while an
+        # additional sparse copy cannot establish another edge.
+        identities = list(observations.values())
+        groups, _ = _compatible_copy_groups(
+            identities, lambda first, second: _conflicting_facts(first, second, _STATEMENT_IDENTITY_FACTS),
+        )
+        net[before] += len(groups)
+        net[after] -= len(groups)
+        neighbors[before].add(after)
+        neighbors[after].add(before)
+    if not neighbors:
+        return set(), None
+
+    # A directed trail exists when the underlying graph is connected and
+    # exactly its start/end are unbalanced (or every vertex is balanced).
+    remaining = set(neighbors)
+    stack = [remaining.pop()]
+    while stack:
+        reached = neighbors[stack.pop()] & remaining
+        remaining.difference_update(reached)
+        stack.extend(reached)
+    if remaining:
+        return set(), None
+    imbalance = {balance: change for balance, change in net.items() if change}
+    if not imbalance:
+        return set(neighbors), None
+    if sorted(imbalance.values()) == [-1, 1]:
+        return {balance for balance, change in imbalance.items() if change == 1}, min(imbalance, key=imbalance.get)
+    return set(), None
 
 
 def _balance_repeats(first, second, account_rows, date_fields=_SECONDARY_BANK_DATES):
     """Use intervening statement movements to distinguish a repeated balance from a copy."""
     if not first["balance_key"] or first["balance_key"] != second["balance_key"]:
         return False
-    currency, balance = first["_statement_balance"]
-    settlement = Decimal(second["amount"])
-    if currency != first["currency"] or not settlement:
+    currency, _ = first["_statement_balance"]
+    amount = Decimal(first["amount"])
+    if currency != first["currency"] or not amount:
         return False
+    sources = first["_statement_sources"] | second["_statement_sources"]
     for field in date_fields:
         days = (first[field], second[field])
         if not all(days) or days[0] == days[1]:
             continue
         start, end = sorted(days)
-        movements = defaultdict(set)
-        for row in account_rows:
+        movements = defaultdict(lambda: defaultdict(dict))
+
+        def observe(day, change, row):
+            identity = tuple(row[fact] for fact in _STATEMENT_IDENTITY_FACTS) + (row["counterparty_ids"],)
+            movements[day][change, row["_statement_balance"]][identity] = row
+
+        for index, row in enumerate(account_rows):
             day = row[field]
-            if day and start < day < end and row["currency"] == currency:
-                amount = Decimal(row["amount"])
-                if amount:
-                    movements[day].add((amount, row["_statement_balance"]))
-        if not movements:
-            continue
-        running = balance
+            if day and start <= day <= end and row["currency"] == currency and index not in sources:
+                change = Decimal(row["amount"])
+                if change:
+                    observe(day, change, row)
+        for row in (first, second):
+            observe(row[field], amount, row)
+        openings = None
         for day in sorted(movements):
-            running = _advance_statement_balance(currency, running, movements[day])
-            if running is None:
+            starts, finish = _statement_day_span(currency, movements[day])
+            feasible = starts if openings is None else starts & openings
+            if not feasible:
                 break
+            openings = {finish} if finish is not None else feasible
         else:
-            if running + settlement == balance:
-                return True
+            return True
     return False
 
 
@@ -453,6 +486,7 @@ def _merge_reference_copies(rows):
             continue
         copy, = copies
         booking = identified[ref]
+        booking["_statement_sources"] |= copy["_statement_sources"]
         if not booking["balance_key"]:
             booking["_statement_balance"] = copy["_statement_balance"]
         for field in fields:
@@ -583,6 +617,7 @@ def transaction_rows(account_key, transactions):
         row["_transaction_id"] = transaction_id
         row["_amount_key"] = amount_key
         row["_statement_balance"] = statement_balance
+        row["_statement_sources"] = frozenset((len(drafts),))
         row["_entry_reference"] = entry_ref
         row["_source_key"], row["_source_keys"] = source_key, source_keys
         row["_unreferenced_keys"] = unreferenced_keys
@@ -616,4 +651,5 @@ def transaction_rows(account_key, transactions):
     _compare_posting_dates(rows, drafts)
     for row in rows:
         del row["_statement_balance"]
+        del row["_statement_sources"]
     return rows, skipped + warnings

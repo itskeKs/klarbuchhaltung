@@ -40,7 +40,8 @@ identifiers can distinguish separate payments, even when the bank reuses a refer
 When two bookings with the same reference appear together, different known dates of
 the same kind can identify the separate payments and match later replays. A shared
 running balance and structured reference can corroborate a secondary-date correction.
-Intervening movements can show that a balance recurred after a separate payment.
+Dated statement movements, including movements on the same day, can show that a
+balance recurred after a separate payment.
 The ledger remembers account identifiers as fingerprints and learns missing evidence
 from later matches. Temporary transaction IDs help identify copies within one fetch.
 **Banking** flags conflicting memos, contradictory posting dates for a corroborated
