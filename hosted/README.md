@@ -43,8 +43,11 @@ running balance and structured reference can corroborate a secondary-date correc
 Dated statement movements, including movements on the same day, can show that a
 balance recurred after a separate payment. Compatible copies can supply missing
 balances. Signed movements can bridge missing balances when other amounts and
-reported balances support the same sequence. Nearby reported balances can also
-show which of two bank versions fits the statement.
+reported balances support the same sequence. Surrounding balances can show
+which of two bank versions fits the statement. When those balances leave both
+counts possible, **Banking** asks for review before adding a second payment.
+If a later statement contradicts a payment already in the ledger, **Banking**
+flags it and keeps the posted payment and category.
 The ledger remembers account identifiers as fingerprints and learns missing evidence
 from later matches. Temporary transaction IDs help identify copies within one fetch.
 **Banking** flags conflicting memos, contradictory posting dates for a corroborated

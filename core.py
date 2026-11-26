@@ -1989,6 +1989,23 @@ def _stored_secondary_match(row, old):
                                  (getattr(old, field) for field in _BANK_SECONDARY_DATES))
 
 
+def _bank_rejected_statement_booking(row, matched_ref, recorded):
+    for old in recorded:
+        if old.ref == matched_ref:
+            continue
+        for ref, dates in row.get("_statement_rejections", ()):
+            if ref == old.ref:
+                return True
+            observed_dates = [(getattr(old, field), day) for field, day in dates if getattr(old, field)]
+            if (row["balance_key"] and row["balance_key"] == old.balance_key
+                    and observed_dates and all(observed == day for observed, day in observed_dates)
+                    and all(not (row[field] and getattr(old, field) and row[field] != getattr(old, field))
+                            for field in ("creditor_ref", "reference_schema"))
+                    and _bank_account_match(row["counterparty_ids"], old.counterparty_ids) is not False):
+                return True
+    return False
+
+
 def _bank_description_matches(row, old):
     return bool(old.description and old.description != "Bankumsatz" and old.description == row["description"])
 
@@ -2187,7 +2204,12 @@ def _bank_matches(conn, rows):
     for row in bank_rows:
         source_ref = row["ref"]
         if source_ref in matched:
-            _remember_bank_booking(conn, matched[source_ref], row)
+            if row.get("_statement_rejections") and _bank_rejected_statement_booking(
+                row, matched[source_ref], by_provider.get(row["provider_ref"], ()),
+            ):
+                ambiguous.add(source_ref)
+            else:
+                _remember_bank_booking(conn, matched[source_ref], row)
         elif source_ref not in ambiguous:
             ref = source_ref
             while ref in reserved or conn.execute("SELECT 1 FROM transactions WHERE ref = ?", (ref,)).fetchone():
@@ -2209,7 +2231,7 @@ def import_bank_rows(conn, rows: list, *, auto_match: bool = True, require_fx: b
         date_ = (r.get("date") or "")[:10]
         if not ref or not date_:
             continue
-        if ref in ambiguous:
+        if ref in ambiguous and ref not in seen:
             continue
         if ref in seen or (not r.get("bank_groups") and conn.execute(
                 "SELECT 1 FROM transactions WHERE ref = ?", (ref,)).fetchone()):

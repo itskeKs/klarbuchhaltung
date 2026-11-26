@@ -1327,6 +1327,108 @@ def test_neighboring_statement_balance_can_prove_a_single_corrected_booking(
         ).fetchone()) == (*saved, "einnahme_sonstige")
 
 
+@pytest.mark.parametrize("day_field", ["booking_date", "transaction_date"])
+@pytest.mark.parametrize("context", ["before", "after", "long-after"])
+@pytest.mark.parametrize("outcome,seed", [
+    ("one", False), ("one", True), ("one", "both"), ("one", "alternate"),
+    ("two", False), ("two", True), ("ambiguous", False), ("ambiguous", True),
+])
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_statement_context_compares_both_payment_counts_without_dropping_sparse_movements(
+    sandbox, day_field, context, outcome, sign, seed,
+):
+    import core
+
+    def payment(day, change, balance, ref, memo, lookup=None):
+        if context == "before":
+            day = 42 - day
+            balance = balance - change if balance is not None else None
+            change = -change
+        change *= sign
+        return bank_row(
+            **{
+                "booking_date": "2026-11-27",
+                "transaction_date": "2026-11-18",
+                "value_date": "2026-11-17",
+                day_field: f"2026-11-{day:02}",
+            },
+            entry_reference=ref, reference_number=ref, transaction_id=lookup or ref,
+            credit_debit_indicator="CRDT" if change > 0 else "DBIT",
+            transaction_amount={"amount": str(abs(change)), "currency": "EUR"},
+            debtor_account={"iban": "DE00PAYER"}, creditor_account={"iban": "DE00PAYEE"},
+            remittance_information=[memo],
+            balance_after_transaction=None if balance is None else {"amount": str(balance * sign), "currency": "EUR"},
+        )
+
+    first = payment(19, 119, 119, "rent", "Rent")
+    second = payment(21, 119, 119, "rent", "Rent")
+    reversal = payment(20, -119, 0, "reversal", "Reversal")
+    neighbors = [payment(22, 119, None, "supplies", "Supplies"), payment(22, -23, 96, "fee", "Fee")]
+    net = 96
+    if context == "long-after":
+        for day in (23, 24):
+            neighbors.extend((payment(day, 119, None, f"supplies-{day}", f"Supplies {day}"),
+                              payment(day, -10, net + 109, f"fee-{day}", f"Fee {day}")))
+            net += 109
+    ledger_sign = -sign if context == "before" else sign
+    if outcome != "ambiguous":
+        net += 119 if outcome == "two" else 0
+        neighbors.append(payment(25 if context == "long-after" else 23, -10, net - 10, "tail", "Tail"))
+        net -= 10
+
+    batch = [first, reversal, second, *neighbors]
+    with closing(core.db()) as ledger:
+        def sync(page):
+            rows, skipped = transaction_rows("account-a", page)
+            result = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True)
+            return result["imported"], skipped + result["ambiguous"]
+
+        saved = []
+        if seed:
+            existing = [first, second] if seed == "both" else [second if seed == "alternate" else first]
+            assert sync([*existing, reversal]) == (len(existing) + 1, 0)
+            saved = [tuple(row) for row in ledger.execute("SELECT id, ref, date FROM transactions WHERE description = 'Rent'")]
+            for booking_id, _, _ in saved:
+                core.set_tx_category(ledger, booking_id, "einnahme_sonstige")
+            if outcome == "two":
+                imported, warnings = sync(batch[:-1])
+                assert imported == len(neighbors) - 1 and warnings > 0
+        expected_count = 1 + len(neighbors) + (2 if outcome == "two" else 1)
+        if seed == "both":
+            expected_count += 1
+            net += 119
+        expected_warning = outcome == "ambiguous" or seed == "both" or (seed == "alternate" and day_field == "booking_date")
+        if outcome == "ambiguous" and day_field == "booking_date" and not seed:
+            expected_count -= 1
+            net -= 119
+        pages = [batch[::-1] if seed else batch, batch if seed else batch[::-1]]
+        pages.extend((
+            [first, *batch],
+            [*batch, second],
+            batch + batch,
+            [first | {"balance_after_transaction": None}, *batch],
+            [*batch, second | {"reference_number": None}],
+        ))
+        for page in pages:
+            _, warnings = sync(page)
+            assert bool(warnings) == expected_warning
+            if seed == "alternate":
+                assert warnings == int(day_field == "booking_date")
+            assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (
+                expected_count, net * ledger_sign,
+            )
+            for booking_id, booking_ref, booking_date in saved:
+                assert tuple(ledger.execute(
+                    "SELECT id, ref, date, category FROM transactions WHERE id = ?", (booking_id,),
+                ).fetchone()) == (booking_id, booking_ref, booking_date, "einnahme_sonstige")
+        if outcome == "two":
+            assert sync([second, first]) == (0, 0)
+            assert sync(batch[:-1])[0] == 0
+            assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (
+                expected_count, net * ledger_sign,
+            )
+
+
 @pytest.mark.parametrize("mode", ["initial", "singleton", "overlap"])
 @pytest.mark.parametrize("reverse", [False, True])
 @pytest.mark.parametrize("omitted", [(), ("debtor_account",), ("reference_number",),
