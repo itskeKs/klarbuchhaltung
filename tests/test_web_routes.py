@@ -6,6 +6,7 @@ mehr angelegt -> FileNotFoundError. Reine core-Tests haben das nicht gefangen,
 weil die Route ihren eigenen Pfad baut. Daher hier auf Routen-Ebene testen.
 """
 import io
+from datetime import date
 
 import pytest
 
@@ -18,6 +19,44 @@ def client(sandbox):
     webapp.app.config.update(TESTING=True)
     with webapp.app.test_client() as c:
         yield c
+
+
+def test_payments_render_after_assigning_recurring_payment(client, conn):
+    today = date.today().isoformat()
+    statement = ("Date,Description,Amount,Currency\n"
+                 f"{today},Office supplies,-23,EUR\n"
+                 f"{today},Office supplies,-17,EUR\n")
+    imported = client.post("/zahlungen/import", data={
+        "file": (io.BytesIO(statement.encode()), "payments.csv")})
+    assert imported.status_code == 302
+    assigned_id = next(tx["id"] for tx in core.list_transactions(conn) if tx["amount"] == -23)
+    saved = client.post(f"/zahlungen/tx/{assigned_id}/set", data={
+        "action": "expense", "category": "4930 - Bürobedarf", "vat_rate": "19"})
+    assert saved.status_code == 302
+    assert client.get(saved.location).status_code == 200
+
+    reopened = client.get("/zahlungen")
+    assert reopened.status_code == 200
+    html = reopened.get_data(as_text=True)
+    rows = html.split('class="tx-item"')[1:]
+    assert len(rows) == 2
+    assigned = next(row for row in rows if "-23,00 €" in row)
+    assert "Office supplies" in assigned and 'data-uncat="0"' in assigned
+    assert ">4930</div>" in assigned and ">Bürobedarf</div>" in assigned
+    pending = next(row for row in rows if "-17,00 €" in row)
+    assert "Office supplies" in pending and 'title="Offen"' in pending
+    outflow = html.split("Geldausgang</div>", 1)[1].split("</div>", 1)[0]
+    assert "-40,00 €" in outflow
+
+
+@pytest.mark.parametrize(("rate", "expected"), [(None, 19), (0, 0)])
+def test_payments_preserve_optional_booking_rule_values(client, conn, rate, expected):
+    core.import_bank_csv(conn, f"Date,Description,Amount\n{date.today()},Office supplies,-17")
+    core.save_rule(conn, "Office supplies", "gebuehr", vat_rate=rate)
+    response = client.get("/zahlungen")
+    assert response.status_code == 200
+    assert (f'data-action="gebuehr" data-cat="" data-vat="{expected}" '
+            'data-vatkind="domestic" data-private="0"') in response.get_data(as_text=True)
 
 
 def post_expense(client, *, receipt=None, date_="2026-03-05", vendor="Telekom"):

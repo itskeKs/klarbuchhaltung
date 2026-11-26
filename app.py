@@ -735,8 +735,8 @@ def zahlungen():
             elif cat == "offen":
                 s = core.suggestion_for(rules, t["description"])
                 if s:
-                    st = {"action": s["action"], "category": s.get("category") or "",
-                          "vat_rate": int(s["vat_rate"]) if s.get("vat_rate") is not None else 19,
+                    st = {"action": s["action"], "category": s["category"] or "",
+                          "vat_rate": int(s["vat_rate"]) if s["vat_rate"] is not None else 19,
                           "private_share": int(round(s["private_share"] or 0)),
                           "vat_kind": core.expense_vat_kind(s)}
             tax_label = _tax_label(cat, st["vat_rate"])
