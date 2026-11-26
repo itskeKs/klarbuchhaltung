@@ -1130,7 +1130,9 @@ def init_schema(conn: sqlite3.Connection) -> None:
             creditor_ref TEXT,
             reference_schema TEXT,
             counterparty_iban TEXT,
-            counterparty_ids TEXT
+            counterparty_ids TEXT,
+            value_day TEXT,
+            transaction_day TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_bank_provider_ref ON bank_import_facts(provider_ref);
         CREATE INDEX IF NOT EXISTS idx_bank_import_group ON bank_import_identity(booking_group);
@@ -1201,7 +1203,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
     if dcols and "suggest_tx" not in dcols:
         conn.execute("ALTER TABLE documents ADD COLUMN suggest_tx INTEGER")
     tcols = {r["name"] for r in conn.execute("PRAGMA table_info(transactions)")}
-    bank_fact_columns = ("creditor_ref", "reference_schema", "counterparty_iban", "counterparty_ids")
+    bank_fact_columns = ("creditor_ref", "reference_schema", "counterparty_iban", "counterparty_ids", *_BANK_SECONDARY_DATES)
     bank_cols = {r["name"] for r in conn.execute("PRAGMA table_info(bank_import_facts)")}
     if not bank_cols.issuperset(bank_fact_columns):
         if not conn.in_transaction:
@@ -1892,7 +1894,9 @@ def import_bank_csv(conn, text: str) -> dict:
 ENABLE_BANKING_REF_PREFIX = "enablebanking:"
 
 
-_BANK_IDENTITY_FIELDS = ("provider_ref", "booked_day", "balance_key", "creditor_ref", "reference_schema", "counterparty_iban")
+_BANK_SECONDARY_DATES = ("value_day", "transaction_day")
+_BANK_IDENTITY_FIELDS = ("provider_ref", "booked_day", "balance_key", "creditor_ref", "reference_schema",
+                         *_BANK_SECONDARY_DATES, "counterparty_iban")
 _BankBooking = namedtuple("_BankBooking", ("ref", "description", *_BANK_IDENTITY_FIELDS, "counterparty_ids"))
 
 
@@ -1926,13 +1930,16 @@ def _remember_bank_booking(conn, ref, row):
         identifiers = json.dumps(sorted(alternate), separators=(",", ":"))
     conn.execute(
         "INSERT INTO bank_import_facts "
-        "(ref, provider_ref, booked_day, balance_key, creditor_ref, reference_schema, counterparty_iban, counterparty_ids) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+        "(ref, provider_ref, booked_day, balance_key, creditor_ref, reference_schema, "
+        "value_day, transaction_day, counterparty_iban, counterparty_ids) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(ref) DO UPDATE SET provider_ref = COALESCE(provider_ref, excluded.provider_ref), "
         "booked_day = COALESCE(booked_day, excluded.booked_day), "
         "balance_key = COALESCE(balance_key, excluded.balance_key), "
         "creditor_ref = COALESCE(creditor_ref, excluded.creditor_ref), "
         "reference_schema = COALESCE(reference_schema, excluded.reference_schema), "
+        "value_day = COALESCE(value_day, excluded.value_day), "
+        "transaction_day = COALESCE(transaction_day, excluded.transaction_day), "
         "counterparty_iban = COALESCE(counterparty_iban, excluded.counterparty_iban), "
         "counterparty_ids = COALESCE(excluded.counterparty_ids, counterparty_ids)",
         (ref, *(row[field] for field in _BANK_IDENTITY_FIELDS), identifiers),
@@ -1941,8 +1948,18 @@ def _remember_bank_booking(conn, ref, row):
 
 def _bank_facts_conflict(row, old):
     return (any(row[field] and getattr(old, field) and row[field] != getattr(old, field)
-                for field in _BANK_IDENTITY_FIELDS)
+                for field in _BANK_IDENTITY_FIELDS if field not in _BANK_SECONDARY_DATES)
             or _bank_account_match(row["counterparty_ids"], old.counterparty_ids) is False)
+
+
+def _bank_secondary_match(first, second):
+    shared = [(one, two) for one, two in zip(first, second) if one and two]
+    return all(one == two for one, two in shared) if shared else None
+
+
+def _stored_secondary_match(row, old):
+    return _bank_secondary_match((row[field] for field in _BANK_SECONDARY_DATES),
+                                 (getattr(old, field) for field in _BANK_SECONDARY_DATES))
 
 
 def _bank_description_matches(row, old):
@@ -1979,10 +1996,13 @@ def _bank_match_rank(row, old, ref, source_refs):
 
 
 def _occupied_bank_reference(ref, row):
-    identity = (ref, *(row[field] for field in _BANK_IDENTITY_FIELDS))
+    identity = (ref, *(row[field] for field in _BANK_IDENTITY_FIELDS if field not in _BANK_SECONDARY_DATES))
     alternate = tuple(pair for pair in row["counterparty_ids"] if pair != ("IBAN", row["counterparty_iban"]))
     if alternate:
         identity += (alternate,)
+    dates = tuple((field, row[field]) for field in _BANK_SECONDARY_DATES if row[field])
+    if dates:
+        identity += (dates,)
     fields = json.dumps(identity, separators=(",", ":"))
     return ENABLE_BANKING_REF_PREFIX + sha256(fields.encode()).hexdigest()
 
@@ -2039,17 +2059,23 @@ def _bank_matches(conn, rows):
         for group in row["bank_groups"].values():
             candidates.update(by_day[group])
         ref = row["ref"]
+        distinct_dates = row.get("_distinct_secondary_dates", False)
         # A legacy storage reference can be occupied by an incompatible booking.
         while record := conn.execute(select + "WHERE t.ref = ?", (ref,)).fetchone():
             existing = _bank_booking(record)
-            if not _bank_facts_conflict(row, existing):
+            if not _bank_facts_conflict(row, existing) and not (distinct_dates and _stored_secondary_match(row, existing) is False):
                 candidates.add(existing)
                 break
             ref = _occupied_bank_reference(ref, row)
         storage_refs[row["ref"]] = ref
         source_refs = _bank_source_refs(row, candidates)
-        options[row["ref"]] = {old.ref: rank for old in candidates
-                               if (rank := _bank_match_rank(row, old, ref, source_refs)) is not None}
+        ranked = [(old, rank, _stored_secondary_match(row, old)) for old in candidates
+                  if (rank := _bank_match_rank(row, old, ref, source_refs)) is not None]
+        # A conflicting secondary date alone can be a changed bank date. Separate
+        # coexisting bookings or prefer a positive replay that matches known dates.
+        compare_dates = distinct_dates or any(rank < 6 and date_match is True for _, rank, date_match in ranked)
+        options[row["ref"]] = {old.ref: rank for old, rank, date_match in ranked
+                               if not compare_dates or date_match is not False}
         if row["counterparty_ids"] and row["creditor_ref"]:
             for old in candidates:
                 if (old.creditor_ref == row["creditor_ref"]

@@ -467,7 +467,7 @@ def test_legacy_banking_schema_opens_concurrently_and_keeps_identity(sandbox, mi
         ledger.execute("DROP TABLE IF EXISTS bank_import_date_aliases")
         original = tuple(ledger.execute("SELECT * FROM transactions").fetchone())
         identity = tuple(ledger.execute("SELECT * FROM bank_import_identity").fetchone())
-        facts = tuple(ledger.execute("SELECT * FROM bank_import_facts").fetchone())
+        facts = dict(ledger.execute("SELECT * FROM bank_import_facts").fetchone())
         for column in missing_facts:
             ledger.execute(f"ALTER TABLE bank_import_facts DROP COLUMN {column}")
 
@@ -477,7 +477,7 @@ def test_legacy_banking_schema_opens_concurrently_and_keeps_identity(sandbox, mi
         ready.wait(timeout=5)
         with closing(core.db()) as ledger:
             assert ledger.execute("SELECT count(*) FROM bank_import_date_aliases").fetchone()[0] == 0
-            assert tuple(ledger.execute("SELECT * FROM bank_import_facts").fetchone()) == facts
+            assert dict(ledger.execute("SELECT * FROM bank_import_facts").fetchone()) == facts
 
     with ThreadPoolExecutor(2) as pool:
         list(pool.map(lambda _: open_ledger(), range(2)))
@@ -490,7 +490,7 @@ def test_legacy_banking_schema_opens_concurrently_and_keeps_identity(sandbox, mi
             assert (result["imported"], skipped + result["ambiguous"]) == (0, 0)
         assert [tuple(row) for row in ledger.execute("SELECT * FROM transactions")] == [original]
         assert tuple(ledger.execute("SELECT * FROM bank_import_identity").fetchone()) == identity
-        assert tuple(ledger.execute("SELECT * FROM bank_import_facts").fetchone()) == facts
+        assert dict(ledger.execute("SELECT * FROM bank_import_facts").fetchone()) == facts
         assert ledger.execute("SELECT count(*) FROM bank_import_date_aliases").fetchone()[0] == 2
         assert not ledger.execute("PRAGMA foreign_key_check").fetchall()
 
@@ -795,6 +795,38 @@ def test_fetch_id_keeps_incompatible_and_independent_source_payments(sandbox, sa
             assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (3, 215)
 
 
+@pytest.mark.parametrize("initial", ["original", "enriched", "both"])
+@pytest.mark.parametrize("enrichment", [
+    {"balance_after_transaction": {"amount": "119", "currency": "EUR"}},
+    {"reference_number": "INV123", "reference_number_schema": "SCOR"},
+    {"entry_reference": "stable-credit"},
+    {"remittance_information": ["New bank memo"]},
+])
+def test_fetch_id_and_date_corroborate_sparse_booking_without_payer_or_memo(sandbox, initial, enrichment):
+    import core
+
+    original = bank_row(transaction_id="lookup-credit", booking_date="2026-11-21", remittance_information=[])
+    enriched = original | enrichment
+    debit = bank_row(entry_reference="debit", booking_date="2026-11-21", credit_debit_indicator="DBIT",
+                     transaction_amount={"currency": "EUR", "amount": "23.00"})
+    credit_versions = [original, enriched]
+    first_page = {"original": [original], "enriched": [enriched], "both": credit_versions}[initial]
+    with closing(core.db()) as ledger:
+        rows, _ = transaction_rows("account-a", first_page + [debit])
+        assert core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True)["imported"] == 2
+        core.set_tx_category(ledger, 1, "einnahme_sonstige")
+        original_payment = tuple(ledger.execute("SELECT id, ref, category FROM transactions WHERE id = 1").fetchone())
+        for credits in (credit_versions, credit_versions[::-1], [original], [enriched], credit_versions):
+            page = [credit | {"transaction_id": "later-lookup"} for credit in credits] + [debit]
+            rows, skipped = transaction_rows("account-a", page)
+            result = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True)
+            assert result["imported"] == 0
+            if len(credits) == 2:
+                assert skipped + result["ambiguous"] == int("remittance_information" in enrichment)
+            assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (2, 96)
+            assert tuple(ledger.execute("SELECT id, ref, category FROM transactions WHERE id = 1").fetchone()) == original_payment
+
+
 def test_fetch_id_without_corroboration_keeps_disjoint_payments(sandbox):
     import core
 
@@ -808,6 +840,73 @@ def test_fetch_id_without_corroboration_keeps_disjoint_payments(sandbox):
             result = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True)
             assert (result["imported"], skipped + result["ambiguous"]) == (expected, 0)
             assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (3, 215)
+
+
+@pytest.mark.parametrize("date_field", ["transaction_date", "value_date"])
+@pytest.mark.parametrize("split", [True, False])
+@pytest.mark.parametrize("reverse", [True, False])
+def test_known_secondary_dates_distinguish_reused_entry_references(sandbox, date_field, split, reverse):
+    import core
+
+    shared = bank_row(entry_reference="reused", booking_date="2026-11-22",
+                      debtor_account={"iban": "DE00FIXTURE0001"})
+    first = shared | {date_field: "2026-11-20", "transaction_id": "one"}
+    second = shared | {date_field: "2026-11-21", "transaction_id": "two"}
+    debit = bank_row(entry_reference="debit", booking_date="2026-11-22", credit_debit_indicator="DBIT",
+                     transaction_amount={"currency": "EUR", "amount": "23.00"})
+    if reverse:
+        first, second = second, first
+    batch = [first, second, debit]
+    with closing(core.db()) as ledger:
+        rows, skipped = transaction_rows("account-a", [first, debit] if split else batch)
+        result = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True)
+        assert (result["imported"], skipped + result["ambiguous"]) == (2 if split else 3, 0)
+        first_ref = transaction_rows("account-a", [first])[0][0]["ref"]
+        first_id = ledger.execute("SELECT id FROM transactions WHERE ref = ?", (first_ref,)).fetchone()[0]
+        core.set_tx_category(ledger, first_id, "einnahme_sonstige")
+        if split:
+            rows, _ = transaction_rows("account-a", [second, debit])
+            assert core.import_bank_rows(ledger, rows, auto_match=False)["imported"] == 0
+            assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (2, 96)
+        for page, expected, warnings in ((batch, int(split), 0), (batch[::-1], 0, 0), ([second, debit], 0, 0),
+                                         ([first, debit], 0, 0), ([shared, debit], 0, 1)):
+            rows, skipped = transaction_rows("account-a", page)
+            result = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True)
+            assert (result["imported"], skipped + result["ambiguous"]) == (expected, warnings)
+            assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (3, 215)
+            assert tuple(ledger.execute("SELECT ref, category FROM transactions WHERE id = ?", (first_id,)).fetchone()) == (
+                first_ref, "einnahme_sonstige",
+            )
+
+
+def test_legacy_reference_learns_secondary_dates_without_replacing_payment(sandbox):
+    import core
+
+    original = bank_row(entry_reference="reused", booking_date="2026-11-22",
+                        debtor_account={"iban": "DE00FIXTURE0001"})
+    first = original | {"transaction_date": "2026-11-20", "value_date": "2026-11-21"}
+    second = first | {"transaction_date": "2026-11-21"}
+    debit = bank_row(entry_reference="debit", booking_date="2026-11-22", credit_debit_indicator="DBIT",
+                     transaction_amount={"currency": "EUR", "amount": "23.00"})
+    with closing(core.db()) as ledger:
+        rows, _ = transaction_rows("account-a", [original, debit])
+        assert core.import_bank_rows(ledger, rows, auto_match=False)["imported"] == 2
+        core.set_tx_category(ledger, 1, "einnahme_sonstige")
+        identity = tuple(ledger.execute("SELECT id, ref, category FROM transactions WHERE id = 1").fetchone())
+        ledger.execute("ALTER TABLE bank_import_facts DROP COLUMN value_day")
+        ledger.execute("ALTER TABLE bank_import_facts DROP COLUMN transaction_day")
+
+    with closing(core.db()) as ledger:
+        assert tuple(ledger.execute("SELECT value_day, transaction_day FROM bank_import_facts WHERE ref = ?",
+                                    (identity[1],)).fetchone()) == (None, None)
+        for page, expected in (([first, debit], 0), ([first, second, debit], 1), ([second, debit], 0)):
+            rows, skipped = transaction_rows("account-a", page)
+            result = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True)
+            assert (result["imported"], skipped + result["ambiguous"]) == (expected, 0)
+        assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (3, 215)
+        assert tuple(ledger.execute("SELECT id, ref, category FROM transactions WHERE id = 1").fetchone()) == identity
+        assert tuple(ledger.execute("SELECT value_day, transaction_day FROM bank_import_facts WHERE ref = ?",
+                                    (identity[1],)).fetchone()) == ("2026-11-21", "2026-11-20")
 
 
 def test_legacy_booking_learns_payer_iban_without_changing_reference(sandbox):

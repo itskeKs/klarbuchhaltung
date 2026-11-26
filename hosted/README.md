@@ -37,6 +37,8 @@ when the matching dates and known details agree. The ledger remembers alternate
 dates and a newly supplied bank reference when it can identify an existing payment.
 Different known balances, structured references or comparable counterparty account
 identifiers can distinguish separate payments, even when the bank reuses a reference.
+When two bookings with the same reference appear together, different known dates of
+the same kind can identify the separate payments and match later replays.
 The ledger remembers account identifiers as fingerprints and learns missing evidence
 from later matches. Temporary transaction IDs help identify copies within one fetch.
 **Banking** flags conflicting memos and entries with multiple possible matches. Compare
