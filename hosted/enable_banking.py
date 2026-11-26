@@ -131,6 +131,7 @@ _FINANCIAL_BOOKING_FACTS = ("balance_key", "creditor_ref", "reference_schema")
 _OPTIONAL_BOOKING_FACTS = (*_FINANCIAL_BOOKING_FACTS, "counterparty_iban")
 _SECONDARY_BANK_DATES = ("_value_day", "_transaction_day")
 _REFERENCE_COPY_FACTS = ("balance_key", "creditor_ref")
+_FETCH_COPY_FACTS = ("provider_ref", "booked_day", *_SECONDARY_BANK_DATES, *_OPTIONAL_BOOKING_FACTS)
 
 
 def _iban_key(value):
@@ -207,51 +208,56 @@ def _align_partial_booking_dates(bookings):
     return aligned, len(unresolved)
 
 
-def _merge_dated_bookings(dated_ref, copies):
-    """Combine compatible copies and keep payments with conflicting known facts separate."""
-    facts = {row["ref"]: {field: row[field] for field in (*_OPTIONAL_BOOKING_FACTS, "counterparty_ids") if row[field]}
-             for row in copies}
-    conflicts = {ref: frozenset(other_ref for other_ref, other in facts.items()
-                                if _conflicting_facts(known, other, _OPTIONAL_BOOKING_FACTS))
-                 for ref, known in facts.items()}
+def _compatible_copy_groups(copies, conflicts_with):
+    conflicts = [frozenset(index for index, other in enumerate(copies) if conflicts_with(row, other))
+                 for row in copies]
     # Copies with the same conflicts can be merged. A sparse copy may rule out fewer
     # alternatives and can only be attached if exactly one group accounts for it.
-    signatures = set(conflicts.values())
+    signatures = set(conflicts)
     groups = {s: [] for s in signatures if not any(s < other for other in signatures)}
-    unresolved = set()
-    for row in copies:
-        matches = [s for s in groups if conflicts[row["ref"]] <= s]
+    unresolved = []
+    for row, known_conflicts in zip(copies, conflicts):
+        matches = [s for s in groups if known_conflicts <= s]
         if len(matches) == 1:
             groups[matches[0]].append(row)
         else:
-            unresolved.add(row["ref"])
+            unresolved.append(row)
+    return groups.values(), unresolved
+
+
+def _merge_copy_metadata(row, versions):
+    row["counterparty_ids"] = tuple(sorted({pair for copy in versions for pair in copy["counterparty_ids"]}))
+    row["bank_groups"] = {day: group for copy in versions for day, group in copy["bank_groups"].items()}
+    # Keep the original lookup day if a later copy supplied the posting date.
+    row["bank_group"] = min((copy["bank_group"] for copy in versions if not copy["booked_day"]),
+                            default=row["bank_group"])
+    row["prior_refs"] = list(dict.fromkeys(ref for copy in versions for ref in copy["prior_refs"]))
+    row["_unreferenced_keys"] = tuple(dict.fromkeys(key for copy in versions for key in copy["_unreferenced_keys"]))
+    row["_counterparty_names"] = frozenset().union(*(copy["_counterparty_names"] for copy in versions))
+
+
+def _merge_dated_bookings(dated_ref, copies):
+    """Combine compatible copies and keep payments with conflicting known facts separate."""
+    groups, unresolved = _compatible_copy_groups(copies, lambda a, b: _conflicting_facts(a, b, _OPTIONAL_BOOKING_FACTS))
 
     merged = []
-    skipped = len(unresolved)
-    for versions in groups.values():
-        known = {field: value for row in versions for field, value in facts[row["ref"]].items()}
+    skipped = len({row["ref"] for row in unresolved})
+    for versions in groups:
+        known = {field: row[field] for row in versions for field in _OPTIONAL_BOOKING_FACTS if row[field]}
         known["counterparty_ids"] = tuple(sorted({pair for copy in versions for pair in copy["counterparty_ids"]}))
         ref = _dated_booking_ref(dated_ref, known)
         row = min(versions, key=lambda version: (version["ref"] != ref, version["description"])) | known
         row["ref"] = ref
         row["booked_day"] = next((copy["booked_day"] for copy in versions if copy["booked_day"]), None)
-        row["bank_groups"] = {day: group for copy in versions for day, group in copy["bank_groups"].items()}
-        # Keep the original lookup day if a later copy supplied the posting date.
-        row["bank_group"] = min((copy["bank_group"] for copy in versions if not copy["booked_day"]),
-                                default=row["bank_group"])
-        row["prior_refs"] = list(dict.fromkeys(ref for copy in versions for ref in copy["prior_refs"]))
-        row["_unreferenced_keys"] = tuple(dict.fromkeys(key for copy in versions for key in copy["_unreferenced_keys"]))
-        row["_transaction_ids"] = frozenset().union(*(copy["_transaction_ids"] for copy in versions))
-        row["_counterparty_names"] = frozenset().union(*(copy["_counterparty_names"] for copy in versions))
+        _merge_copy_metadata(row, versions)
         skipped += len({copy["description"] for copy in versions}) - 1
         merged.append(row)
     return sorted(merged, key=lambda row: row["ref"]), skipped
 
 
 def _booking_evidence(row):
-    evidence = [(field, row[field]) for field in _REFERENCE_COPY_FACTS if row[field]]
-    evidence.extend(("transaction_id", value) for value in row["_transaction_ids"])
-    return ((group, field, value) for group in row["bank_groups"].values() for field, value in evidence)
+    return ((group, field, row[field]) for group in row["bank_groups"].values()
+            for field in _REFERENCE_COPY_FACTS if row[field])
 
 
 def _conflicting_counterparties(first, second):
@@ -260,6 +266,71 @@ def _conflicting_counterparties(first, second):
         return not comparable
     first_names, second_names = first["_counterparty_names"], second["_counterparty_names"]
     return bool(first_names and second_names) and first_names.isdisjoint(second_names)
+
+
+def _fetch_copy_corroborates(first, second):
+    if any(first[field] and first[field] == second[field] for field in ("provider_ref", *_REFERENCE_COPY_FACTS)):
+        return True
+    same_payer = core._bank_account_match(first["counterparty_ids"], second["counterparty_ids"]) is True
+    same_memo = first["_remittance"] and first["_remittance"] == second["_remittance"]
+    same_source = first["_source_key"] and first["_source_key"] == second["_source_key"]
+    shared_day = not first["bank_groups"].keys().isdisjoint(second["bank_groups"])
+    return (same_payer and same_memo) or (shared_day and (same_payer or same_memo or same_source))
+
+
+def _corroborated_fetch_groups(copies):
+    groups = []
+    for row in copies:
+        connected = [row]
+        unrelated = []
+        for group in groups:
+            if any(_fetch_copy_corroborates(row, previous) for previous in group):
+                connected.extend(group)
+            else:
+                unrelated.append(group)
+        groups = [*unrelated, connected]
+    return groups
+
+
+def _merge_fetch_copies(account_key, rows):
+    """Use the current lookup ID within one account fetch, before numbering source occurrences."""
+    batches = defaultdict(list)
+    for index, row in enumerate(rows):
+        lookup_id = row.pop("_transaction_id")
+        group = (lookup_id, row["_amount_key"], row["currency"]) if lookup_id else (index,)
+        batches[group].append(row)
+
+    merged = []
+    skipped = 0
+    for copies in (group for batch in batches.values() for group in _corroborated_fetch_groups(batch)):
+        if len(copies) == 1:
+            merged.extend(copies)
+            continue
+        groups, unresolved = _compatible_copy_groups(
+            copies, lambda a, b: _conflicting_facts(a, b, _FETCH_COPY_FACTS) or _conflicting_counterparties(a, b),
+        )
+        skipped += len(unresolved)
+        payments = []
+        for versions in groups:
+            preferred = min(versions, key=lambda row: (not row["provider_ref"], not row["booked_day"],
+                                                        -sum(bool(row[field]) for field in _OPTIONAL_BOOKING_FACTS),
+                                                        row["description"], row["ref"] or row["_source_key"]))
+            known = {field: row[field] for row in versions for field in _FETCH_COPY_FACTS if row[field]}
+            row = preferred | known
+            _merge_copy_metadata(row, versions)
+            effective_day = row["booked_day"] or row["_value_day"] or row["_transaction_day"]
+            row["date"] = date.fromisoformat(effective_day).isoformat()
+            row["_source_keys"] = tuple(dict.fromkeys(key for copy in versions for key in copy["_source_keys"]))
+            row["prior_refs"].extend(copy["ref"] for copy in versions if copy["ref"])
+            if row["provider_ref"]:
+                row["_dated_ref"] = fingerprint(account_key, "entry", row["_entry_reference"], row["date"],
+                                                row["_amount_key"], row["currency"])
+                row["ref"] = _dated_booking_ref(row["_dated_ref"], row)
+            skipped += len({copy["_remittance"] for copy in versions}) - 1
+            payments.append(row)
+        merged.extend(sorted(payments, key=lambda row: (row["ref"] or row["_source_key"], row["counterparty_ids"],
+                                                        row["reference_schema"] or "")))
+    return merged, skipped
 
 
 def _merge_reference_copies(rows):
@@ -279,10 +350,7 @@ def _merge_reference_copies(rows):
             continue
         matches = {ref for evidence in _booking_evidence(row) for ref in by_evidence.get(evidence, ())
                    if not _conflicting_facts(row, identified[ref], fields)
-                   and not _conflicting_counterparties(row, identified[ref])
-                   and (evidence[1] != "transaction_id"
-                        or core._bank_account_match(row["counterparty_ids"], identified[ref]["counterparty_ids"]) is True
-                        or (row["_remittance"] and row["_remittance"] == identified[ref]["_remittance"]))}
+                   and not _conflicting_counterparties(row, identified[ref])}
         if len(matches) > 1:
             omitted.add(row["ref"])
             skipped += 1
@@ -311,9 +379,7 @@ def _merge_reference_copies(rows):
 
 def transaction_rows(account_key, transactions):
     """Keep the multiplicity of identical reference-less booked transactions."""
-    occurrences = Counter()
-    seen_source_copies = set()
-    bookings = {}
+    drafts = []
     skipped = 0
     for tx in transactions:
         if not isinstance(tx, dict):
@@ -353,6 +419,9 @@ def transaction_rows(account_key, transactions):
         entry_ref = entry_ref.strip() if isinstance(entry_ref, str) else ""
         provider_ref = None
         dated_ref = None
+        ref = None
+        source_key = None
+        source_keys = ()
         prior_refs = []
         balance_key = _balance_key(tx.get("balance_after_transaction"))
         reference = tx.get("reference_number")
@@ -378,24 +447,14 @@ def transaction_rows(account_key, transactions):
             provider_ref = fingerprint(account_key, "entry", entry_ref, amount_key, currency)
             dated_ref = fingerprint(account_key, "entry", entry_ref, booking, amount_key, currency)
             ref = _dated_booking_ref(dated_ref, facts)
-            booking_key = dated_ref
             # Earlier ledgers used only the effective date and optional financial facts.
             legacy_facts = facts | {"counterparty_iban": None, "counterparty_ids": ()}
             for day in dict.fromkeys(day for day in dates if day):
                 dated = fingerprint(account_key, "entry", entry_ref, day, amount_key, currency)
                 prior_refs.extend((core.ENABLE_BANKING_REF_PREFIX + dated, _dated_booking_ref(dated, legacy_facts)))
         else:
-            # Remove repeated copies in this fetch before defining persistent occurrence numbers.
-            if transaction_id:
-                source_copy = (transaction_id, key, tuple(facts.values()))
-                if source_copy in seen_source_copies:
-                    continue
-                seen_source_copies.add(source_copy)
-            if legacy_key:
-                occurrences[legacy_key] += 1
-                prior_refs.append(core.bank_source_reference(legacy_key, occurrences[legacy_key]))
-            occurrences[key] += 1
-            ref = booking_key = core.bank_source_reference(key, occurrences[key])
+            source_key = key
+            source_keys = (legacy_key, key) if legacy_key else (key,)
         row = {"ref": ref, "date": booking, **facts,
                "amount": str(amount), "currency": currency,
                "description": description or "Bankumsatz", "tx_type": "Enable Banking"}
@@ -408,10 +467,27 @@ def transaction_rows(account_key, transactions):
         row["_value_day"], row["_transaction_day"] = dates[1:]
         row["_counterparty_names"] = frozenset((counterparty_name,)) if counterparty_name else frozenset()
         row["_remittance"] = tuple(dict.fromkeys(details))
-        row["_transaction_ids"] = frozenset((transaction_id,)) if transaction_id else frozenset()
+        row["_transaction_id"] = transaction_id
+        row["_amount_key"] = amount_key
+        row["_entry_reference"] = entry_ref
+        row["_source_key"], row["_source_keys"] = source_key, source_keys
         row["_unreferenced_keys"] = unreferenced_keys
         row["prior_refs"] = prior_refs
-        bookings.setdefault(booking_key, []).append(row)
+        drafts.append(row)
+    versions, warnings = _merge_fetch_copies(account_key, drafts)
+    skipped += warnings
+    occurrences = Counter()
+    bookings = {}
+    for row in versions:
+        aliases = {}
+        for key in row.pop("_source_keys"):
+            occurrences[key] += 1
+            aliases[key] = core.bank_source_reference(key, occurrences[key])
+        source_key = row.pop("_source_key")
+        if not row["provider_ref"]:
+            row["ref"] = aliases.pop(source_key)
+        row["prior_refs"].extend(aliases.values())
+        bookings.setdefault(row["_dated_ref"] or row["ref"], []).append(row)
     rows = []
     aligned, warnings = _align_partial_booking_dates(bookings)
     skipped += warnings

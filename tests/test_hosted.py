@@ -736,6 +736,80 @@ def test_counterparty_iban_enrichment_keeps_prior_alternate_evidence(sandbox):
             assert ledger.execute("SELECT sum(amount) FROM transactions").fetchone()[0] == total
 
 
+@pytest.mark.parametrize("initial", ["bare", "enriched", "combined"])
+@pytest.mark.parametrize("third_reference", [True, False])
+@pytest.mark.parametrize("fields", ["balance", "reference"])
+def test_fetch_id_combines_compatible_booking_versions(sandbox, initial, third_reference, fields):
+    import core
+
+    bare = bank_row(transaction_id="one-credit", booking_date="2026-11-21",
+                    debtor_account={"iban": "DE00FIXTURE0001"})
+    balance = {"balance_after_transaction": {"amount": "119", "currency": "EUR"}}
+    reference = {"reference_number": "INV123", "reference_number_schema": "SCOR"}
+    extra = balance if fields == "balance" else reference
+    enriched = bare | extra
+    third = bare | {"entry_reference": "stable-credit"} | (reference if fields == "balance" else balance)
+    credit_versions = [bare, enriched] + ([third] if third_reference else [])
+    debit = bank_row(entry_reference="debit", booking_date="2026-11-21", credit_debit_indicator="DBIT",
+                     transaction_amount={"currency": "EUR", "amount": "23.00"})
+    first_page = {"bare": [bare], "enriched": [enriched], "combined": credit_versions}[initial] + [debit]
+    batch = credit_versions + [debit]
+    with closing(core.db()) as ledger:
+        rows, skipped = transaction_rows("account-a", first_page)
+        result = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True)
+        assert (result["imported"], skipped + result["ambiguous"]) == (2, 0)
+        core.set_tx_category(ledger, 1, "einnahme_sonstige")
+        original = tuple(ledger.execute("SELECT id, ref, category FROM transactions WHERE id = 1").fetchone())
+        for page in (batch, batch[::-1], [bare | {"transaction_id": "new-fetch"}, debit], [enriched, debit]):
+            rows, skipped = transaction_rows("account-a", page)
+            result = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True)
+            assert (result["imported"], skipped + result["ambiguous"]) == (0, 0)
+            assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (2, 96)
+            assert tuple(ledger.execute("SELECT id, ref, category FROM transactions WHERE id = 1").fetchone()) == original
+        facts = ledger.execute("SELECT provider_ref, balance_key, creditor_ref FROM bank_import_facts WHERE ref = ?",
+                               (original[1],)).fetchone()
+        assert tuple(bool(value) for value in facts) == (
+            third_reference, third_reference or fields == "balance", third_reference or fields == "reference",
+        )
+
+
+@pytest.mark.parametrize("same_id", [True, False])
+def test_fetch_id_keeps_incompatible_and_independent_source_payments(sandbox, same_id):
+    import core
+
+    bare = bank_row(transaction_id="one-credit", debtor_account={"iban": "DE00FIXTURE0001"})
+    balance = {"amount": "119", "currency": "EUR"}
+    enriched = bare | {"balance_after_transaction": balance}
+    separate = (enriched | {"balance_after_transaction": balance | {"amount": "238"}} if same_id
+                else bare | {"transaction_id": "another-credit"})
+    debit = bank_row(entry_reference="debit", credit_debit_indicator="DBIT",
+                     transaction_amount={"currency": "EUR", "amount": "23.00"})
+    # A sparse row can be assigned to just one richer version. In the other case the
+    # two known movements stay distinct and the sparse version requires review.
+    batch = [bare, enriched, separate, debit]
+    with closing(core.db()) as ledger:
+        for page, expected in ((batch, 3), (batch[::-1], 0)):
+            rows, skipped = transaction_rows("account-a", page)
+            result = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True)
+            assert (result["imported"], skipped + result["ambiguous"]) == (expected, int(same_id))
+            assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (3, 215)
+
+
+def test_fetch_id_without_corroboration_keeps_disjoint_payments(sandbox):
+    import core
+
+    first = bank_row(transaction_id="reused-lookup", booking_date="2026-11-21", remittance_information=[])
+    second = first | {"booking_date": None, "value_date": "2026-11-20"}
+    debit = bank_row(entry_reference="debit", booking_date="2026-11-21", credit_debit_indicator="DBIT",
+                     transaction_amount={"currency": "EUR", "amount": "23.00"})
+    with closing(core.db()) as ledger:
+        for page, expected in (([first, second, debit], 3), ([debit, second, first], 0)):
+            rows, skipped = transaction_rows("account-a", page)
+            result = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True)
+            assert (result["imported"], skipped + result["ambiguous"]) == (expected, 0)
+            assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (3, 215)
+
+
 def test_legacy_booking_learns_payer_iban_without_changing_reference(sandbox):
     import core
 
