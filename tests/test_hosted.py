@@ -1081,6 +1081,9 @@ def test_independent_lookup_ids_do_not_split_corroborated_dated_copies(sandbox, 
     "sparse-reversal", "posting-sparse-reversal", "sparse-reversal-no-entry", "posting-sparse-reversal-no-lookup",
     "sparse-first-day-fee", "posting-sparse-last-day-fee", "posting-complete-and-sparse-last-day-fee",
     "posting-sparse-boundary-fees",
+    "anchored-first-gap", "anchored-last-gap", "posting-anchored-inner-gap", "posting-anchored-distinct-days",
+    "anchored-two-gaps",
+    "parallel-unreferenced",
 ])
 def test_intervening_booked_movement_distinguishes_repeated_statement_balances(sandbox, sign, seed, reverse, evidence):
     import core
@@ -1130,6 +1133,22 @@ def test_intervening_booked_movement_distinguishes_repeated_statement_balances(s
             offset | {"entry_reference": "last-fee", "value_date": "2026-11-21", "transaction_date": "2026-11-21",
                       "transaction_amount": {"amount": "13", "currency": "EUR"}, "balance_after_transaction": None},
         ]
+    if trail.startswith("anchored-"):
+        positions = {
+            "anchored-first-gap": [("20", 50, None), ("20", 69, 0)],
+            "anchored-last-gap": [("20", 50, 69), ("20", 69, None)],
+            "anchored-inner-gap": [("20", 50, 69), ("20", 10, None), ("20", 10, None), ("20", 49, 0)],
+            "anchored-distinct-days": [("19", 50, None), ("20", 49, 20), ("21", 20, None)],
+            "anchored-two-gaps": [("20", 30, 89), ("20", 10, None), ("20", 40, 39), ("20", 20, None), ("20", 19, 0)],
+        }
+        adjustments = [
+            adjustment | {"entry_reference": f"reversal-{index}", "transaction_id": f"reversal-{index}",
+                          "value_date": "2026-11-" + day, "transaction_date": "2026-11-" + day,
+                          "transaction_amount": {"amount": str(amount), "currency": "EUR"},
+                          "balance_after_transaction": None if balance is None else
+                          {"amount": str(balance * sign), "currency": "EUR"}}
+            for index, (day, amount, balance) in enumerate(positions[trail])
+        ]
     if trail == "early-reversal":
         adjustment.update(value_date="2026-11-19", transaction_date="2026-11-19")
         offset.update(value_date="2026-11-19", transaction_date="2026-11-19",
@@ -1137,7 +1156,7 @@ def test_intervening_booked_movement_distinguishes_repeated_statement_balances(s
     if trail == "late-reversal":
         adjustment.update(value_date="2026-11-21", transaction_date="2026-11-21")
         offset.update(value_date="2026-11-21", transaction_date="2026-11-21")
-    if trail in {"cycle", "parallel-cycle", "parallel-reused-reference"}:
+    if trail in {"cycle", "parallel-cycle", "parallel-reused-reference", "parallel-unreferenced"}:
         # First and second share an endpoint. Distinct bank references can have identical edges.
         steps = [(20, 139), (-20, 119), (-119, 0)]
         if trail != "cycle":
@@ -1153,6 +1172,9 @@ def test_intervening_booked_movement_distinguishes_repeated_statement_balances(s
             for index in (0, 2):
                 account = {"iban": f"DE00PART{index}"}
                 adjustments[index].update(entry_reference="reused-part", debtor_account=account, creditor_account=account)
+        if trail == "parallel-unreferenced":
+            for index in (0, 2):
+                adjustments[index].update(entry_reference=None, reference_number=None)
     date_field = "transaction_day"
     if evidence.startswith("posting-"):
         date_field = "date"
@@ -1247,6 +1269,62 @@ def test_disconnected_same_day_balance_movements_do_not_split_a_date_correction(
     rows, skipped = transaction_rows("account-a", [second, *disconnected, adjustment, first])
     assert skipped == 0
     assert sorted(float(row["amount"]) for row in rows) == [-119, -40, 40, 119]
+
+
+@pytest.mark.parametrize("day_field", ["booking_date", "transaction_date"])
+@pytest.mark.parametrize("context", ["before", "after"])
+@pytest.mark.parametrize("sign", [-1, 1])
+@pytest.mark.parametrize("reverse", [True, False])
+@pytest.mark.parametrize("sparse_gap", [False, True])
+def test_neighboring_statement_balance_can_prove_a_single_corrected_booking(
+    sandbox, day_field, context, sign, reverse, sparse_gap,
+):
+    import core
+
+    direction, opposite = ("CRDT", "DBIT") if sign > 0 else ("DBIT", "CRDT")
+    first = bank_row(entry_reference="rent", transaction_id="same-fetch", booking_date="2026-11-23",
+                     value_date="2026-11-17", transaction_date="2026-11-18", credit_debit_indicator=direction,
+                     debtor_account={"iban": "DE00PAYER"}, creditor_account={"iban": "DE00PAYEE"},
+                     reference_number="INV", remittance_information=["Rent"],
+                     balance_after_transaction={"amount": str(119 * sign), "currency": "EUR"})
+    first[day_field] = "2026-11-19"
+    second = first | {day_field: "2026-11-21"}
+    reversal = first | {day_field: "2026-11-20", "entry_reference": "reversal", "transaction_id": "reversal",
+                        "credit_debit_indicator": opposite, "remittance_information": ["Reversal"],
+                        "balance_after_transaction": {"amount": "0", "currency": "EUR"}}
+    neighboring_day, neighboring_balance = ("2026-11-18", 119) if context == "before" else ("2026-11-22", -23)
+    gaps = []
+    if sparse_gap:
+        gaps.append(reversal | {day_field: neighboring_day, "entry_reference": "gap", "transaction_id": "gap",
+                                "transaction_amount": {"amount": "5", "currency": "EUR"},
+                                "balance_after_transaction": None, "remittance_information": ["Gap"]})
+        neighboring_day, neighboring_balance = ("2026-11-17", 124) if context == "before" else ("2026-11-23", -28)
+    neighbor = reversal | {day_field: neighboring_day, "entry_reference": "offset", "transaction_id": "offset",
+                          "transaction_amount": {"amount": "23", "currency": "EUR"},
+                          "balance_after_transaction": {"amount": str(neighboring_balance * sign), "currency": "EUR"},
+                          "remittance_information": ["Offset"]}
+    expected, alternative = (second, first) if context == "before" else (first, second)
+    whole = [first, reversal, second, neighbor, *gaps]
+    if reverse:
+        whole.reverse()
+    with closing(core.db()) as ledger:
+        def sync(page):
+            rows, skipped = transaction_rows("account-a", page)
+            result = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True)
+            return result["imported"], skipped + result["ambiguous"]
+
+        assert sync(whole) == (3 + len(gaps), 0)
+        saved = tuple(ledger.execute("SELECT id, ref, date FROM transactions WHERE description = 'Rent'").fetchone())
+        assert saved[2] == expected["booking_date"]
+        core.set_tx_category(ledger, saved[0], "einnahme_sonstige")
+        assert sync(whole[::-1]) == (0, 0)
+        assert sync([alternative, neighbor]) == (0, int(day_field == "booking_date"))
+        assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (
+            3 + len(gaps), (-23 - 5 * len(gaps)) * sign,
+        )
+        assert tuple(ledger.execute(
+            "SELECT id, ref, date, category FROM transactions WHERE description = 'Rent'",
+        ).fetchone()) == (*saved, "einnahme_sonstige")
 
 
 @pytest.mark.parametrize("mode", ["initial", "singleton", "overlap"])

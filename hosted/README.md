@@ -42,8 +42,9 @@ the same kind can identify the separate payments and match later replays. A shar
 running balance and structured reference can corroborate a secondary-date correction.
 Dated statement movements, including movements on the same day, can show that a
 balance recurred after a separate payment. Compatible copies can supply missing
-balances for that check. A movement without a balance can fall before or after
-the evidenced part of the statement on its first or last day.
+balances. Signed movements can bridge missing balances when other amounts and
+reported balances support the same sequence. Nearby reported balances can also
+show which of two bank versions fits the statement.
 The ledger remembers account identifiers as fingerprints and learns missing evidence
 from later matches. Temporary transaction IDs help identify copies within one fetch.
 **Banking** flags conflicting memos, contradictory posting dates for a corroborated

@@ -257,18 +257,20 @@ def _merge_copy_metadata(row, versions):
 
 
 def _statement_copies_conflict(first, second):
+    if first is second:
+        return False
+    current_lookup_matches = first["_transaction_id"] and first["_transaction_id"] == second["_transaction_id"]
+    if not (first["provider_ref"] or second["provider_ref"] or current_lookup_matches):
+        return True
     if first["_statement_balance"] is not None and second["_statement_balance"] is not None:
         return (first["_statement_balance"] != second["_statement_balance"]
                 or _conflicting_facts(first, second, _STATEMENT_IDENTITY_FACTS))
-    if first is second:
-        return False
     if _conflicting_facts(first, second, _FETCH_COPY_FACTS):
         return True
     if first["provider_ref"] and first["provider_ref"] == second["provider_ref"]:
         return False
     if _conflicting_counterparties(first, second):
         return True
-    current_lookup_matches = first["_transaction_id"] and first["_transaction_id"] == second["_transaction_id"]
     remittance_matches = (first["creditor_ref"] and first["creditor_ref"] == second["creditor_ref"]
                           and (first["provider_ref"] or second["provider_ref"]))
     return not (current_lookup_matches or remittance_matches)
@@ -279,24 +281,17 @@ def _statement_day_balances(movements, boundary):
         groups, unresolved = _compatible_copy_groups(list(observations.values()), _statement_copies_conflict)
         for versions in groups:
             ending = next((row["_statement_balance"] for row in versions if row["_statement_balance"] is not None), None)
-            if ending is not None or not boundary:
-                yield amount, ending
+            yield amount, ending
         for row in unresolved:
             if row["_statement_balance"] is not None or not boundary:
-                yield amount, None
+                yield None, None
 
 
-def _statement_day_span(currency, movements, *, boundary):
+def _statement_day_span(edges):
     """Return valid opening balances and the closing balance, if fixed."""
     net = Counter()
     neighbors = defaultdict(set)
-    # A movement with an unknown balance can precede the first day's trail
-    # or follow the last day's trail. It cannot establish an interior link.
-    for amount, ending in _statement_day_balances(movements, boundary):
-        if ending is None or ending[0] != currency:
-            return set(), None
-        after = ending[1]
-        before = after - amount
+    for before, after in edges:
         net[before] += 1
         net[after] -= 1
         neighbors[before].add(after)
@@ -322,44 +317,192 @@ def _statement_day_span(currency, movements, *, boundary):
     return set(), None
 
 
-def _balance_repeats(first, second, account_rows, date_fields=_SECONDARY_BANK_DATES):
-    """Use intervening statement movements to distinguish a repeated balance from a copy."""
+def _statement_gap_closings(edges, missing, openings, closings):
+    """Try separately placed gaps under a fixed search budget."""
+    budget = 256
+    if openings is None:
+        shifts = {0}
+        for change in missing:
+            shifts |= {shift + change for shift in shifts}
+            if len(shifts) > budget:
+                return False
+        openings = set()
+        for start, _ in edges:
+            for shift in shifts:
+                openings.add(start - shift)
+                if len(openings) > budget:
+                    return False
+
+    def next_states(balance, remaining, gaps):
+        for index, edge in enumerate(remaining):
+            start, end = edge
+            if start == balance and (index == 0 or edge != remaining[index - 1]):
+                yield end, remaining[:index] + remaining[index + 1:], gaps
+        anchors = {start for start, _ in remaining}
+        choices = (index for index, change in enumerate(gaps) if index == 0 or change != gaps[index - 1])
+        for index in sorted(choices, key=lambda i: balance + gaps[i] not in anchors):
+            yield balance + gaps[index], remaining, gaps[:index] + gaps[index + 1:]
+
+    edges, missing = tuple(sorted(edges)), tuple(sorted(missing))
+    day_change = sum(end - start for start, end in edges) + sum(missing)
+    scheduled = set()
+    truncated = False
+    for opening in sorted(openings):
+        closing = opening + day_change
+        if closing in closings:
+            continue
+        if len(scheduled) == budget:
+            return False
+        initial = (opening, edges, missing)
+        scheduled.add(initial)
+        pending = [initial]
+        while pending:
+            balance, remaining, gaps = pending.pop()
+            if not remaining or (not gaps and balance in _statement_day_span(remaining)[0]):
+                closings.add(closing)
+                break
+            next_steps = []
+            for state in next_states(balance, remaining, gaps):
+                if state in scheduled:
+                    continue
+                if len(scheduled) == budget:
+                    truncated = True
+                    break
+                scheduled.add(state)
+                next_steps.append(state)
+            pending.extend(reversed(next_steps))
+    return not truncated
+
+
+def _statement_day_closings(currency, movements, openings, *, boundary, anchored):
+    edges = []
+    missing = []
+    for amount, ending in _statement_day_balances(movements, boundary):
+        if amount is None or (ending is not None and ending[0] != currency):
+            return set(), False
+        if ending is None:
+            missing.append(amount)
+        else:
+            edges.append((ending[1] - amount, ending[1]))
+
+    if missing and not anchored and not boundary:
+        return set(), False
+    change = sum(missing)
+    closings = set()
+
+    def follow(trail):
+        starts, finish = _statement_day_span(trail)
+        feasible = starts if openings is None else starts & openings
+        if feasible:
+            closings.update((finish,) if finish is not None else feasible)
+
+    if not missing or boundary or (anchored and not change):
+        follow(edges)
+    if not missing or not anchored:
+        return closings, not missing
+    if not edges:
+        return {start + change for start in openings or ()}, openings is not None
+
+    # A contiguous gap has exactly the sum of its observed movements. Test
+    # every way it can meet a declared balance, never an arbitrary partition.
+    vertices = {point for edge in edges for point in edge}
+    if change:
+        for start in vertices | {point - change for point in vertices}:
+            follow([*edges, (start, start + change)])
+    complete = len(missing) <= 1 or _statement_gap_closings(edges, missing, openings, closings)
+    # Boundary movements may also straddle the known trail.
+    return closings, complete and not (boundary and len(missing) > 1)
+
+
+def _statement_observe(movements, row, day):
+    identity = tuple(row[fact] for fact in _STATEMENT_OBSERVATION_FACTS)
+    if not row["provider_ref"] and not row["_transaction_id"]:
+        identity += (row["_statement_sources"],)
+    movements[day][Decimal(row["amount"])][identity] = row
+
+
+def _statement_trail(currency, observations, candidates, first_day, last_day):
+    movements = defaultdict(lambda: defaultdict(dict))
+    for day, rows in observations.items():
+        if first_day <= day <= last_day:
+            for row in rows:
+                _statement_observe(movements, row, day)
+    anchored = any(row["_statement_balance"] and row["_statement_balance"][0] == currency
+                   for day, rows in observations.items() if first_day <= day <= last_day for row in rows)
+    for day, row in candidates:
+        _statement_observe(movements, row, day)
+    openings = None
+    complete = True
+    for day in sorted(movements):
+        openings, checked = _statement_day_closings(
+            currency, movements[day], openings, boundary=day in {first_day, last_day}, anchored=anchored,
+        )
+        complete &= checked
+        if not openings:
+            return False if complete else None
+    return True
+
+
+def _statement_variants(first, second, account_rows, date_fields=_SECONDARY_BANK_DATES):
+    """Return the supported version indexes when dated balances provide evidence."""
     if not first["balance_key"] or first["balance_key"] != second["balance_key"]:
-        return False
+        return None
     currency, _ = first["_statement_balance"]
     amount = Decimal(first["amount"])
     if currency != first["currency"] or not amount:
-        return False
+        return None
     sources = first["_statement_sources"] | second["_statement_sources"]
+    supported = set()
     for field in date_fields:
         days = (first[field], second[field])
         if not all(days) or days[0] == days[1]:
             continue
         start, end = sorted(days)
-        movements = defaultdict(lambda: defaultdict(dict))
-
-        def observe(day, change, row):
-            identity = tuple(row[fact] for fact in _STATEMENT_OBSERVATION_FACTS)
-            movements[day][change][identity] = row
-
+        observations = defaultdict(list)
         for index, row in enumerate(account_rows):
             day = row[field]
-            if day and start <= day <= end and row["currency"] == currency and index not in sources:
-                change = Decimal(row["amount"])
-                if change:
-                    observe(day, change, row)
-        for row in (first, second):
-            observe(row[field], amount, row)
-        openings = None
-        for day in sorted(movements):
-            starts, finish = _statement_day_span(currency, movements[day], boundary=day in days)
-            feasible = starts if openings is None else starts & openings
-            if not feasible:
-                break
-            openings = {finish} if finish is not None else feasible
-        else:
-            return True
-    return False
+            if day and row["currency"] == currency and index not in sources and Decimal(row["amount"]):
+                observations[day].append(row)
+        versions = ((days[0], first), (days[1], second))
+        if not _statement_trail(currency, observations, versions, start, end):
+            continue
+        anchored_days = [day for day, rows in observations.items()
+                         if any(row["_statement_balance"] and row["_statement_balance"][0] == currency for row in rows)]
+        prior = max((day for day in anchored_days if day < start), default=start)
+        following = min((day for day in anchored_days if day > end), default=end)
+        if (prior, following) == (start, end):
+            supported.add((0, 1))
+            continue
+        both = _statement_trail(currency, observations, versions, prior, following)
+        if both is True:
+            supported.add((0, 1))
+        elif both is False:
+            singles = tuple(_statement_trail(currency, observations, (version,), prior, following) for version in versions)
+            if singles == (True, False):
+                supported.add((0,))
+            elif singles == (False, True):
+                supported.add((1,))
+    return next(iter(supported)) if len(supported) == 1 else None
+
+
+def _balance_repeats(first, second, account_rows):
+    return _statement_variants(first, second, account_rows) == (0, 1)
+
+
+def _statement_preferred_copy(versions, account_rows):
+    preferred = set()
+    rejected = set()
+    for left, right in combinations(range(len(versions)), 2):
+        result = _statement_variants(versions[left], versions[right], account_rows)
+        if result == (0,):
+            preferred.add(left)
+            rejected.add(right)
+        elif result == (1,):
+            preferred.add(right)
+            rejected.add(left)
+    if len(preferred) == 1 and not preferred & rejected:
+        return versions[next(iter(preferred))]
+    return None
 
 
 def _dated_copies_conflict(first, second, account_rows):
@@ -379,8 +522,9 @@ def _merge_dated_bookings(dated_ref, copies, account_rows):
     skipped = len({row["ref"] for row in unresolved})
     for versions in groups:
         known = {field: row[field] for row in versions for field in _FIXED_BOOKING_FACTS if row[field]}
+        preferred = _statement_preferred_copy(versions, account_rows)
         for field in _SECONDARY_BANK_DATES:
-            known[field] = min((copy[field] for copy in versions if copy[field]), default=None)
+            known[field] = (preferred and preferred[field]) or min((copy[field] for copy in versions if copy[field]), default=None)
         known["counterparty_ids"] = tuple(sorted({pair for copy in versions for pair in copy["counterparty_ids"]}))
         ref = _dated_booking_ref(dated_ref, known)
         row = min(versions, key=lambda version: (version["ref"] != ref, version["description"])) | known
@@ -459,9 +603,11 @@ def _merge_fetch_copies(account_key, rows):
         skipped += len(unresolved)
         payments = []
         for versions in groups:
-            preferred = min(versions, key=lambda row: (not row["provider_ref"], not row["booked_day"],
-                                                        -sum(bool(row[field]) for field in _OPTIONAL_BOOKING_FACTS),
-                                                        row["description"], row["ref"] or row["_source_key"]))
+            preferred = _statement_preferred_copy(versions, rows) or min(
+                versions, key=lambda row: (not row["provider_ref"], not row["booked_day"],
+                                           -sum(bool(row[field]) for field in _OPTIONAL_BOOKING_FACTS),
+                                           row["description"], row["ref"] or row["_source_key"]),
+            )
             known = {field: row[field] for row in versions for field in _FETCH_FIXED_FACTS if row[field]}
             for field in _SECONDARY_BANK_DATES:
                 known[field] = preferred[field] or min((copy[field] for copy in versions if copy[field]), default=None)
@@ -531,6 +677,8 @@ def _merge_reference_copies(rows):
 
 def _compare_posting_dates(rows, account_rows):
     by_reference = defaultdict(list)
+    preferred = set()
+    rejected = set()
     for row in rows:
         if row["provider_ref"] and row["booked_day"]:
             by_reference[row["provider_ref"]].append(row)
@@ -538,11 +686,21 @@ def _compare_posting_dates(rows, account_rows):
         for first, second in combinations(versions, 2):
             if first["booked_day"] == second["booked_day"] or not core._bank_corroborates(first, second):
                 continue
-            separate = _balance_repeats(first, second, account_rows, ("booked_day",))
+            result = _statement_variants(first, second, account_rows, ("booked_day",))
+            if result in {(0,), (1,)}:
+                pair = (first, second)
+                winner, = result
+                preferred.add(pair[winner]["ref"])
+                rejected.add(pair[1 - winner]["ref"])
+                continue
+            separate = result == (0, 1)
+            if separate:
+                preferred.update((first["ref"], second["ref"]))
             for row, other in ((first, second), (second, first)):
                 peers = row.setdefault("_booked_date_peers", {})
                 day = other["booked_day"]
                 peers[day] = peers.get(day, False) or separate
+    return rejected - preferred
 
 
 def transaction_rows(account_key, transactions):
@@ -676,9 +834,9 @@ def transaction_rows(account_key, transactions):
             rows.extend(merged)
             skipped += warnings
     rows, warnings = _merge_reference_copies(rows)
-    _compare_posting_dates(rows, drafts)
+    rejected = _compare_posting_dates(rows, drafts)
     for row in rows:
         del row["_statement_balance"]
         del row["_statement_sources"]
         del row["_transaction_id"]
-    return rows, skipped + warnings
+    return [row for row in rows if row["ref"] not in rejected], skipped + warnings
