@@ -127,7 +127,8 @@ def _balance_key(balance):
     return None
 
 
-_OPTIONAL_BOOKING_FACTS = ("balance_key", "creditor_ref", "reference_schema")
+_FINANCIAL_BOOKING_FACTS = ("balance_key", "creditor_ref", "reference_schema")
+_OPTIONAL_BOOKING_FACTS = (*_FINANCIAL_BOOKING_FACTS, "counterparty_iban")
 _SECONDARY_BANK_DATES = ("_value_day", "_transaction_day")
 _REFERENCE_COPY_FACTS = ("balance_key", "creditor_ref")
 
@@ -137,7 +138,9 @@ def _conflicting_facts(first, second, fields):
 
 
 def _dated_booking_ref(dated_ref, facts):
-    values = [facts.get(field) for field in _OPTIONAL_BOOKING_FACTS]
+    values = [facts.get(field) for field in _FINANCIAL_BOOKING_FACTS]
+    if facts.get("counterparty_iban"):
+        values.append(facts["counterparty_iban"])
     identity = fingerprint(dated_ref, *values) if any(values) else dated_ref
     return core.ENABLE_BANKING_REF_PREFIX + identity
 
@@ -167,6 +170,7 @@ def _align_partial_booking_dates(bookings):
                 if matches:
                     key, candidate = next(iter(matches.items()))
                     row["date"] = candidate["date"]
+                    row["_dated_ref"] = key
                     row["ref"] = _dated_booking_ref(key, row)
             aligned.setdefault(key, []).append(row)
     return aligned, len(unresolved)
@@ -204,8 +208,8 @@ def _merge_dated_bookings(dated_ref, copies):
         row["bank_group"] = min((copy["bank_group"] for copy in versions if not copy["booked_day"]),
                                 default=row["bank_group"])
         row["prior_refs"] = list(dict.fromkeys(ref for copy in versions for ref in copy["prior_refs"]))
-        for field in ("_counterparty_names", "_counterparty_ibans"):
-            row[field] = frozenset().union(*(copy[field] for copy in versions))
+        row["_unreferenced_keys"] = tuple(dict.fromkeys(key for copy in versions for key in copy["_unreferenced_keys"]))
+        row["_counterparty_names"] = frozenset().union(*(copy["_counterparty_names"] for copy in versions))
         skipped += len({copy["description"] for copy in versions}) - 1
         merged.append(row)
     return sorted(merged, key=lambda row: row["ref"]), skipped
@@ -217,11 +221,9 @@ def _booking_evidence(row):
 
 
 def _conflicting_counterparties(first, second):
-    first_ibans, second_ibans = first["_counterparty_ibans"], second["_counterparty_ibans"]
-    if len(first_ibans | second_ibans) > 1:
-        return True
-    if first_ibans and second_ibans:
-        return False
+    first_iban, second_iban = first["counterparty_iban"], second["counterparty_iban"]
+    if first_iban and second_iban:
+        return first_iban != second_iban
     first_names, second_names = first["_counterparty_names"], second["_counterparty_names"]
     return bool(first_names and second_names) and first_names.isdisjoint(second_names)
 
@@ -262,7 +264,8 @@ def _merge_reference_copies(rows):
             booking[field] = booking[field] or copy[field]
         booking["date"] = booking["booked_day"] or booking["date"]
         booking["bank_groups"].update(copy["bank_groups"])
-        booking["prior_refs"].extend((copy["ref"], *copy["prior_refs"]))
+        booking["prior_refs"].extend((booking["ref"], copy["ref"], *copy["prior_refs"]))
+        booking["ref"] = _dated_booking_ref(booking["_dated_ref"], booking)
         omitted.add(copy["ref"])
         skipped += booking["_remittance"] != copy["_remittance"]
     return [row for row in rows if row["ref"] not in omitted], skipped
@@ -307,36 +310,47 @@ def transaction_rows(account_key, transactions):
         description = " · ".join(dict.fromkeys([*([name] if isinstance(name, str) and name else []), *details]))
         amount_key = str(amount.normalize())
         entry_ref = tx.get("entry_reference")
+        entry_ref = entry_ref.strip() if isinstance(entry_ref, str) else ""
         provider_ref = None
+        dated_ref = None
         prior_refs = []
         balance_key = _balance_key(tx.get("balance_after_transaction"))
         reference = tx.get("reference_number")
         creditor_ref = fingerprint(reference.strip()) if isinstance(reference, str) and reference.strip() else None
         schema = tx.get("reference_number_schema") if creditor_ref else None
         facts = {"balance_key": balance_key, "creditor_ref": creditor_ref,
-                 "reference_schema": schema if isinstance(schema, str) and schema else None}
-        if isinstance(entry_ref, str) and entry_ref.strip():
-            entry_ref = entry_ref.strip()
+                 "reference_schema": schema if isinstance(schema, str) and schema else None,
+                 "counterparty_iban": fingerprint(iban) if iban else None}
+        unreferenced_keys = ()
+        if not entry_ref or iban:
+            source = (account_key, dates, amount_key, currency, name, details)
+            statement = (reference, tx.get("bank_transaction_code"))
+            fields = (*source, party_account, *statement)
+            key = fingerprint(*fields, balance_key)
+            raw_balance = tx.get("balance_after_transaction")
+            legacy_key = fingerprint(*fields, raw_balance) if balance_key else None
+            unreferenced_keys = (key, legacy_key) if legacy_key else (key,)
+            if iban:
+                unreferenced_keys += (fingerprint(*source, None, *statement, balance_key),)
+                if balance_key:
+                    unreferenced_keys += (fingerprint(*source, None, *statement, raw_balance),)
+        if entry_ref:
             provider_ref = fingerprint(account_key, "entry", entry_ref, amount_key, currency)
             dated_ref = fingerprint(account_key, "entry", entry_ref, booking, amount_key, currency)
             ref = _dated_booking_ref(dated_ref, facts)
             booking_key = dated_ref
-            # Match earlier ledgers whose IDs used only the effective date and amount.
-            prior_refs = [core.ENABLE_BANKING_REF_PREFIX + fingerprint(
-                account_key, "entry", entry_ref, day, amount_key, currency
-            ) for day in dict.fromkeys(day for day in dates if day)]
+            # Earlier ledgers used only the effective date and optional financial facts.
+            legacy_facts = facts | {"counterparty_iban": None}
+            for day in dict.fromkeys(day for day in dates if day):
+                dated = fingerprint(account_key, "entry", entry_ref, day, amount_key, currency)
+                prior_refs.extend((core.ENABLE_BANKING_REF_PREFIX + dated, _dated_booking_ref(dated, legacy_facts)))
         else:
             # transaction_id is a temporary lookup ID according to the provider.
-            fields = (account_key, dates, amount_key, currency, name, details,
-                      party_account, reference, tx.get("bank_transaction_code"))
-            key = fingerprint(*fields, balance_key)
-            if balance_key:
-                legacy_key = fingerprint(*fields, tx.get("balance_after_transaction"))
+            if legacy_key:
                 occurrences[legacy_key] += 1
-                prior_refs.append(core.ENABLE_BANKING_REF_PREFIX + fingerprint(legacy_key, occurrences[legacy_key]))
+                prior_refs.append(core.bank_source_reference(legacy_key, occurrences[legacy_key]))
             occurrences[key] += 1
-            booking_key = fingerprint(key, occurrences[key])
-            ref = core.ENABLE_BANKING_REF_PREFIX + booking_key
+            ref = booking_key = core.bank_source_reference(key, occurrences[key])
         row = {"ref": ref, "date": booking, **facts,
                "amount": str(amount), "currency": currency,
                "description": description or "Bankumsatz", "tx_type": "Enable Banking"}
@@ -345,10 +359,11 @@ def transaction_rows(account_key, transactions):
         row["bank_group"] = row["bank_groups"][booking]
         row["provider_ref"] = provider_ref
         row["booked_day"] = dates[0] or None
+        row["_dated_ref"] = dated_ref
         row["_value_day"], row["_transaction_day"] = dates[1:]
         row["_counterparty_names"] = frozenset((counterparty_name,)) if counterparty_name else frozenset()
-        row["_counterparty_ibans"] = frozenset((fingerprint(iban),)) if iban else frozenset()
         row["_remittance"] = tuple(dict.fromkeys(details))
+        row["_unreferenced_keys"] = unreferenced_keys
         row["prior_refs"] = prior_refs
         bookings.setdefault(booking_key, []).append(row)
     rows = []

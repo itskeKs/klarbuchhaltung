@@ -453,7 +453,7 @@ def test_full_booking_learns_dates_from_overlap_for_sparse_replays(sandbox, reve
         assert [tuple(row) for row in ledger.execute("SELECT id, ref, date, category FROM transactions ORDER BY id")] == original
 
 
-@pytest.mark.parametrize("missing_facts", [(), ("reference_schema",), ("creditor_ref", "reference_schema")])
+@pytest.mark.parametrize("missing_facts", [(), ("reference_schema",), ("creditor_ref", "reference_schema"), ("counterparty_iban",)])
 def test_legacy_banking_schema_opens_concurrently_and_keeps_identity(sandbox, missing_facts):
     import core
 
@@ -562,6 +562,184 @@ def test_shared_invoice_reference_keeps_distinct_counterparties(sandbox, counter
             original = core.get_transaction(ledger, 1)
             assert original["description"].endswith("Part B")
             assert original["category"] == "einnahme_sonstige"
+
+
+@pytest.mark.parametrize("references", [(None, "bert"), ("reused", "reused"), (None, None)])
+@pytest.mark.parametrize("split", [True, False])
+@pytest.mark.parametrize("reverse", [True, False])
+def test_known_payers_keep_distinct_payments_across_sync_batches(sandbox, references, split, reverse):
+    import core
+
+    ana = bank_row(entry_reference=references[0], reference_number="INV123", reference_number_schema="SCOR",
+                   debtor={"name": "Ana Test"}, debtor_account={"iban": "DE00FIXTURE0001"})
+    bert = ana | {"entry_reference": references[1], "debtor": {"name": "Bert Test"},
+                  "debtor_account": {"iban": "DE00FIXTURE0002"}}
+    debit = bank_row(entry_reference="debit", credit_debit_indicator="DBIT",
+                     transaction_amount={"currency": "EUR", "amount": "23.00"})
+    first, second = (bert, ana) if reverse else (ana, bert)
+    batch = [first, second, debit]
+    ledger = core.db()
+
+    def ingest(page, expected_total, warnings=0):
+        rows, skipped = transaction_rows("account-a", page)
+        result = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True)
+        assert ledger.execute("SELECT sum(amount) FROM transactions").fetchone()[0] == expected_total
+        assert skipped + result["ambiguous"] == warnings
+        return result["imported"]
+
+    assert ingest([first, debit] if split else batch, 96 if split else 215) == (2 if split else 3)
+    core.set_tx_category(ledger, 1, "einnahme_sonstige")
+    original = tuple(ledger.execute("SELECT ref, description, category FROM transactions WHERE id = 1").fetchone())
+    if split:
+        assert ingest([second, debit], 215) == 1
+    reduced = first | {"debtor_account": None}
+    same_reference = references[0] is not None and references[0] == references[1]
+    for page, warnings in (([second, debit], 0), ([first, debit], 0), (batch[::-1], 0),
+                           ([second, debit, reduced], int(same_reference)), (batch, 0)):
+        assert ingest(page, 215, warnings) == 0
+        assert ledger.execute("SELECT count(*) FROM transactions").fetchone()[0] == 3
+        assert tuple(ledger.execute("SELECT ref, description, category FROM transactions WHERE id = 1").fetchone()) == original
+
+
+def test_bank_source_reference_preserves_legacy_occurrence_ids():
+    import core
+
+    # Two occurrences of the same source as stored before payer accounts were tracked.
+    key = "5e462c8876aa2d6b82cf5c48b51806cce664f9589806553b1f838459dd3ce5bd"
+    assert [core.bank_source_reference(key, number) for number in (1, 2)] == [
+        "enablebanking:682778baf1f48a6681e0b850388e75c10e95bc890ab866523e2fb7dccf495b24",
+        "enablebanking:4a904f2e2152463580f812e4a4403d04114e3fecb119b9618523f38825401ee1",
+    ]
+
+
+def test_occupied_bank_reference_uses_compatible_bank_facts(sandbox):
+    import core
+
+    first = bank_row(entry_reference="reused", reference_number="INV123",
+                     debtor_account={"iban": "DE00FIXTURE0001"})
+    second = first | {"debtor_account": {"iban": "DE00FIXTURE0002"}}
+    ledger = core.db()
+    rows, _ = transaction_rows("account-a", [first])
+    assert core.import_bank_rows(ledger, rows, auto_match=False)["imported"] == 1
+    core.set_tx_category(ledger, 1, "einnahme_sonstige")
+    occupied_ref = rows[0]["ref"]
+
+    for expected in (1, 0):
+        rows, _ = transaction_rows("account-a", [second])
+        rows[0]["ref"] = occupied_ref
+        result = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True)
+        assert (result["imported"], result["ambiguous"]) == (expected, 0)
+    assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (2, 238)
+    assert core.get_transaction(ledger, 1)["category"] == "einnahme_sonstige"
+
+
+def test_legacy_booking_learns_payer_iban_without_changing_reference(sandbox):
+    import core
+
+    old = bank_row(entry_reference="reused", reference_number="INV123", debtor={"name": "Ana Test"})
+    ana = old | {"debtor_account": {"iban": "DE00FIXTURE0001"}}
+    bert = old | {"debtor_account": {"iban": "DE00FIXTURE0002"}, "debtor": {"name": "Bert Test"}}
+    debit = bank_row(entry_reference="debit", credit_debit_indicator="DBIT",
+                     transaction_amount={"currency": "EUR", "amount": "23.00"})
+    with closing(core.db()) as ledger:
+        rows, _ = transaction_rows("account-a", [old, debit])
+        assert core.import_bank_rows(ledger, rows, auto_match=False)["imported"] == 2
+        core.set_tx_category(ledger, 1, "einnahme_sonstige")
+        identity = tuple(ledger.execute("SELECT id, ref, date, description, category FROM transactions WHERE id = 1").fetchone())
+        ledger.execute("ALTER TABLE bank_import_facts DROP COLUMN counterparty_iban")
+
+    with closing(core.db()) as ledger:
+        assert ledger.execute("SELECT counterparty_iban FROM bank_import_facts WHERE ref = ?", (identity[1],)).fetchone()[0] is None
+        for page, expected, total in (([ana, debit], 0, 96), ([bert, debit], 1, 215), ([ana, bert, debit], 0, 215)):
+            rows, skipped = transaction_rows("account-a", page)
+            result = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True)
+            assert (result["imported"], skipped + result["ambiguous"]) == (expected, 0)
+            assert ledger.execute("SELECT sum(amount) FROM transactions").fetchone()[0] == total
+            assert tuple(ledger.execute("SELECT id, ref, date, description, category FROM transactions WHERE id = 1").fetchone()) == identity
+        payer = ledger.execute("SELECT counterparty_iban FROM bank_import_facts WHERE ref = ?", (identity[1],)).fetchone()[0]
+        assert payer == transaction_rows("account-a", [ana])[0][0]["counterparty_iban"]
+
+
+@pytest.mark.parametrize("late_ana_reference", [None, "ana"])
+@pytest.mark.parametrize("historic_account_kind", ["iban", "bban"])
+@pytest.mark.parametrize("reverse", [True, False])
+def test_legacy_credit_waits_for_identity_when_only_invoice_reference_matches(
+    sandbox, late_ana_reference, historic_account_kind, reverse,
+):
+    import core
+
+    ana = bank_row(reference_number="INV123", reference_number_schema="SCOR", debtor={"name": "Ana Test"},
+                   debtor_account={"iban": "DE00FIXTURE0001"})
+    bert = ana | {"entry_reference": "bert", "debtor": {"name": "Bert Test"},
+                  "debtor_account": {"iban": "DE00FIXTURE0002"}}
+    debit = bank_row(entry_reference="debit", credit_debit_indicator="DBIT",
+                     transaction_amount={"currency": "EUR", "amount": "23.00"})
+    historic_ana = ana if historic_account_kind == "iban" else ana | {
+        "debtor_account": {"other": {"identification": "202611210001", "scheme_name": "BBAN"}},
+    }
+    with closing(core.db()) as ledger:
+        rows, _ = transaction_rows("account-a", [historic_ana, debit])
+        assert core.import_bank_rows(ledger, rows, auto_match=False)["imported"] == 2
+        core.set_tx_category(ledger, 1, "einnahme_sonstige")
+        original = tuple(ledger.execute("SELECT ref, description, category FROM transactions WHERE id = 1").fetchone())
+        ledger.execute("ALTER TABLE bank_import_facts DROP COLUMN counterparty_iban")
+
+    with closing(core.db()) as ledger:
+        for page in ([bert, debit], [debit, bert]):
+            rows, skipped = transaction_rows("account-a", page)
+            result = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True)
+            assert (result["imported"], skipped + result["ambiguous"]) == (0, 1)
+            assert tuple(ledger.execute("SELECT provider_ref, counterparty_iban FROM bank_import_facts WHERE ref = ?",
+                                        (original[0],)).fetchone()) == (None, None)
+            assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (2, 96)
+
+        ana = ana | {"entry_reference": late_ana_reference}
+        batch = [bert, ana, debit] if reverse else [ana, bert, debit]
+        for page, expected in ((batch, 1), (batch[::-1], 0), ([bert, debit], 0)):
+            rows, skipped = transaction_rows("account-a", page)
+            result = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True)
+            assert (result["imported"], skipped + result["ambiguous"]) == (expected, 0)
+            assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (3, 215)
+            assert tuple(ledger.execute("SELECT ref, description, category FROM transactions WHERE id = 1").fetchone()) == original
+        assert ledger.execute("SELECT counterparty_iban FROM bank_import_facts WHERE ref = ?",
+                              (original[0],)).fetchone()[0] == transaction_rows("account-a", [ana])[0][0]["counterparty_iban"]
+
+
+@pytest.mark.parametrize("legacy", [True, False])
+@pytest.mark.parametrize("reverse", [True, False])
+def test_prior_description_breaks_tie_on_reused_reference_with_new_payer_evidence(sandbox, legacy, reverse):
+    import core
+
+    sparse = bank_row(entry_reference="reused", reference_number="INV123", debtor={"name": "Ana Test"},
+                      remittance_information=["Part A"])
+    ana = sparse | {"debtor_account": {"iban": "DE00FIXTURE0001"}}
+    bert = sparse | {"debtor": {"name": "Bert Test"}, "debtor_account": {"iban": "DE00FIXTURE0002"},
+                     "remittance_information": ["Part B"]}
+    debit = bank_row(entry_reference="debit", credit_debit_indicator="DBIT",
+                     transaction_amount={"currency": "EUR", "amount": "23.00"})
+    with closing(core.db()) as ledger:
+        rows, _ = transaction_rows("account-a", [sparse, debit])
+        assert core.import_bank_rows(ledger, rows, auto_match=False)["imported"] == 2
+        core.set_tx_category(ledger, 1, "einnahme_sonstige")
+        original = tuple(ledger.execute("SELECT ref, description, category FROM transactions WHERE id = 1").fetchone())
+        if legacy:
+            ledger.execute("ALTER TABLE bank_import_facts DROP COLUMN counterparty_iban")
+
+    batch = [bert, ana, debit] if reverse else [ana, bert, debit]
+    with closing(core.db()) as ledger:
+        rows, skipped = transaction_rows("account-a", [bert, debit])
+        result = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True)
+        assert (result["imported"], skipped + result["ambiguous"]) == (0, 1)
+        assert ledger.execute("SELECT counterparty_iban FROM bank_import_facts WHERE ref = ?",
+                              (original[0],)).fetchone()[0] is None
+        for page, expected in ((batch, 1), (batch[::-1], 0), ([ana, debit], 0), ([bert, debit], 0)):
+            rows, skipped = transaction_rows("account-a", page)
+            result = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True)
+            assert (result["imported"], skipped + result["ambiguous"]) == (expected, 0)
+            assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (3, 215)
+            assert tuple(ledger.execute("SELECT ref, description, category FROM transactions WHERE id = 1").fetchone()) == original
+        assert ledger.execute("SELECT counterparty_iban FROM bank_import_facts WHERE ref = ?",
+                              (original[0],)).fetchone()[0] == transaction_rows("account-a", [ana])[0][0]["counterparty_iban"]
 
 
 @pytest.mark.parametrize("reverse", [True, False])
