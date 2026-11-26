@@ -49,7 +49,7 @@
 </div>
 
 <div class="card" style="padding:0;overflow:hidden">
-  <div class="row" style="gap:14px;padding:11px 20px;border-bottom:1px solid var(--line-3);font-size:11px;font-weight:600;letter-spacing:.05em;text-transform:uppercase;color:var(--ink-4)">
+  <div class="row payment-columns" style="gap:14px;padding:11px 20px;border-bottom:1px solid var(--line-3);font-size:11px;font-weight:600;letter-spacing:.05em;text-transform:uppercase;color:var(--ink-4)">
     <span style="width:18px;flex-shrink:0"></span>
     <span style="flex:1;min-width:0">Zahlungspartner · Datum</span>
     <span style="width:120px;flex-shrink:0;text-align:right">Betrag</span>
@@ -132,7 +132,7 @@
     {% else %}
     <div class="tx-item" data-kind="{{ 'in' if t.is_income else 'out' }}" data-uncat="{{ '1' if not t.categorized else '0' }}"
          data-text="{{ t.search }}">
-      <div class="txn tx-row" onclick="txToggle(this)">
+      <div class="txn tx-row bank-payment" onclick="txToggle(this)">
         <input type="checkbox" class="txcheck" value="{{ t.id }}" onclick="event.stopPropagation();txBulk()" style="width:16px;height:16px;flex-shrink:0;accent-color:var(--ink);cursor:pointer">
         <div style="flex:1;min-width:0">
           <div style="font-size:14.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ t.description or '—' }}</div>

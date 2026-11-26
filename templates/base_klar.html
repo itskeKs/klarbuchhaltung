@@ -137,10 +137,19 @@
     .kcal-db.out{ color:#C9C6BB; }
     .kcal-db.sel{ background:var(--accent); color:#fff; font-weight:600; }
   </style>
+  {% if hosted %}
+  <link rel="stylesheet" href="{{ url_for('static', filename='hosted.css') }}">
+  <meta name="klar-csrf" content="{{ hosted_csrf }}">
+  <script src="{{ url_for('static', filename='hosted.js') }}"></script>
+  {% endif %}
   {% block head %}{% endblock %}
 </head>
-<body>
+<body{% if hosted %} data-hosted-view="{{ active }}"{% endif %}>
   <div class="kl-shell">
+    {% if hosted %}
+    <button class="hosted-menu btn btn--outline" type="button" aria-controls="klar-navigation"
+            aria-expanded="false" onclick="this.setAttribute('aria-expanded', this.getAttribute('aria-expanded') !== 'true')">Menü</button>
+    {% endif %}
     {% include "_sidebar.html" %}
     <main class="kl-main">
       {% with messages = get_flashed_messages(with_categories=true) %}
@@ -152,6 +161,7 @@
     </main>
   </div>
 
+  {% if not hosted %}
   {# ── Rechnung senden (Modal, Mockup „Klar Invoice Send") ── #}
   <div id="isend" style="position:fixed;inset:0;z-index:900;background:rgba(22,23,29,.42);display:none;align-items:flex-start;justify-content:center;padding:5vh 20px 20px;overflow-y:auto">
     <div id="isend-box" style="width:900px;max-width:100%;background:var(--surface);border-radius:22px;box-shadow:0 30px 70px -30px rgba(20,18,10,.5);overflow:hidden">
@@ -605,6 +615,7 @@
       try{ if(localStorage.getItem('ask-open')==='1'){ const dk=document.getElementById('ask-dock'); dk.hidden=false; loadHist(); } }catch(e){}
     })();
   </script>
+  {% endif %}
 
   {# ── Command Palette (⌘K) ── #}
   <div id="cmdk" class="scrim" hidden style="align-items:flex-start;padding-top:14vh">
@@ -625,9 +636,9 @@
       {g:'Gehe zu', t:'Kunden', u:'{{ url_for("invoices", tab="customers") }}'},
       {g:'Gehe zu', t:'Dokumente', u:'{{ url_for("files") }}'},
       {g:'Gehe zu', t:'Berichte', u:'{{ url_for("reports") }}'},
-      {g:'Gehe zu', t:'Assistant', u:'{{ url_for("chat") }}'},
+      {% if not hosted %}{g:'Gehe zu', t:'Assistant', u:'{{ url_for("chat") }}'},{% endif %}
       {g:'Gehe zu', t:'Einstellungen', u:'{{ url_for("settings") }}'},
-      {g:'Gehe zu', t:'Terminal', u:'{{ url_for("terminal") }}'},
+      {% if terminal_moeglich %}{g:'Gehe zu', t:'Terminal', u:'{{ url_for("terminal") }}'},{% endif %}
       {g:'Aktion', t:'Neue Rechnung', u:'{{ url_for("invoice_new") }}'},
       {g:'Aktion', t:'CSV importieren', u:'{{ url_for("import_csv") }}'},
     ];
@@ -668,7 +679,7 @@
         const lbl=document.createElement('span'); lbl.className='kls-label'; trig.appendChild(lbl);
         trig.insertAdjacentHTML('beforeend','<svg class="kls-chev" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>');
         const panel=document.createElement('div'); panel.className='kls-panel'; panel.hidden=true;
-        // Panel an <body> hängen, damit position:fixed nicht an einem transformierten/
+        // Panel an <body{% if hosted %} data-hosted-view="{{ active }}"{% endif %}> hängen, damit position:fixed nicht an einem transformierten/
         // overflow-Container (Bulk-Leiste, Modal) klebt und daneben rutscht.
         wrap.appendChild(trig); document.body.appendChild(panel);
         const CHK='<svg class="kls-check" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>';

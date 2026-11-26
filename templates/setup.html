@@ -39,8 +39,9 @@
   <h1>{{ profil.name if profil else 'Willkommen' }} einrichten</h1>
   <p class="lead">
     Einmalig die Stammdaten dieses Profils – daraus entstehen Rechnungen, EÜR und
-    Umsatzsteuer-Voranmeldung. Alles bleibt lokal auf diesem Rechner und ist später in den
-    Einstellungen änderbar.
+    Umsatzsteuer-Voranmeldung. {% if hosted %}Deine Daten werden im eigenen Konto auf diesem Server
+    gespeichert. Du kannst die Stammdaten später in den Einstellungen ändern.{% else %}
+    Alles bleibt lokal auf diesem Rechner und ist später in den Einstellungen änderbar.{% endif %}
   </p>
 
   {% with msgs = get_flashed_messages(with_categories=true) %}
@@ -48,6 +49,7 @@
   {% endwith %}
 
   <form method="post">
+      {% if hosted %}<input type="hidden" name="_klar_csrf" value="{{ hosted_csrf }}">{% endif %}
     <div class="card">
       <h2>Dein Unternehmen</h2>
       <p class="hint">Erscheint als Absender auf der Rechnung.</p>

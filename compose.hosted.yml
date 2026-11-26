@@ -1,0 +1,83 @@
+name: klarbuchhaltung
+
+x-runtime: &runtime
+  image: klarbuchhaltung-hosted:local
+  build:
+    context: .
+    dockerfile: hosted/Dockerfile
+  init: true
+  restart: unless-stopped
+  read_only: true
+  tmpfs:
+    - /tmp:size=64m,mode=1777
+  cap_drop: [ALL]
+  security_opt:
+    - no-new-privileges:true
+
+x-tenant: &tenant
+  <<: *runtime
+  command: ["gunicorn", "-c", "hosted/gunicorn.conf.py", "hosted.tenant:create_app()"]
+
+x-environment: &environment
+  KLAR_PUBLIC_ORIGIN: ${KLAR_PUBLIC_ORIGIN:?Set KLAR_PUBLIC_ORIGIN to the public HTTPS origin}
+  BB_HOME: /data
+
+services:
+  gateway:
+    <<: *runtime
+    command: ["gunicorn", "-c", "hosted/gunicorn.conf.py", "hosted.gateway:create_app()"]
+    environment: *environment
+    networks:
+      buha-proxy:
+        aliases: [klarbuchhaltung-gateway]
+      tenant-a:
+      tenant-b:
+    volumes:
+      - gateway-data:/data
+      - type: bind
+        source: ${KLAR_SECRETS_DIR:?Set KLAR_SECRETS_DIR}/gateway.json
+        target: /run/klar/gateway.json
+        read_only: true
+        bind:
+          create_host_path: false
+
+  tenant-a:
+    <<: *tenant
+    environment:
+      <<: *environment
+      KLAR_TENANT: tenant-a
+    networks: [tenant-a]
+    volumes:
+      - tenant-a-data:/data
+      - type: bind
+        source: ${KLAR_SECRETS_DIR:?Set KLAR_SECRETS_DIR}/tenant-a
+        target: /run/klar
+        read_only: true
+        bind:
+          create_host_path: false
+
+  tenant-b:
+    <<: *tenant
+    environment:
+      <<: *environment
+      KLAR_TENANT: tenant-b
+    networks: [tenant-b]
+    volumes:
+      - tenant-b-data:/data
+      - type: bind
+        source: ${KLAR_SECRETS_DIR:?Set KLAR_SECRETS_DIR}/tenant-b
+        target: /run/klar
+        read_only: true
+        bind:
+          create_host_path: false
+
+networks:
+  buha-proxy:
+    external: true
+  tenant-a:
+  tenant-b:
+
+volumes:
+  gateway-data:
+  tenant-a-data:
+  tenant-b-data:

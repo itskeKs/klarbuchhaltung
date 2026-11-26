@@ -10,6 +10,7 @@ import os
 import sqlite3
 import sys
 import tomllib
+from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
@@ -1110,6 +1111,11 @@ def init_schema(conn: sqlite3.Connection) -> None:
             note         TEXT,
             created_at   TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS bank_import_identity (
+            ref TEXT PRIMARY KEY REFERENCES transactions(ref) ON DELETE CASCADE,
+            booking_group TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_bank_import_group ON bank_import_identity(booking_group);
         CREATE TABLE IF NOT EXISTS fx_rates (
             date   TEXT NOT NULL,   -- Kursdatum (YYYY-MM-DD)
             base   TEXT NOT NULL,   -- Ausgangswährung
@@ -1855,36 +1861,87 @@ def import_bank_csv(conn, text: str) -> dict:
     return {"imported": imported, "duplicates": dups, "matched": matched}
 
 
-def import_bank_rows(conn, rows: list) -> dict:
+ENABLE_BANKING_REF_PREFIX = "enablebanking:"
+
+
+def _seen_bank_rows(conn, rows):
+    """Reconcile complete daily batches when the bank supplies no permanent reference."""
+    groups = defaultdict(list)
+    for row in rows:
+        if row.get("bank_group"):
+            groups[row["bank_group"]].append(row)
+
+    seen = set()
+    for group, batch in groups.items():
+        # Recognize existing-format refs on upgrade without touching user assignments.
+        conn.executemany(
+            "INSERT OR IGNORE INTO bank_import_identity (booking_group, ref) "
+            "SELECT ?, ref FROM transactions WHERE ref = ?",
+            ((group, row["ref"]) for row in batch),
+        )
+        saved = dict(conn.execute(
+            "SELECT ref, description FROM bank_import_identity JOIN transactions USING (ref) "
+            "WHERE booking_group = ?", (group,),
+        ))
+        exact = saved.keys() & {row["ref"] for row in batch}
+        seen.update(exact)
+        descriptions = Counter(desc for ref, desc in saved.items() if ref not in exact)
+        unmatched = []
+        for row in batch:
+            if row["ref"] in exact:
+                continue
+            if descriptions[row["description"]]:
+                seen.add(row["ref"])
+                descriptions[row["description"]] -= 1
+            else:
+                unmatched.append(row["ref"])
+        # The whole posting date is fetched together. Changed optional details can
+        # account for existing payments; only additional occurrences are new.
+        seen.update(unmatched[:descriptions.total()])
+    return seen
+
+
+def import_bank_rows(conn, rows: list, *, auto_match: bool = True, require_fx: bool = False) -> dict:
     """Fertig normalisierte Zahlungen aufnehmen (z. B. aus dem Wirex-Konto).
 
-    Landen als 'offen' in den Zahlungen – bewusst OHNE Buchungssatz und ohne
-    Festschreibung: die buchhalterische Zuordnung macht der Nutzer.
+    Auto-match is optional. Enable Banking rows are always left for review.
     'ref' ist UNIQUE, ein erneuter Abruf legt also nichts doppelt an."""
-    imported = dups = 0
+    imported = dups = deferred = 0
+    seen = _seen_bank_rows(conn, rows)
     for r in rows:
         ref = (r.get("ref") or "").strip()
         date_ = (r.get("date") or "")[:10]
         if not ref or not date_:
             continue
-        if conn.execute("SELECT 1 FROM transactions WHERE ref = ?", (ref,)).fetchone():
+        if ref in seen or conn.execute("SELECT 1 FROM transactions WHERE ref = ?", (ref,)).fetchone():
             dups += 1
             continue
         amount = float(r.get("amount") or 0)
         currency = (r.get("currency") or "EUR").upper()
         amount_home, fx = to_home(conn, amount, currency, date_)
-        conn.execute(
+        if require_fx and amount_home is None:
+            deferred += 1
+            continue
+        inserted = conn.execute(
             """INSERT INTO transactions
                (ref, date, amount, fee, currency, amount_home, fx_rate,
                 description, tx_type, category, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?, 'offen', ?)""",
+               VALUES (?,?,?,?,?,?,?,?,?, 'offen', ?)
+               ON CONFLICT(ref) DO NOTHING""",
             (ref, date_, amount, float(r.get("fee") or 0), currency, amount_home, fx,
              r.get("description") or "", r.get("tx_type") or "", _now()),
         )
-        imported += 1
+        if inserted.rowcount and r.get("bank_group"):
+            conn.execute("INSERT INTO bank_import_identity (ref, booking_group) VALUES (?, ?)",
+                         (ref, r["bank_group"]))
+        imported += inserted.rowcount
+        dups += 1 - inserted.rowcount
     conn.commit()
-    matched = _auto_match_transactions(conn) if imported else 0
-    return {"imported": imported, "duplicates": dups, "matched": matched}
+    matched = _auto_match_transactions(conn) if imported and auto_match else 0
+    result = {"imported": imported, "duplicates": dups, "matched": matched}
+    if require_fx:
+        result["deferred"] = deferred
+    return result
 
 
 def _auto_match_transactions(conn) -> int:
@@ -1892,7 +1949,9 @@ def _auto_match_transactions(conn) -> int:
     matched = 0
     txs = conn.execute(
         """SELECT * FROM transactions
-           WHERE amount > 0 AND invoice_id IS NULL AND amount_home IS NOT NULL"""
+           WHERE amount > 0 AND invoice_id IS NULL AND amount_home IS NOT NULL
+             AND (ref IS NULL OR ref NOT LIKE ?)""",
+        (ENABLE_BANKING_REF_PREFIX + "%",),
     ).fetchall()
     for t in txs:
         cands = conn.execute(
