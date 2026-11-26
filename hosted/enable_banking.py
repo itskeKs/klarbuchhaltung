@@ -129,6 +129,7 @@ def _balance_key(balance):
 
 _OPTIONAL_BOOKING_FACTS = ("balance_key", "creditor_ref", "reference_schema")
 _SECONDARY_BANK_DATES = ("_value_day", "_transaction_day")
+_REFERENCE_COPY_FACTS = ("balance_key", "creditor_ref")
 
 
 def _conflicting_facts(first, second, fields):
@@ -203,9 +204,68 @@ def _merge_dated_bookings(dated_ref, copies):
         row["bank_group"] = min((copy["bank_group"] for copy in versions if not copy["booked_day"]),
                                 default=row["bank_group"])
         row["prior_refs"] = list(dict.fromkeys(ref for copy in versions for ref in copy["prior_refs"]))
+        for field in ("_counterparty_names", "_counterparty_ibans"):
+            row[field] = frozenset().union(*(copy[field] for copy in versions))
         skipped += len({copy["description"] for copy in versions}) - 1
         merged.append(row)
     return sorted(merged, key=lambda row: row["ref"]), skipped
+
+
+def _booking_evidence(row):
+    return ((group, field, row[field]) for group in row["bank_groups"].values()
+            for field in _REFERENCE_COPY_FACTS if row[field])
+
+
+def _conflicting_counterparties(first, second):
+    first_ibans, second_ibans = first["_counterparty_ibans"], second["_counterparty_ibans"]
+    if len(first_ibans | second_ibans) > 1:
+        return True
+    if first_ibans and second_ibans:
+        return False
+    first_names, second_names = first["_counterparty_names"], second["_counterparty_names"]
+    return bool(first_names and second_names) and first_names.isdisjoint(second_names)
+
+
+def _merge_reference_copies(rows):
+    """Consolidate a reference-less copy only when its booked evidence identifies one payment."""
+    identified = {row["ref"]: row for row in rows if row["provider_ref"]}
+    by_evidence = defaultdict(set)
+    for ref, row in identified.items():
+        for evidence in _booking_evidence(row):
+            by_evidence[evidence].add(ref)
+
+    candidates = defaultdict(list)
+    omitted = set()
+    skipped = 0
+    fields = ("booked_day", *_SECONDARY_BANK_DATES, *_OPTIONAL_BOOKING_FACTS)
+    for row in rows:
+        if row["provider_ref"]:
+            continue
+        matches = {ref for evidence in _booking_evidence(row) for ref in by_evidence.get(evidence, ())
+                   if not _conflicting_facts(row, identified[ref], fields)
+                   and not _conflicting_counterparties(row, identified[ref])}
+        if len(matches) > 1:
+            omitted.add(row["ref"])
+            skipped += 1
+        elif matches:
+            candidates[next(iter(matches))].append(row)
+
+    for ref, copies in candidates.items():
+        if len(copies) > 1:
+            # Several reference-less movements may have equal details. Keep their multiplicity.
+            omitted.add(ref)
+            skipped += 1
+            continue
+        copy, = copies
+        booking = identified[ref]
+        for field in fields:
+            booking[field] = booking[field] or copy[field]
+        booking["date"] = booking["booked_day"] or booking["date"]
+        booking["bank_groups"].update(copy["bank_groups"])
+        booking["prior_refs"].extend((copy["ref"], *copy["prior_refs"]))
+        omitted.add(copy["ref"])
+        skipped += booking["_remittance"] != copy["_remittance"]
+    return [row for row in rows if row["ref"] not in omitted], skipped
 
 
 def transaction_rows(account_key, transactions):
@@ -238,6 +298,10 @@ def transaction_rows(account_key, transactions):
         party_key = "debtor" if direction == "CRDT" else "creditor"
         party = tx.get(party_key)
         name = party.get("name") if isinstance(party, dict) else None
+        counterparty_name = " ".join(name.split()).casefold() if isinstance(name, str) else ""
+        party_account = tx.get(party_key + "_account")
+        iban = party_account.get("iban") if isinstance(party_account, dict) else None
+        iban = "".join(iban.split()).upper() if isinstance(iban, str) else ""
         remittance = tx.get("remittance_information")
         details = [s.strip() for s in remittance if isinstance(s, str) and s.strip()] if isinstance(remittance, list) else []
         description = " · ".join(dict.fromkeys([*([name] if isinstance(name, str) and name else []), *details]))
@@ -264,7 +328,7 @@ def transaction_rows(account_key, transactions):
         else:
             # transaction_id is a temporary lookup ID according to the provider.
             fields = (account_key, dates, amount_key, currency, name, details,
-                      tx.get(party_key + "_account"), reference, tx.get("bank_transaction_code"))
+                      party_account, reference, tx.get("bank_transaction_code"))
             key = fingerprint(*fields, balance_key)
             if balance_key:
                 legacy_key = fingerprint(*fields, tx.get("balance_after_transaction"))
@@ -282,6 +346,9 @@ def transaction_rows(account_key, transactions):
         row["provider_ref"] = provider_ref
         row["booked_day"] = dates[0] or None
         row["_value_day"], row["_transaction_day"] = dates[1:]
+        row["_counterparty_names"] = frozenset((counterparty_name,)) if counterparty_name else frozenset()
+        row["_counterparty_ibans"] = frozenset((fingerprint(iban),)) if iban else frozenset()
+        row["_remittance"] = tuple(dict.fromkeys(details))
         row["prior_refs"] = prior_refs
         bookings.setdefault(booking_key, []).append(row)
     rows = []
@@ -294,4 +361,5 @@ def transaction_rows(account_key, transactions):
             merged, warnings = _merge_dated_bookings(booking_key, copies)
             rows.extend(merged)
             skipped += warnings
-    return rows, skipped
+    rows, warnings = _merge_reference_copies(rows)
+    return rows, skipped + warnings

@@ -1115,11 +1115,18 @@ def init_schema(conn: sqlite3.Connection) -> None:
             ref TEXT PRIMARY KEY REFERENCES transactions(ref) ON DELETE CASCADE,
             booking_group TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS bank_import_date_aliases (
+            booking_group TEXT NOT NULL,
+            ref TEXT NOT NULL REFERENCES transactions(ref) ON DELETE CASCADE,
+            PRIMARY KEY (booking_group, ref)
+        ) WITHOUT ROWID;
         CREATE TABLE IF NOT EXISTS bank_import_facts (
             ref TEXT PRIMARY KEY REFERENCES transactions(ref) ON DELETE CASCADE,
             provider_ref TEXT,
             booked_day TEXT,
-            balance_key TEXT
+            balance_key TEXT,
+            creditor_ref TEXT,
+            reference_schema TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_bank_provider_ref ON bank_import_facts(provider_ref);
         CREATE INDEX IF NOT EXISTS idx_bank_import_group ON bank_import_identity(booking_group);
@@ -1190,10 +1197,16 @@ def init_schema(conn: sqlite3.Connection) -> None:
     if dcols and "suggest_tx" not in dcols:
         conn.execute("ALTER TABLE documents ADD COLUMN suggest_tx INTEGER")
     tcols = {r["name"] for r in conn.execute("PRAGMA table_info(transactions)")}
+    reference_columns = ("creditor_ref", "reference_schema")
     bank_cols = {r["name"] for r in conn.execute("PRAGMA table_info(bank_import_facts)")}
-    if "creditor_ref" not in bank_cols:
-        conn.execute("ALTER TABLE bank_import_facts ADD COLUMN creditor_ref TEXT")
-        conn.execute("ALTER TABLE bank_import_facts ADD COLUMN reference_schema TEXT")
+    if not bank_cols.issuperset(reference_columns):
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+        # Another initializer may have added the columns while this connection waited.
+        bank_cols = {r["name"] for r in conn.execute("PRAGMA table_info(bank_import_facts)")}
+        for column in reference_columns:
+            if column not in bank_cols:
+                conn.execute(f"ALTER TABLE bank_import_facts ADD COLUMN {column} TEXT")
     if "amount_home" not in tcols:
         conn.execute("ALTER TABLE transactions ADD COLUMN amount_home REAL")
         conn.execute("ALTER TABLE transactions ADD COLUMN fx_rate REAL")
@@ -1881,6 +1894,8 @@ _BankBooking = namedtuple("_BankBooking", "ref description provider_ref booked_d
 def _remember_bank_booking(conn, ref, row):
     conn.execute("INSERT OR IGNORE INTO bank_import_identity (ref, booking_group) VALUES (?, ?)",
                  (ref, row["bank_group"]))
+    conn.executemany("INSERT OR IGNORE INTO bank_import_date_aliases (booking_group, ref) VALUES (?, ?)",
+                     ((group, ref) for group in row["bank_groups"].values()))
     conn.execute(
         "INSERT INTO bank_import_facts (ref, provider_ref, booked_day, balance_key, creditor_ref, reference_schema) "
         "VALUES (?, ?, ?, ?, ?, ?) "
@@ -1934,7 +1949,11 @@ def _bank_matches(conn, rows):
         return {key: [_BankBooking(*r) for r in conn.execute(select + clause, (key,))]
                 for key in keys}
 
-    by_day = lookup("WHERE i.booking_group = ?", {g for row in bank_rows for g in row["bank_groups"].values()})
+    by_day = lookup(
+        "WHERE i.ref IN (SELECT ref FROM bank_import_identity WHERE booking_group = ?1 "
+        "UNION ALL SELECT ref FROM bank_import_date_aliases WHERE booking_group = ?1)",
+        {g for row in bank_rows for g in row["bank_groups"].values()},
+    )
     by_provider = lookup("WHERE f.provider_ref = ?", {r["provider_ref"] for r in bank_rows if r["provider_ref"]})
     options = {}
     for row in bank_rows:

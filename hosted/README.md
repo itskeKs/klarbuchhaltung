@@ -32,9 +32,11 @@ an additional check. Reload **Banking** for the result. Each check follows all p
 booked transactions. Pending entries stay at the bank until booked. Under **Zahlungen**,
 new entries are open for categorization. Repeated checks preserve assignments. A bank
 reference can be reused on another date. Compatible copies of a booking with the same
-dated reference count once. A copy can add a posting date, balance or structured
-reference when the matching dates and known details agree.
-Different known balances or structured references can distinguish separate payments.
+dated reference count once. A copy can add a posting date, balance or reference
+when the matching dates and known details agree. The ledger remembers alternate
+dates and a newly supplied bank reference when it can identify an existing payment.
+Different known balances, structured references or counterparties can distinguish
+separate payments.
 **Banking** flags conflicting memos and entries with multiple possible matches. Compare
 them with the statement. The next fetch retries them as the bank supplies more detail.
 Reauthorizing the same account preserves its payment history, including when the bank
