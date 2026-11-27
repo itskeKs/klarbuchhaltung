@@ -2234,20 +2234,65 @@ def _bank_statement_option(row):
             (row["ref"], None, *(row[field] for field in _BANK_IDENTITY_FIELDS), row["counterparty_ids"]))
 
 
-def _bank_statement_option_matches(row, option):
+def _bank_statement_option_match(row, option):
+    """Distinguish an observed alternative from a likely correction needing review."""
     if row["ref"] == option.ref:
-        return True
-    if _stored_secondary_match(row, option) is not True or _bank_facts_conflict(row, option):
-        return False
-    return row["provider_ref"] == option.provider_ref or (
-        row["balance_key"] and row["balance_key"] == option.balance_key and row["creditor_ref"] == option.creditor_ref
+        return 1
+    if _stored_secondary_match(row, option) is not True:
+        return 0
+    corroborated = (
+        row["balance_key"] and row["balance_key"] == option.balance_key
+        and row["creditor_ref"] and row["creditor_ref"] == option.creditor_ref
         and _bank_account_match(row["counterparty_ids"], option.counterparty_ids) is True
     )
+    if not _bank_facts_conflict(row, option):
+        return int(row["provider_ref"] == option.provider_ref or corroborated)
+    same_movement = row | {"provider_ref": option.provider_ref, "booked_day": option.booked_day}
+    return 2 if corroborated and not _bank_facts_conflict(same_movement, option) else 0
+
+
+def _bank_statement_compatible_proof(first, second):
+    if not first or not second or first[0] != second[0]:
+        return False
+    for (balance, invoice, payer), (other_balance, other_invoice, other_payer) in zip(first[2], second[2]):
+        if ((balance and other_balance and balance != other_balance)
+                or (invoice and other_invoice and invoice != other_invoice)
+                or _bank_account_match(payer, other_payer) is False):
+            return False
+    return True
+
+
+def _bank_statement_same_proof(first, second):
+    if not _bank_statement_compatible_proof(first, second):
+        return False
+    days, other = first[1], second[1]
+    shared = days.keys() & other.keys()
+    return bool(shared) and all(days[key] == other[key] for key in shared)
+
+
+def _bank_statement_matches_legacy_review(key, row, stored):
+    """Verify the old day-based key and its scoped bank evidence before upgrading it."""
+    scope = row.get("_statement_review_legacy_scope")
+    if not scope or stored["proof"]:
+        return False
+    account, references = scope
+    for groups, facts in stored["observations"]:
+        old = _BankBooking(*facts)
+        values = (account, "statement-review", old.booked_day, row["amount"], row["currency"], references)
+        identity = sha256(json.dumps(values, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        if key != ENABLE_BANKING_REF_PREFIX + identity:
+            continue
+        for current_groups, current_facts in row["_statement_review_options"]:
+            current = _BankBooking(*current_facts)
+            if not set(groups).isdisjoint(current_groups) and _bank_statement_option_match(current._asdict(), old):
+                return True
+    return False
 
 
 def _record_bank_statement_review(conn, row, ref):
     conn.execute("INSERT INTO bank_statement_reviews (review_key, ref, alternatives) VALUES (?, ?, ?)",
-                 (row["ref"], ref, json.dumps(row["_statement_review_options"])))
+                 (row["ref"], ref, json.dumps({"observations": row["_statement_review_options"],
+                                               "proof": row.get("_statement_review_proof")})))
 
 
 def _prepare_bank_statement_reviews(conn, rows):
@@ -2261,9 +2306,14 @@ def _prepare_bank_statement_reviews(conn, rows):
     warnings = duplicates = 0
     recorded = {}
     disputed = defaultdict(list)
-    for key, ref, options in conn.execute("SELECT review_key, ref, alternatives FROM bank_statement_reviews"):
-        recorded[key] = ref
-        for groups, facts in json.loads(options):
+    for key, ref, options, day, description in conn.execute(
+        "SELECT review_key, ref, alternatives, date, description FROM bank_statement_reviews JOIN transactions USING (ref)",
+    ):
+        stored = json.loads(options)
+        if isinstance(stored, list):
+            stored = {"observations": stored, "proof": None}
+        recorded[key] = ref, stored, day, description
+        for groups, facts in stored["observations"]:
             option = _BankBooking(*facts)
             for group in groups:
                 disputed[group].append(option)
@@ -2274,11 +2324,32 @@ def _prepare_bank_statement_reviews(conn, rows):
             for group in groups:
                 disputed[group].append(option)
             alternatives.append(option.ref)
-        prior = recorded.get(row["ref"])
+        proof = row.get("_statement_review_proof")
+        prior = [key for key, (_, stored, _, _) in recorded.items() if (
+            key == row["ref"] or _bank_statement_matches_legacy_review(key, row, stored)
+            or _bank_statement_same_proof(proof, stored["proof"])
+        )]
         if prior:
-            description = conn.execute("SELECT description FROM transactions WHERE ref = ?", (prior,)).fetchone()[0]
+            if len(prior) > 1:
+                warnings += 1
+                continue
+            key = prior[0]
+            _, stored, _, description = recorded[key]
             warnings += int(description != row["description"])
+            saved = {json.dumps(option) for option in stored["observations"]}
+            updated = saved | {json.dumps(option) for option in row["_statement_review_options"]}
+            if updated != saved or not stored["proof"]:
+                stored["observations"] = [json.loads(option) for option in sorted(updated)]
+                if not stored["proof"]:
+                    stored["proof"] = proof
+                conn.execute("UPDATE bank_statement_reviews SET alternatives = ? WHERE review_key = ?", (json.dumps(stored), key))
             duplicates += 1
+            continue
+        if any(day == row["date"] and _bank_statement_compatible_proof(proof, stored["proof"])
+               for _, stored, day, _ in recorded.values()):
+            # Different secondary dates on the same booking date do not
+            # establish a second statement surplus by themselves.
+            warnings += 1
             continue
         candidates = [existing for alternative in alternatives if (existing := conn.execute(
             "SELECT ref, category, invoice_id, expense_id, receipt_path, note FROM transactions "
@@ -2301,11 +2372,17 @@ def _prepare_bank_statement_reviews(conn, rows):
             warnings += 1
         _record_bank_statement_review(conn, row, ref)
         duplicates += 1
-    named = [row for row in rows if "_statement_review_options" not in row and (
-        not any(_bank_statement_option_matches(row, option) for group in row.get("bank_groups", {}).values()
-                for option in disputed.get(group, ()))
-    )]
-    duplicates += len(rows) - len(incoming) - len(named)
+    named = []
+    for row in rows:
+        if "_statement_review_options" in row:
+            continue
+        matches = {_bank_statement_option_match(row, option) for group in row.get("bank_groups", {}).values()
+                   for option in disputed.get(group, ())}
+        if {1, 2} & matches:
+            duplicates += 1
+            warnings += int(1 not in matches)
+        else:
+            named.append(row)
     return named, pending, warnings, duplicates
 
 

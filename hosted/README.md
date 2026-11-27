@@ -58,6 +58,10 @@ If the statement proves an additional payment on a known booking date and
 leaves its bank reference unresolved, **Zahlungen** shows it once as an open
 payment. Check the statement before assigning it. The import leaves the
 reference, counterparty and category of that payment open.
+Compatible versions, including copies with missing dates or a changed lookup
+ID, contribute to the balance check without deciding the reference. A proven
+correction keeps the existing payment and its posting date. If the balances
+support different totals, check the statement before adding another payment.
 If a later statement contradicts a payment already in the ledger, **Banking**
 flags it and keeps the posted payment and category.
 The ledger remembers account identifiers as fingerprints and learns missing evidence
