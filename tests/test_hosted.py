@@ -1031,6 +1031,129 @@ def test_joint_statement_books_the_common_extra_and_keeps_the_remainder_in_revie
             assert [(row["state"], row["amount"]) for row in core.pending_bank_statement_amounts(ledger)] == [("pending", 119)]
 
 
+def _joint_receipt_count_fixture(*, cross_month=False, close_same_day=False, closing=334):
+    day = "2026-11-30" if cross_month else "2026-11-20"
+    other_day = "2026-12-01" if cross_month else day
+    opening = _bank_motion("2026-11-19", 10, 0, "Opening", entry_reference="opening")
+    rent = _bank_motion(day, 119, 119, "Rent", entry_reference="rent", reference_number="rent-invoice")
+    supplies = _bank_motion(other_day, 119, None, "Supplies", entry_reference="supplies", reference_number="supplies-invoice")
+    fee_day = "2026-12-02" if cross_month else day if close_same_day else "2026-11-21"
+    fee = _bank_motion(fee_day, -23, closing, "Fee", entry_reference="fee")
+    echoes = [row | {"entry_reference": None, "transaction_id": f"renewed-{index}", "balance_after_transaction": None}
+              for index, row in enumerate((rent, supplies))]
+    return [opening, rent, supplies, fee], echoes
+
+
+@pytest.mark.parametrize("assigned", [False, True])
+def test_joint_statement_reserves_each_proven_payment(sandbox, assigned):
+    import core
+
+    reports, echoes = _joint_receipt_count_fixture(closing=453)
+    copies = [*echoes, *(row | {"transaction_id": f"later-{index}"} for index, row in enumerate(echoes))]
+    with closing(core.db()) as ledger:
+        assert _sync_bank_pages(ledger, [reports, copies]) == 6
+        ids = tuple(row[0] for row in ledger.execute("SELECT id FROM transactions WHERE description='Kontoauszug prüfen' ORDER BY id"))
+        assert len(ids) == 2
+        for reply in ([copies, reports], [reports], [reports, copies]):
+            assert _sync_bank_pages(ledger, reply) == 0
+            assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (6, 463)
+            assert tuple(row[0] for row in ledger.execute(
+                "SELECT id FROM transactions WHERE description='Kontoauszug prüfen' ORDER BY id",
+            )) == ids
+        rent = reports[1] | {"entry_reference": "rent-repeat", "balance_after_transaction": {"amount": "357", "currency": "EUR"}}
+        supplies = reports[2] | {"entry_reference": "supplies-repeat", "balance_after_transaction": {"amount": "476", "currency": "EUR"}}
+        if assigned:
+            core.set_tx_category(ledger, ids[0], "einnahme_sonstige", "Do not guess the source")
+        assert _sync_bank_pages(ledger, [[*reports[:3], rent, reports[-1]], [echoes[1]]]) == 0
+        assert sorted(row[0] for row in ledger.execute("SELECT description FROM transactions WHERE id IN (?, ?)", ids)) == (
+            ["Kontoauszug prüfen", "Kontoauszug prüfen"] if assigned else ["Kontoauszug prüfen", "Rent"]
+        )
+        assert _sync_bank_pages(ledger, [[*reports[:3], rent, supplies, reports[-1]]]) == 0
+        assert _sync_bank_pages(ledger, [[supplies], [rent]]) == 0
+        assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (6, 463)
+        if assigned:
+            assert tuple(ledger.execute("SELECT description,category,note FROM transactions WHERE id=?", (ids[0],)).fetchone()) == (
+                "Kontoauszug prüfen", "einnahme_sonstige", "Do not guess the source",
+            )
+        else:
+            assert {row[0] for row in ledger.execute(
+                "SELECT description FROM transactions WHERE id IN (?, ?)", ids,
+            )} == {"Rent", "Supplies"}
+
+
+@pytest.mark.parametrize("assigned", [False, True])
+def test_joint_statement_preserves_a_reserve_and_imports_a_newly_proven_payment(sandbox, assigned):
+    import core
+
+    reports, echoes = _joint_receipt_count_fixture(close_same_day=True)
+    rent = reports[1] | {"entry_reference": "rent-repeat", "balance_after_transaction": {"amount": "357", "currency": "EUR"}}
+    supplies = reports[2] | {"entry_reference": "supplies-repeat", "balance_after_transaction": {"amount": "453", "currency": "EUR"}}
+    settled = [*reports[:3], rent, reports[-1], supplies]
+    with closing(core.db()) as ledger:
+        assert _sync_bank_pages(ledger, [reports, echoes]) == 5
+        slot = ledger.execute("SELECT id,ref FROM transactions WHERE description='Kontoauszug prüfen'").fetchone()
+        assert slot is not None
+        assert [(row["state"], row["amount"]) for row in core.pending_bank_statement_amounts(ledger)] == [("pending", 119)]
+        if assigned:
+            core.set_tx_category(ledger, slot["id"], "einnahme_sonstige", "Keep this assignment")
+        assert _sync_bank_pages(ledger, [settled]) == 1
+        for reply in ([settled], [echoes, reports], [reports]):
+            assert _sync_bank_pages(ledger, reply) == 0
+            assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (6, 463)
+            assert core.pending_bank_statement_amounts(ledger) == []
+        saved = ledger.execute("SELECT ref,description,category,note FROM transactions WHERE id=?", (slot["id"],)).fetchone()
+        assert saved["ref"] == slot["ref"]
+        if assigned:
+            assert tuple(saved)[1:] == ("Kontoauszug prüfen", "einnahme_sonstige", "Keep this assignment")
+        else:
+            assert sorted(row[0] for row in ledger.execute("SELECT description FROM transactions WHERE amount=119")) == [
+                "Rent", "Rent", "Supplies", "Supplies",
+            ]
+
+
+@pytest.mark.parametrize("reported_balance", [False, True])
+def test_joint_statement_counts_existing_named_payment_before_reserving_another(sandbox, reported_balance):
+    import core
+
+    reports, echoes = _joint_receipt_count_fixture()
+    extra = reports[1] | {"entry_reference": "rent-repeat", "balance_after_transaction": {"amount": "357", "currency": "EUR"}}
+    if not reported_balance:
+        extra["balance_after_transaction"] = None
+    named = [*reports[:3], extra, reports[-1]]
+    with closing(core.db()) as ledger:
+        assert _sync_bank_pages(ledger, [named]) == 5
+        existing = ledger.execute("SELECT id FROM transactions WHERE description='Rent' ORDER BY id DESC").fetchone()[0]
+        core.set_tx_category(ledger, existing, "einnahme_sonstige", "Named first")
+        for reply in ([reports, echoes], [echoes, reports], [named]):
+            assert _sync_bank_pages(ledger, reply) == 0
+            assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (5, 344)
+        assert not ledger.execute("SELECT 1 FROM transactions WHERE description='Kontoauszug prüfen'").fetchone()
+        assert tuple(ledger.execute("SELECT category,note FROM transactions WHERE id=?", (existing,)).fetchone()) == (
+            "einnahme_sonstige", "Named first",
+        )
+
+
+@pytest.mark.parametrize("cross_month", [False, True])
+@pytest.mark.parametrize("missing_first", [False, True])
+def test_joint_statement_identity_uses_the_known_checkpoint_booking_day(sandbox, cross_month, missing_first):
+    import core
+
+    reports, echoes = _joint_receipt_count_fixture(cross_month=cross_month)
+    first, second = reports[0], reports[0] | {"value_date": "2026-11-18", "transaction_date": "2026-11-17"}
+    if missing_first:
+        first = first | {"value_date": None, "transaction_date": None}
+    before, after = [first, *reports[1:]], [second, *reports[1:]]
+    with closing(core.db()) as ledger:
+        assert _sync_bank_pages(ledger, [before, echoes]) == (4 if cross_month else 5)
+        for reply in ([after, echoes], [echoes, before], [after]):
+            assert _sync_bank_pages(ledger, reply) == 0
+            expected = (4, 225) if cross_month else (5, 344)
+            assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == expected
+            assert [(row["state"], row["amount"], row["covered"]) for row in core.pending_bank_statement_amounts(ledger)] == (
+                [("unplaced", 119, 1)] if cross_month else []
+            )
+
+
 @pytest.mark.parametrize("sign", [-1, 1])
 @pytest.mark.parametrize("seed", [False, True])
 @pytest.mark.parametrize("shape, has_balance", [

@@ -3000,12 +3000,12 @@ def _joint_balance_window(families, witnesses, currency):
     minimum = tuple(map(min, supported))
     if selection := histories.get(minimum):
         return list(zip(families, supported, selection)), ()
-    # Different named allocations can still establish one distinct
-    # movement. Use its signed amount, leaving its source unspecified.
+    # Different named allocations can establish the same signed count
+    # even when no single allocation contains all per-source minima.
     surplus_counts = {sum(counts) - sum(baseline) for counts in histories}
-    if (min(surplus_counts) == 1 and all(rows is not None for rows in histories.values())
+    if (min(surplus_counts) > 0 and all(rows is not None for rows in histories.values())
             and len({row["_amount_key"] for row in alternatives.values()}) == 1):
-        return [], (list(alternatives.values()), max(surplus_counts) > 1)
+        return [], (list(alternatives.values()), min(surplus_counts), max(surplus_counts))
     return [], ()
 
 
@@ -3062,14 +3062,14 @@ def _joint_balance_proofs(families, account_by_currency):
                 surplus = None
                 if decisions and decisions[1]:
                     members = [*witnesses, *(row for subject in connected for row in subject.representatives())]
-                    alternatives, remainder = decisions[1]
-                    surplus = alternatives, members, remainder
+                    alternatives, minimum, maximum = decisions[1]
+                    surplus = alternatives, members, minimum, maximum
                 for subject in connected:
                     yield subject, None, subject.representatives(), (), surplus
                     surplus = None
 
 
-def _joint_statement_review(account_key, alternatives, members, remainder, trace):
+def _joint_statement_reviews(account_key, alternatives, members, minimum, maximum, trace):
     first = alternatives[0]
     amount, currency = first["_amount_key"], first["currency"]
     checkpoints = sorted({(row["booked_day"] or "", *(row[field] or "" for field in _SECONDARY_BANK_DATES),
@@ -3079,30 +3079,26 @@ def _joint_statement_review(account_key, alternatives, members, remainder, trace
     known = None not in dates and len(dates) == 1
     enclosing = sorted({row["booked_day"] for row in members if _reported_balance(row) and row["booked_day"]})
     if not enclosing or (None in dates and len(enclosing) < 2):
-        return None
+        return
     bounds = (min(dates), max(dates)) if None not in dates else (enclosing[0], enclosing[-1])
-    day = bounds[0]
-    group = fingerprint(account_key, day, amount, currency)
-    scope = fingerprint(account_key, "joint-statement-review", amount, currency, checkpoints, bounds)
-    proof = (scope, {"booked_day": group} if known else {}, (), (day, checkpoints))
+    members = [core._bank_statement_option(row) for row in members]
+    scope = core._joint_statement_scope(account_key, amount, currency, checkpoints, bounds, members)
     joint = {
+        "scope": scope,
         "account_key": account_key,
         "bounds": (enclosing[0], enclosing[-1]),
-        "members": [core._bank_statement_option(row) for row in members],
+        "dates": bounds, "members": members, "minimum": minimum, "maximum": maximum,
     }
-    review = dict.fromkeys(core._BANK_IDENTITY_FIELDS) | {
-        "ref": core.ENABLE_BANKING_REF_PREFIX + scope, "date": day, "booked_day": day if known else None,
-        "amount": amount, "currency": currency, "account_key": account_key, "description": "Kontoauszug prüfen",
-        "tx_type": "Enable Banking", "counterparty_ids": (), "bank_group": group, "bank_groups": {day: group},
-        "prior_refs": [], "_statement_review_options": [core._bank_statement_option(row) for row in alternatives],
-        "_statement_review_members": joint["members"], "_statement_review_proof": proof, "_statement_joint": joint,
-        "_statement_remainder": remainder,
+    details = {
+        "joint": joint, "proof": (scope, {}, (), (bounds[0], checkpoints)),
+        "observations": [core._bank_statement_option(row) for row in alternatives],
     }
-    if trace:
-        review["_statement_subject_reports"] = (frozenset(row["_report_index"] for row in alternatives),)
-    if known:
-        return "confirmed", review
-    return "unplaced", review | {"_statement_fiscal_bounds": bounds}
+    for slot in range(minimum):
+        review = core._joint_statement_template(scope, slot, details, bounds, currency, amount, known=known)
+        review["_statement_remainder"] = maximum - minimum if slot == 0 else 0
+        if trace:
+            review["_statement_subject_reports"] = (frozenset(row["_report_index"] for row in alternatives),)
+        yield review
 
 
 def _reconcile_balance_reports(account_key, drafts, account_rows, assessments, neutral, trace, overlap_witnesses=()):
@@ -3145,12 +3141,12 @@ def _reconcile_balance_reports(account_key, drafts, account_rows, assessments, n
     )]
     joint = set()
     for family, supported, selection, peers, surplus in _joint_balance_proofs(joint_families, account_by_currency):
-        if surplus and (decision := _joint_statement_review(account_key, *surplus, trace)):
-            state, review = decision
-            if state == "confirmed":
-                neutral.append(review)
-            if state == "unplaced" or review["_statement_remainder"]:
-                assessments.append(review | {"state": state})
+        if surplus:
+            for review in _joint_statement_reviews(account_key, *surplus, trace):
+                if review["state"] == "confirmed":
+                    neutral.append(review)
+                if review["state"] == "unplaced" or review["_statement_remainder"]:
+                    assessments.append(review)
         versions = family.reports
         origins = {row["_report_index"] for row in versions}
         joint.update(origins)

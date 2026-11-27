@@ -2477,7 +2477,7 @@ def pending_bank_statement_amounts(conn, start="0000-01-01", end="9999-12-31"):
                         "json_extract(details, '$.remainder') AS remainder FROM bank_statement_assessments), "
                         "reviews AS (SELECT account_key, date, amount, currency, review_key, state, earliest, latest "
                         "FROM assessed WHERE state IN ('pending', 'protected', 'unplaced') UNION ALL "
-                        "SELECT account_key, CASE WHEN state = 'confirmed' THEN date END, amount, currency, review_key, "
+                        "SELECT account_key, CASE WHEN state = 'confirmed' THEN date END, amount * remainder, currency, review_key, "
                         "'pending', earliest, latest FROM assessed WHERE state IN ('confirmed', 'unplaced') AND remainder) "
                         "SELECT account_key, date, amount, currency, state, "
                         "state = 'unplaced' AND earliest >= ?1 AND latest <= ?2 AS covered "
@@ -2931,6 +2931,15 @@ def _bank_balance_trail(dates, amounts, balances, before, sparse_occurrences=())
     return False
 
 
+def _joint_statement_scope(account, amount, currency, checkpoints, dates, members):
+    edges = sorted({(day, "" if day else value, "" if day else acquired, signed, balance)
+                    for day, value, acquired, signed, balance in checkpoints})
+    sources = sorted({(booking.booked_day, booking.provider_ref) for _, facts in members
+                      if (booking := _BankBooking(*facts)).booked_day and booking.provider_ref})
+    scope = (account, currency, str(Decimal(str(amount)).normalize()), dates, edges, sources)
+    return sha256(json.dumps(scope, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+
+
 def _joint_statement_source(row, groups, booking):
     if set(groups).isdisjoint(row.get("bank_groups", {}).values()) or _bank_facts_conflict(row, booking):
         return False
@@ -2941,88 +2950,273 @@ def _joint_statement_source(row, groups, booking):
     return _bank_economic_replay(row, booking._asdict())
 
 
-def _joint_statement_allocation(rows, joint, options, dates, currency, amount):
-    """Find a uniquely named extra on a complete replay of a proven statement."""
+def _joint_statement_slot_ref(scope, slot):
+    raw = json.dumps((scope, slot), ensure_ascii=False, separators=(",", ":"))
+    return ENABLE_BANKING_REF_PREFIX + sha256(raw.encode()).hexdigest()
+
+
+def _joint_statement_dates(joint, options):
+    if "dates" in joint:
+        return joint["dates"]
+    days = {_BankBooking(*facts).booked_day for _, facts in options}
+    return (min(days), max(days)) if days and None not in days else joint["bounds"]
+
+
+def _joint_statement_membership(rows, groups, facts):
+    booking = _BankBooking(*facts)
+    compatible = {i for i, row in rows.items() if _joint_statement_source(row, groups, booking)}
+    direct = {i for i in compatible if (booking.ref and rows[i]["ref"] == booking.ref)
+              or (booking.provider_ref and rows[i]["provider_ref"] == booking.provider_ref)}
+    return direct or compatible
+
+
+def _joint_statement_existing(conn, joint, options):
+    """Find previously booked named movements in this statement's scope."""
+    groups = {group for groups, _ in (*joint["members"], *options) for group in groups}
+    candidates = {group: _bank_statement_group_bookings(conn, (group,)) for group in groups}
+
+    def in_groups(groups):
+        return {booking for group in groups for booking in candidates[group]}
+
+    members = []
+    for groups, facts in joint["members"]:
+        bank_groups = {group: group for group in groups}
+        rows = {booking.ref: booking._asdict() | {"bank_groups": bank_groups} for booking in in_groups(groups)}
+        matches = _joint_statement_membership(rows, groups, facts)
+        if len(matches) != 1:
+            return {}
+        members.extend(matches)
+    if len(set(members)) != len(joint["members"]):
+        return {}
+    dates = _joint_statement_dates(joint, options)
+    return {booking.ref: booking for groups, facts in options for booking in in_groups(groups)
+            if booking.ref not in members and booking.provider_ref and booking.booked_day
+            and dates[0] <= booking.booked_day <= dates[1]
+            and _bank_statement_option_match(booking._asdict(), _BankBooking(*facts))}
+
+
+def _joint_statement_allocation(rows, joint, options, currency, amount):
+    """Classify named sources using the same complete balance trail."""
     first, last = joint["bounds"]
-    eligible = {index: row for index, row in enumerate(rows) if row.get("_bank_account_key") == joint["account_key"]
-                and row["currency"] == currency and first <= row["date"] <= last and "_statement_review_options" not in row}
-    members = [{i for i, row in eligible.items() if _joint_statement_source(row, groups, _BankBooking(*facts))}
-               for groups, facts in joint["members"]]
+    dates = _joint_statement_dates(joint, options)
+    amount = Decimal(str(amount))
+    eligible = {index: row for index, row in enumerate(rows)
+                if row.get("_bank_account_key") == joint["account_key"] and row["currency"] == currency
+                and first <= row["date"] <= last}
+    members = [_joint_statement_membership(eligible, groups, facts) for groups, facts in joint["members"]]
     known = set().union(*members)
-    alternatives = {i for i, row in eligible.items() if i not in known and Decimal(str(row["amount"])) == Decimal(str(amount))
+    alternatives = {i for i, row in eligible.items() if i not in known and Decimal(str(row["amount"])) == amount
                     and any(not set(groups).isdisjoint(row["bank_groups"].values())
                             and _bank_statement_option_match(row, _BankBooking(*facts)) for groups, facts in options)}
-    if resolved := joint.get("resolved"):
-        groups, facts = resolved
-        copies = {i for i in alternatives if not eligible[i]["provider_ref"]
-                  or _joint_statement_source(eligible[i], groups, _BankBooking(*facts))}
-        return None, copies
-    if all(len(indices) == 1 for indices in members) and len(known) == len(members) and len(eligible.keys() - known) == 1:
-        candidate = next(iter(eligible.keys() - known))
-        report = eligible[candidate]
-        if (candidate in alternatives and report["provider_ref"] and report["balance_key"]
-                and report["booked_day"] and dates[0] <= report["booked_day"] <= dates[1]):
-            days = [row["booked_day"] for row in eligible.values()]
-            amounts = [Decimal(str(row["amount"])) for row in eligible.values()]
-            balances = [observed[1] if (observed := row.get("_bank_observed_balance")) else None for row in eligible.values()]
-            if (len(days) <= _BANK_BALANCE_TRAIL_LIMIT and all(days)
-                    and _bank_balance_trail(days, amounts, balances, _bank_date_predecessors(days)) is True):
-                return candidate, {candidate}
-    return None, alternatives
+    verified = set()
+    if (eligible and len(eligible) <= _BANK_BALANCE_TRAIL_LIMIT
+            and all(len(indices) == 1 for indices in members) and len(known) == len(members)):
+        days = [row["booked_day"] for row in eligible.values()]
+        movements = [Decimal(str(row["amount"])) for row in eligible.values()]
+        balances = [observed[1] if (observed := row.get("_bank_observed_balance")) else None for row in eligible.values()]
+        if (all(days) and all(eligible[i]["provider_ref"] or eligible[i].get("_statement_edge_occurrence")
+                              for i in eligible.keys() - known)
+                and _bank_balance_trail(days, movements, balances, _bank_date_predecessors(days)) is True):
+            verified = {i for i in alternatives if (eligible[i]["provider_ref"] or eligible[i].get("_statement_edge_occurrence"))
+                        and dates[0] <= eligible[i]["booked_day"] <= dates[1]}
+    return verified, alternatives
+
+
+def _joint_statement_slot_matches(conn, rows, candidates, slots):
+    """Fill distinguishable slots, preserving any ambiguous user assignment."""
+    choices = {}
+    for source in candidates:
+        report = rows[source]
+        choices[source] = {index for index, (_, ref, day, saved) in enumerate(slots)
+                           if (report["booked_day"] == day if ref else (
+                               saved["fiscal_bounds"][0] <= report["booked_day"] <= saved["fiscal_bounds"][1]))
+                           and any(_bank_statement_option_match(report, _BankBooking(*facts))
+                                   for _, facts in saved["observations"])}
+    degree = Counter(index for options in choices.values() for index in options)
+    assigned = {index: source for source, options in choices.items() if len(options) == 1
+                for index in options if degree[index] == 1}
+    protected = {index for index, (_, ref, _, _) in enumerate(slots)
+                 if ref and not _unassigned_statement_payment(conn, ref) and index not in assigned}
+    remaining = candidates - set(assigned.values())
+    ambiguous = set()
+    while shared := {source for source in remaining - ambiguous if not choices[source].isdisjoint(protected)}:
+        ambiguous.update(shared)
+        protected.update(index for source in shared for index in choices[source])
+
+    def place(source, seen):
+        for index in sorted(choices[source] - protected - seen):
+            seen.add(index)
+            if index not in assigned or place(assigned[index], seen):
+                assigned[index] = source
+                return True
+        return False
+
+    for source in sorted(remaining - ambiguous, key=lambda i: (rows[i]["booked_day"], rows[i]["ref"])):
+        place(source, set())
+    return [(source, slots[index]) for index, source in assigned.items()], ambiguous
+
+
+def _joint_statement_template(scope, slot, details, dates, currency, amount, *, known=None):
+    """Make one review slot for an established movement without a source."""
+    ref = _joint_statement_slot_ref(scope, slot)
+    day, last = dates
+    known = day == last if known is None else known
+    account = details["joint"]["account_key"]
+    group = sha256(json.dumps((account, day, str(Decimal(str(amount)).normalize()), currency),
+                              ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+    proof = (ref.removeprefix(ENABLE_BANKING_REF_PREFIX), {"booked_day": group} if known else {},
+             (), details["proof"][3])
+    return dict.fromkeys(_BANK_IDENTITY_FIELDS) | {
+        "ref": ref, "date": day, "booked_day": day if known else None,
+        "amount": amount, "currency": currency, "account_key": account, "description": "Kontoauszug prüfen",
+        "tx_type": "Enable Banking", "counterparty_ids": (), "bank_group": group, "bank_groups": {day: group},
+        "prior_refs": [], "state": "confirmed" if known else "unplaced",
+        "_statement_review_options": details["observations"], "_statement_review_proof": proof,
+        "_statement_review_members": details["joint"]["members"],
+        "_statement_joint": details["joint"] | {"scope": scope, "slot": slot},
+        "_statement_fiscal_bounds": None if known else dates,
+    }
 
 
 def _restore_joint_bank_reviews(conn, rows, assessments):
-    """Keep the proven movement reserved until its own bank evidence identifies it."""
-    if not any(row.get("_bank_account_key") for row in rows):
+    """Reconcile named movements and review slots against one scoped count."""
+    if not any(row.get("_bank_account_key") or row.get("_statement_joint") for row in (*rows, *assessments)):
         return rows, assessments, 0, 0
     if not conn.in_transaction:
         conn.execute("BEGIN IMMEDIATE")
-    booked = conn.execute(
+    grouped = defaultdict(lambda: {"slots": [], "assessments": {}, "incoming": {}})
+    for key, ref, day, currency, amount, encoded in conn.execute(
         "SELECT review_key,ref,date,currency,amount,alternatives FROM bank_statement_reviews JOIN transactions USING(ref) "
-        "WHERE json_type(alternatives, '$.joint') = 'object'",
-    ).fetchall()
-    unplaced = conn.execute(
-        "SELECT review_key,date,currency,amount,details FROM bank_statement_assessments "
-        "WHERE state='unplaced' AND json_type(details, '$.joint') = 'object'",
-    ).fetchall()
+        "WHERE json_type(alternatives, '$.joint') = 'object' ORDER BY transactions.id",
+    ):
+        details = json.loads(encoded)
+        joint = details["joint"]
+        scope = joint.get("scope") or _joint_statement_scope(
+            joint["account_key"], amount, currency, details["proof"][3][1],
+            _joint_statement_dates(joint, details["observations"]), joint["members"],
+        )
+        grouped[scope]["slots"].append((key, ref, day, currency, amount, details))
+    for key, day, currency, amount, state, encoded in conn.execute(
+        "SELECT review_key,date,currency,amount,state,details FROM bank_statement_assessments "
+        "WHERE state IN ('unplaced', 'confirmed') AND json_type(details, '$.joint') = 'object'",
+    ):
+        details = json.loads(encoded)
+        joint = details["joint"]
+        scope = joint.get("scope") or _joint_statement_scope(
+            joint["account_key"], amount, currency, details["proof"][3][1],
+            _joint_statement_dates(joint, details["observations"]), joint["members"],
+        )
+        grouped[scope]["assessments"][key] = details
+        if state == "unplaced":
+            grouped[scope]["slots"].append((key, None, day, currency, amount, details))
+    for row in (*rows, *assessments):
+        if joint := row.get("_statement_joint"):
+            grouped[joint["scope"]]["incoming"][row["ref"]] = row
+    if not grouped:
+        return rows, assessments, 0, 0
+
+    named = [row for row in rows if not row.get("_statement_joint")]
+    decisions = [row for row in assessments if not row.get("_statement_joint")]
     discarded, additions = set(), []
-    decisions = list(assessments)
     warnings = 0
-    for key, ref, day, currency, amount, encoded in booked:
-        saved = json.loads(encoded)
-        joint = saved["joint"]
-        candidate, copies = _joint_statement_allocation(rows, joint, saved["observations"], (day, day), currency, amount)
-        discarded.update(copies)
-        if candidate is None:
-            warnings += int(bool(copies and not joint.get("resolved")))
-            continue
-        row = rows[candidate]
-        if _unassigned_statement_payment(conn, ref):
-            conn.execute("UPDATE transactions SET description=? WHERE ref=?", (row["description"], ref))
+    for scope, group in grouped.items():
+        slots, stored, incoming = group["slots"], group["assessments"], group["incoming"]
+        if incoming:
+            template = next(iter(incoming.values()))
+            currency, amount = template["currency"], template["amount"]
+            details = {"joint": template["_statement_joint"], "proof": template["_statement_review_proof"],
+                       "observations": template["_statement_review_options"]}
+        elif slots:
+            _, _, _, currency, amount, details = slots[0]
         else:
-            warnings += 1
-        joint["resolved"] = _bank_statement_option(row)
-        saved["purpose"] = row["description"]
-        _remember_bank_booking(conn, ref, row)
-        conn.execute("UPDATE bank_statement_reviews SET alternatives=? WHERE review_key=?", (json.dumps(saved), key))
-    for key, _, currency, amount, encoded in unplaced:
-        saved = json.loads(encoded)
-        joint = saved["joint"]
-        candidate, copies = _joint_statement_allocation(rows, joint, saved["observations"], saved["fiscal_bounds"], currency, amount)
-        discarded.update(copies)
-        if candidate is None:
-            warnings += int(bool(copies))
             continue
-        row = rows[candidate]
-        joint["resolved"] = _bank_statement_option(row)
-        review = row | {
-            "ref": key, "account_key": joint["account_key"], "_statement_joint": joint,
-            "_statement_review_options": saved["observations"], "_statement_review_proof": saved["proof"],
-            "_statement_purpose": row["description"],
-        }
-        additions.append(review)
-        decisions.append(review | {"state": "confirmed"})
-    return [*(row for i, row in enumerate(rows) if i not in discarded), *additions], decisions, warnings, len(discarded) - len(additions)
+        joint, options = details["joint"], details["observations"]
+        dates = _joint_statement_dates(joint, options)
+        clean, alternatives = _joint_statement_allocation(named, joint, options, currency, amount)
+        if not incoming and not alternatives:
+            continue
+        existing = _joint_statement_existing(conn, joint, options)
+        previously_named = {i for i in alternatives if any(
+            _joint_statement_source(named[i], named[i]["bank_groups"].values(), booking) for booking in existing.values()
+        )}
+        free = []
+        known = set(previously_named)
+        for key, ref, day, _, _, saved in slots:
+            if resolved := saved["joint"].get("resolved"):
+                groups, facts = resolved
+                covered = {i for i in alternatives if _joint_statement_source(named[i], groups, _BankBooking(*facts))}
+                known.update(covered)
+                discarded.update(covered)
+            else:
+                free.append((key, ref, day, saved))
+        fresh = {i for i in clean - known if named[i]["provider_ref"]}
+        verified = len(clean)
+        occupied = len(slots) + len(existing)
+        minimum = max(occupied, verified, joint.get("minimum", len(slots)) if incoming else 0)
+        maximum = max(minimum, joint.get("maximum", minimum),
+                      *(entry["joint"].get("maximum", len(slots) + bool(entry.get("remainder"))) for entry in stored.values()))
+        matches, ambiguous = _joint_statement_slot_matches(conn, named, fresh, free)
+        occupied += len(fresh) - len(matches) - len(ambiguous)
+        discarded.update(ambiguous | (clean - fresh - known))
+        warnings += int(bool(ambiguous))
+        for candidate, slot in matches:
+            key, ref, _, saved = slot
+            free.remove(slot)
+            report = named[candidate]
+            saved["joint"]["resolved"] = _bank_statement_option(report)
+            saved["purpose"] = report["description"]
+            discarded.add(candidate)
+            if ref:
+                if _unassigned_statement_payment(conn, ref):
+                    conn.execute("UPDATE transactions SET description=? WHERE ref=?", (report["description"], ref))
+                else:
+                    warnings += 1
+                _remember_bank_booking(conn, ref, report)
+                conn.execute("UPDATE bank_statement_reviews SET alternatives=? WHERE review_key=?", (json.dumps(saved), key))
+            else:
+                review = report | {
+                    "ref": key, "state": "confirmed", "account_key": joint["account_key"], "_statement_joint": saved["joint"],
+                    "_statement_review_options": saved["observations"], "_statement_review_proof": saved["proof"],
+                    "_statement_purpose": report["description"],
+                }
+                additions.append(review)
+                decisions.append(review)
+        unresolved = {i for i in alternatives - clean - known
+                      if free or not named[i]["provider_ref"]}
+        discarded.update(unresolved)
+        warnings += int(bool(unresolved and free))
+
+        free_templates = [row for key, row in incoming.items() if key not in {slot[0] for slot in slots}]
+        needed = max(0, minimum - occupied)
+        used = {slot[0] for slot in slots}
+        for number in range(minimum):
+            if not needed:
+                break
+            key = _joint_statement_slot_ref(scope, number)
+            if key in used:
+                continue
+            review = next((row for row in free_templates if row["ref"] == key), None)
+            review = review or _joint_statement_template(scope, number, details, dates, currency, amount)
+            review = review | {"_statement_remainder": False}
+            if review["state"] == "confirmed":
+                additions.append(review)
+            else:
+                decisions.append(review)
+            needed -= 1
+
+        remaining = maximum - minimum
+        for key, entry in stored.items():
+            if entry.get("remainder") and entry["remainder"] != remaining:
+                conn.execute("UPDATE bank_statement_assessments SET details=json_set(details, '$.remainder', ?) WHERE review_key=?",
+                             (remaining, key))
+        if incoming and remaining and not any(entry.get("remainder") for entry in stored.values()):
+            # The first proven slot carries the outstanding amount. It can
+            # already be covered by a named ledger payment.
+            review = next(iter(incoming.values())) | {"_statement_remainder": remaining}
+            decisions = [row for row in decisions if row["ref"] != review["ref"]]
+            decisions.append(review)
+
+    return [*(row for i, row in enumerate(named) if i not in discarded), *additions], decisions, warnings, len(discarded)
 
 
 def import_bank_rows(conn, rows: list, *, auto_match: bool = True, require_fx: bool = False, assessments=()) -> dict:
