@@ -154,6 +154,8 @@ The verified sequence can include many independent dated movements while
 the importer evaluates only the uncertain payment placements. A report
 that omits a reference or posting date can still preserve an independently
 identified booking when the surrounding balances support that match.
+A changed balance with a missing reference can remain open for review
+until the statement establishes whether it belongs to an existing payment.
 A shorter reply can reuse a verified earlier sequence from the same account. Observations
 without a booking date contribute only when the signed history supports
 their effect in the relevant interval.

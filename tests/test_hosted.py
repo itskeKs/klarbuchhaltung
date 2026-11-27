@@ -2092,6 +2092,119 @@ def test_bank_revision_retains_named_fee_beside_unresolved_equal_occurrences(san
             assert core.pending_bank_statement_amounts(ledger) == []
 
 
+def _bank_late_fee_history(sign):
+    def movement(day, amount, balance, name, reference):
+        return _bank_motion(f"2026-11-{day}", sign * amount, sign * balance, name, entry_reference=reference)
+
+    opening = movement(18, 10, 0, "Opening", "opening")
+    rent = movement(20, 119, 119, "Rent", "rent")
+    prior = [opening, rent, movement(22, -23, 96, "Service", "fees"), movement(22, -23, 73, "ATM", "fees")]
+    latest = [opening, rent, movement(21, 50, 169, "Late", "late"),
+              movement(22, -23, 146, "Service", "fees"), movement(22, -23, 123, "ATM", "fees"),
+              movement(22, -23, 100, "Extra", "fees"), movement(24, 15, 115, "Closing", "closing")]
+    return prior, latest
+
+
+def _verify_late_fee_replay(ledger, prior, sparse, latest, sign):
+    import core
+
+    assert _sync_bank_pages(ledger, [prior]) == 4
+    original = {row["id"]: (row["ref"], row["description"], row["date"]) for row in ledger.execute(
+        "SELECT id,ref,description,date FROM transactions WHERE abs(amount)=23",
+    )}
+    for ident in original:
+        core.set_tx_category(ledger, ident, "gebuehr", f"Assigned {ident}")
+    for phase, (rows, imported) in enumerate(((sparse, 3), (latest, 0), (latest[::-1], 0), (prior, 0), (latest, 0))):
+        rows = [row | {"transaction_id": f"replay-{phase}-{index}"} for index, row in enumerate(rows)]
+        assert _sync_bank_pages(ledger, [rows[:4], rows[4:]] if len(rows) > 4 else [rows]) == imported
+        assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (7, sign * 125)
+        assert [row[0] for row in ledger.execute("SELECT description FROM transactions WHERE abs(amount)=23 ORDER BY description")] == [
+            "ATM", "Extra", "Service",
+        ]
+        assert {row["id"]: (row["ref"], row["description"], row["date"], row["note"]) for row in ledger.execute(
+            "SELECT id,ref,description,date,note FROM transactions WHERE category='gebuehr'",
+        )} == {ident: (*facts, f"Assigned {ident}") for ident, facts in original.items()}
+        assert core.pending_bank_statement_amounts(ledger) == []
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+@pytest.mark.parametrize("optional_dates", [(), ("value_date",), ("transaction_date",), ("value_date", "transaction_date")])
+@pytest.mark.parametrize("balance_reported", [False, True])
+def test_bank_revision_uses_surviving_typed_dates_in_signed_trail(sandbox, sign, optional_dates, balance_reported):
+    import core
+
+    prior, latest = _bank_late_fee_history(sign)
+    omitted = dict.fromkeys(("entry_reference", *optional_dates))
+    if not balance_reported:
+        omitted["balance_after_transaction"] = None
+    sparse = [row | omitted if row["remittance_information"] == ["Service"] else row for row in latest]
+    with closing(core.db()) as ledger:
+        _verify_late_fee_replay(ledger, prior, sparse, latest, sign)
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+@pytest.mark.parametrize("unknown_days", [{"Opening", "Rent", "Late"}, {"Rent", "Late"}, {"Opening", "Rent"}])
+@pytest.mark.parametrize("sparse_names", [{"ATM", "Extra"}, {"Service", "Extra"}])
+def test_bank_revision_checks_old_and_new_undated_movements_together(sandbox, sign, unknown_days, sparse_names):
+    import core
+
+    prior, latest = _bank_late_fee_history(sign)
+
+    def strip_days(rows):
+        return [row | {"booking_date": None} if row["remittance_information"][0] in unknown_days else row for row in rows]
+
+    prior, latest = strip_days(prior), strip_days(latest)
+    sparse = [row | {"balance_after_transaction": None} if row["remittance_information"][0] in sparse_names
+              else row for row in latest]
+    with closing(core.db()) as ledger:
+        _verify_late_fee_replay(ledger, prior, sparse, latest, sign)
+        stored = {row["description"]: row["booked_day"] for row in ledger.execute(
+            "SELECT description,booked_day FROM transactions JOIN bank_import_facts USING (ref)",
+        )}
+        assert all(stored[name] is None for name in unknown_days)
+        assert stored["ATM"] == stored["Service"] == stored["Extra"] == "2026-11-22"
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+@pytest.mark.parametrize("unknown_checkpoint", ["Opening", "Rent"])
+def test_bank_occurrence_window_keeps_dated_witnesses_around_undated_checkpoint(sandbox, sign, unknown_checkpoint):
+    import core
+
+    prior, latest = _bank_late_fee_history(sign)
+    sparse = [row | {"booking_date": None} if row["remittance_information"] == [unknown_checkpoint]
+              else row | {"balance_after_transaction": None} if row["entry_reference"] == "fees"
+              else row for row in latest]
+    with closing(core.db()) as ledger:
+        _verify_late_fee_replay(ledger, prior, sparse, latest, sign)
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_bank_revision_waits_for_witnesses_before_booking_an_unresolved_named_payment(sandbox, sign):
+    import core
+
+    prior, latest = _bank_late_fee_history(sign)
+    partial = [row | dict.fromkeys(("entry_reference", "value_date", "transaction_date"))
+               for row in latest if row["remittance_information"] == ["Service"]]
+    with closing(core.db()) as ledger:
+        assert _sync_bank_pages(ledger, [prior]) == 4
+        service = ledger.execute("SELECT id,ref FROM transactions WHERE description='Service'").fetchone()
+        core.set_tx_category(ledger, service["id"], "gebuehr", "Assigned")
+        for _ in range(2):
+            assessments = []
+            rows, skipped = transaction_rows("account-a", _bank_page_reports([partial]), ledger=ledger, assessments=assessments)
+            outcome = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True, assessments=assessments)
+            assert outcome["imported"] == 0
+            assert skipped + outcome["ambiguous"] >= 1
+            assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (4, sign * 83)
+        assert _sync_bank_pages(ledger, [latest[:4], latest[4:]]) == 3
+        assert _sync_bank_pages(ledger, [latest[::-1]]) == 0
+        assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (7, sign * 125)
+        assert tuple(ledger.execute("SELECT ref,category,note FROM transactions WHERE id=?", (service["id"],)).fetchone()) == (
+            service["ref"], "gebuehr", "Assigned",
+        )
+        assert core.pending_bank_statement_amounts(ledger) == []
+
+
 @pytest.mark.parametrize("shape", ["undated tail", "dense days", "long trail", "unreferenced fee", "undated rent", "undated fee"])
 def test_bank_balance_revision_uses_the_evidenced_interval(sandbox, shape):
     import core

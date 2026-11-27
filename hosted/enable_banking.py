@@ -3200,7 +3200,11 @@ def _unbalanced_page_support(versions, peers, minimum, related):
     if len(days) != 1:
         return set(), ()
     day = next(iter(days))
-    peers = _booked_balance_window(peers, day)
+    window = _booked_balance_window(peers, day)
+    # An undated movement can sit outside the local window. Its signed
+    # trail then also needs the intervening booked movements.
+    if all(row["booked_day"] for row in window):
+        peers = window
     selected = {row["_report_index"] for row in peers}
     coupled = []
     representatives = []

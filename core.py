@@ -1995,16 +1995,17 @@ def _bank_balance_only_difference(row, old):
             and not _bank_facts_conflict(row | {"balance_key": old.balance_key}, old))
 
 
-def _bank_revision_candidate(row, old):
-    """Retain a named candidate for the signed proof when a reference is omitted."""
-    if _bank_balance_only_difference(row, old):
-        return True
-    if (row["provider_ref"] and old.provider_ref) or not _bank_description_matches(row, old):
-        return False
-    dates = ("booked_day", *_BANK_SECONDARY_DATES)
-    return (sum(bool(row[field] and row[field] == getattr(old, field)) for field in dates) >= 2
+def _bank_named_revision_candidate(row, old):
+    """A missing reference can leave a match possible but still unproved."""
+    return (not (row["provider_ref"] and old.provider_ref)
+            and _bank_description_matches(row, old)
+            and _bank_has_shared_date(row, old)
             and _stored_secondary_match(row, old) is not False
             and not _bank_facts_conflict(row | {"balance_key": old.balance_key}, old))
+
+
+def _bank_revision_candidate(row, old):
+    return _bank_balance_only_difference(row, old) or _bank_named_revision_candidate(row, old)
 
 
 def _bank_secondary_match(first, second):
@@ -2286,7 +2287,8 @@ def _bank_matches(conn, rows):
         observed_refs = _bank_observed_secondary_refs(row, by_day)
         overlaps = {old for old in candidates if _bank_balance_overlap(row, old)}
         corrections[row["ref"]] = {old.ref for old in overlaps} | {
-            old.ref for old in candidates if _bank_facts_conflict(row, old) and _bank_economic_replay(row, old._asdict())
+            old.ref for old in candidates if _bank_facts_conflict(row, old)
+            and (_bank_economic_replay(row, old._asdict()) or _bank_named_revision_candidate(row, old))
         }
         if not row.get("_statement_edge_occurrence") and any(
             (old.balance_key == row["balance_key"] and _stored_secondary_match(row, old) is False
@@ -3264,17 +3266,17 @@ def _bank_align_revision_family(reports, stored, matches):
     return assignments
 
 
-def _bank_same_undated_members(reports, prior, matches):
-    """Check that both versions already contain the same independently identified movements."""
-    all_refs = {old.ref for old in prior}
-    associated = set()
+def _bank_undated_revision_links(reports, prior, matches):
+    """Link recognizable shared movements without selecting a posting day."""
+    previous = {old.ref: (old, movement) for old, movement in prior}
+    possible = {}
     for row in reports:
-        possible = {old.ref for old, _, keys in matches[id(row)] if old.ref in all_refs
-                    and (row["balance_key"] in keys or not row["balance_key"] and not keys)}
-        if len(possible) != 1 or not associated.isdisjoint(possible):
-            return False
-        associated.update(possible)
-    return associated == all_refs
+        candidates = [(old, keys) for old, _, keys in matches[id(row)] if old.ref in previous]
+        exact = {old.ref for old, keys in candidates if row["balance_key"] in keys}
+        possible[id(row)] = exact or {old.ref for old, _ in candidates if _bank_description_matches(row, old)}
+    claims = Counter(ref for refs in possible.values() for ref in refs)
+    links = {source: previous[ref] for source, refs in possible.items() if len(refs) == 1 for ref in refs if claims[ref] == 1}
+    return links if len(links) == len(previous) else None
 
 
 def _bank_previous_revision_order(conn, account, currency, first, recorded, opening, family):
@@ -3486,11 +3488,11 @@ def _bank_aligned_balance_revisions(conn, account, currency, current, prior, mat
     return common or {}, feasible
 
 
-def _bank_revision_placements(dated, undated):
-    """Test BOOK placement for proof only, leaving the original facts intact."""
+def _bank_revision_placements(dated, undated, previous, links):
+    """Test common and new BOOK placements without altering observed dates."""
     # Sharing a day with an observed edge covers placing the movement
     # before or after that edge without selecting a fiscal date for it.
-    days = sorted(dated)
+    days = sorted(dated.keys() | previous.keys())
     if not days:
         return
     alternatives = 1
@@ -3500,10 +3502,15 @@ def _bank_revision_placements(dated, undated):
             return
     for placement in product(days, repeat=len(undated)):
         trial = {day: list(entries) for day, entries in dated.items()}
+        earlier = {day: list(entries) for day, entries in previous.items()}
         for day, row in zip(placement, undated):
             observed = row.get("_bank_observed_balance")
-            trial[day].append((row, _BankMovement(day, day, Decimal(str(row["amount"])), observed[1] if observed else None)))
-        yield trial
+            movement = _BankMovement(day, day, Decimal(str(row["amount"])), observed[1] if observed else None)
+            trial.setdefault(day, []).append((row, movement))
+            if id(row) in links:
+                old, shared = links[id(row)]
+                earlier.setdefault(day, []).append((old, shared._replace(first=day, last=day)))
+        yield trial, earlier
 
 
 def _reconcile_bank_balance_revisions(conn, rows, assessments):
@@ -3559,8 +3566,9 @@ def _reconcile_bank_balance_revisions(conn, rows, assessments):
             if day:
                 prior[day].append((booking, amount, keys))
             else:
-                undated_bookings.append(booking)
-                old_undated.append(_BankMovement(None, None, amount, balance_keys=keys))
+                movement = _BankMovement(None, None, amount, balance_keys=keys)
+                undated_bookings.append((booking, movement))
+                old_undated.append(movement)
 
         live_days = {
             day: [(row, _BankMovement(day, day, Decimal(str(row["amount"])),
@@ -3593,24 +3601,29 @@ def _reconcile_bank_balance_revisions(conn, rows, assessments):
 
         aligned = None
         if not any(entry.first != entry.last for entry in (*live, *recorded)):
-            if _bank_same_undated_members(undated_reports, undated_bookings, matches):
-                placements = (live_days,)
-            elif not undated_bookings and all(not matches[id(row)] for row in undated_reports):
-                placements = _bank_revision_placements(live_days, undated_reports)
-            else:
-                placements = ()
-            for placement in placements:
-                answer, feasible = _bank_aligned_balance_revisions(conn, account, currency, placement, prior_days, matches)
-                if feasible is not False:
-                    aligned = _bank_common_revision_matches(aligned, answer)
+            links = _bank_undated_revision_links(undated_reports, undated_bookings, matches)
+            if links is not None:
+                shared = len(links) == len(undated_reports) and all(
+                    row["balance_key"] in links[id(row)][1].balance_keys
+                    or not row["balance_key"] and not links[id(row)][1].balance_keys
+                    for row in undated_reports
+                )
+                if shared:
+                    aligned, _ = _bank_aligned_balance_revisions(conn, account, currency, live_days, prior_days, matches)
+                if undated_reports and not aligned:
+                    aligned = None
+                    for placement, earlier in _bank_revision_placements(live_days, undated_reports, prior_days, links):
+                        answer, feasible = _bank_aligned_balance_revisions(conn, account, currency, placement, earlier, matches)
+                        if feasible is not False:
+                            aligned = _bank_common_revision_matches(aligned, answer)
         aligned = aligned or {}
         aligned_rows.update(aligned)
         verified.update(id(row) for row in reports if id(row) in aligned
                         and row.get("_bank_account_key") and row.get("_bank_observed_balance"))
         candidates = defaultdict(list)
-        for day, reports in current.items():
+        for day, reports in (*current.items(), (None, undated_reports)):
             targets = [row for row in reports if id(row) in aligned or (
-                row.get("_bank_observed_balance")
+                day and row.get("_bank_observed_balance")
                 and any(old.balance_key and old.balance_key != row["balance_key"] for old, _, _ in matches[id(row)])
             )]
             delta = None
