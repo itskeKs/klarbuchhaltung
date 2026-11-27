@@ -2060,7 +2060,12 @@ def _bank_match_rank(row, old, ref, source_refs):
     previous_ref = old.ref in row["prior_refs"]
     provider_match = old.provider_ref and row["provider_ref"] == old.provider_ref
     balance_match = old.balance_key and row["balance_key"] == old.balance_key
+    creditor_match = old.creditor_ref and row["creditor_ref"] == old.creditor_ref
     description_match = _bank_description_matches(row, old)
+    if (not (previous_ref or provider_match or creditor_match or description_match)
+            and all(text and text != "Bankumsatz" for text in (row["description"], old.description))
+            and _stored_secondary_match(row, old) is False):
+        return None
     if row["counterparty_ids"] and _bank_account_match(row["counterparty_ids"], old.counterparty_ids) is None:
         # A reused reference needs corroboration before it can teach a missing payer.
         if not balance_match and not ((previous_ref or provider_match) and description_match):
@@ -2069,7 +2074,7 @@ def _bank_match_rank(row, old, ref, source_refs):
         return 1
     if provider_match:
         return 2
-    if balance_match or (old.creditor_ref and row["creditor_ref"] == old.creditor_ref):
+    if balance_match or creditor_match:
         return 3
     if description_match:
         return 4

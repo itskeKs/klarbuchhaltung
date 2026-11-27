@@ -275,6 +275,124 @@ def test_daily_sync_catches_up_after_browser_closes(sandbox, monkeypatch):
     assert service.consents()[0]["last_synced"] == (today + timedelta(days=1)).date().isoformat()
 
 
+def reported_balance_pair():
+    credit = bank_row(booking_date="2026-11-20", transaction_date="2026-11-20", transaction_id="credit",
+                      debtor_account={"iban": "DE00PAYER"}, remittance_information=["Fixture receipt"],
+                      balance_after_transaction={"amount": "119", "currency": "EUR"})
+    debit = bank_row(booking_date="2026-11-21", value_date="2026-11-21", transaction_id="debit",
+                     creditor_account={"iban": "DE00PAYEE"}, remittance_information=["Fixture debit"],
+                     credit_debit_indicator="DBIT", transaction_amount={"amount": "23", "currency": "EUR"},
+                     balance_after_transaction={"amount": "96", "currency": "EUR"})
+    return credit, debit
+
+
+def test_two_hosted_services_keep_balance_proven_overlap_payments_once(sandbox, monkeypatch):
+    import core
+    from hosted.bank_service import BankingService
+
+    booked = reported_balance_pair()
+    repeated = []
+
+    class PaginatedBank(StubProvider):
+        auth_origin = "https://tilisy.enablebanking.com"
+
+        def request(self, method, path, *, query=None, data=None):
+            if method == "GET" and path.endswith("/transactions"):
+                assert query["transaction_status"] == "BOOK"
+                if query.get("continuation_key"):
+                    return {"transactions": repeated}
+                return {"transactions": list(booked), "continuation_key": "overlap"}
+            return super().request(method, path, query=query, data=data)
+
+    receipts = []
+    for index, who in enumerate(("alex", "blake")):
+        workspace = sandbox / who
+        workspace.mkdir()
+        monkeypatch.setattr(core, "DB_PATH", workspace / "bookkeeping.db")
+        repeated[:] = [booked[1] | {"transaction_id": None}] if index else []
+        service = BankingService(workspace, workspace, SITE + "/api/bank/callback", client_factory=PaginatedBank)
+        service.save_credentials(APP_ID, b"fixture-key")
+        begin = service.begin(who, "DE", BANK, "business")
+        state = parse_qs(urlsplit(begin).query)["state"][0]
+        service.finish(who, state, "fixture-code", "")
+        assert service.sync(force=True) == 2
+        with closing(core.db()) as ledger:
+            payment, debit_id = tuple(row[0] for row in ledger.execute("SELECT id FROM transactions ORDER BY amount DESC"))
+            if index == 0:
+                core.set_tx_category(ledger, debit_id, "gebuehr")
+            receipts.append((core.DB_PATH, payment, debit_id, service))
+
+    for index, (db_path, payment, debit_id, service) in enumerate(receipts):
+        monkeypatch.setattr(core, "DB_PATH", db_path)
+        repeated[:] = [booked[0] | {"transaction_id": "renewed"}, booked[1] | {"transaction_id": None}]
+        assert service.sync(force=True) == 0
+        assert service.consents()[0]["skipped"] == 0
+        repeated.clear()
+        assert service.sync(force=True) == 0
+        with closing(core.db()) as ledger:
+            rows = [tuple(row) for row in ledger.execute("SELECT id,amount,category FROM transactions ORDER BY amount DESC")]
+            assert rows == [(payment, 119, "offen"), (debit_id, -23, "offen" if index else "gebuehr")]
+            assert sum(row[1] for row in rows) == 96
+
+
+@pytest.mark.parametrize("change", [
+    "lookup", "no lookup", "no payer", "no memo", "sparse fields", "no secondary date", "no booking date", "no booking dates",
+])
+@pytest.mark.parametrize("credit_copy", [False, True])
+@pytest.mark.parametrize("same_day", [False, True])
+def test_signed_balance_edge_proves_one_booking_without_optional_references(sandbox, change, credit_copy, same_day):
+    import core
+
+    credit, debit = reported_balance_pair()
+    if same_day:
+        debit["booking_date"] = credit["booking_date"]
+    original = credit if credit_copy else debit
+    copy = original | {"transaction_id": "renewed"}
+    omitted = {"no lookup": ("transaction_id",), "no payer": ("debtor_account", "creditor_account"),
+               "no memo": ("remittance_information",), "sparse fields": ("transaction_id", "debtor_account", "creditor_account",
+                                                                       "remittance_information"),
+               "no secondary date": ("value_date", "transaction_date")}
+    for field in omitted.get(change, ()):
+        copy.pop(field, None)
+    if change in {"no booking date", "no booking dates"}:
+        copy.pop("booking_date")
+    if change == "no booking dates":
+        original.pop("booking_date")
+    rows = [credit, debit, copy]
+    with closing(core.db()) as ledger:
+        for page, expected in ((rows, 2), (rows[::-1], 0), ([credit, debit], 0), ([copy], 0)):
+            mapped, warnings = transaction_rows("account-a", page)
+            result = core.import_bank_rows(ledger, mapped, require_fx=True, auto_match=False)
+            assert (result["imported"], result["ambiguous"] + warnings) == (expected, 0)
+            assert tuple(ledger.execute("SELECT count(*),sum(amount),sum(abs(amount)) FROM transactions").fetchone()) == (2, 96, 142)
+
+
+@pytest.mark.parametrize("booking_reported", [True, False])
+def test_signed_statement_reset_keeps_two_reference_less_equal_movements(sandbox, booking_reported):
+    import core
+
+    credit, debit = reported_balance_pair()
+    reset = debit | {
+        "booking_date": credit["booking_date"], "transaction_id": "reset", "remittance_information": ["Refund"],
+        "transaction_amount": {"amount": "119", "currency": "EUR"},
+        "balance_after_transaction": {"amount": "0", "currency": "EUR"},
+    }
+    opening = credit | {
+        "booking_date": "2026-11-19", "transaction_date": "2026-11-19", "transaction_id": "opening",
+        "remittance_information": ["Opening"], "transaction_amount": {"amount": "10", "currency": "EUR"},
+        "balance_after_transaction": {"amount": "0", "currency": "EUR"},
+    }
+    if not booking_reported:
+        credit.pop("booking_date")
+    second = credit | {"transaction_id": "current-second"}
+    with closing(core.db()) as ledger:
+        page = [opening, credit, reset, second, debit]
+        for page, expected in ((page, 5), (page[::-1], 0)):
+            mapped, _ = transaction_rows("account-a", page)
+            assert core.import_bank_rows(ledger, mapped, require_fx=True, auto_match=False)["imported"] == expected
+            assert tuple(ledger.execute("SELECT count(*),sum(amount),sum(abs(amount)) FROM transactions").fetchone()) == (5, 106, 390)
+
+
 @pytest.mark.parametrize("origin", ["http://tilisy.enablebanking.com", "https://other.example",
                                     "https://auth.enablebanking.com:8443"])
 def test_consent_requires_provider_https_origin(tmp_path, monkeypatch, origin):
@@ -2849,15 +2967,20 @@ def test_statement_corrections_are_owned_by_payment_evidence(sandbox, relation, 
             )
 
 
-@pytest.mark.parametrize("absent_entry", ["fee", "all"])
+@pytest.mark.parametrize("absent_entry", ["fee", "all", "fee without payer", "fee without invoice"])
 @pytest.mark.parametrize("lookup", ["same", "renewed", "absent"])
 def test_overlapping_pages_keep_corroborated_bookings_without_an_entry_reference(sandbox, absent_entry, lookup):
     import core
 
     def omit_entry(row, name):
-        if absent_entry == "all" or name == "Fee":
-            return {key: value for key, value in row.items() if key != "entry_reference"}
-        return row
+        if absent_entry != "all" and name != "Fee":
+            return row
+        missing = {"entry_reference"}
+        if absent_entry == "fee without payer":
+            missing.update(("debtor_account", "creditor_account"))
+        if absent_entry == "fee without invoice":
+            missing.update(("reference_number", "reference_number_schema"))
+        return {key: value for key, value in row.items() if key not in missing}
 
     def fixture(label):
         reports, correction = statement_overlap_fixture(0, 0, label, balanced=True)
@@ -2865,6 +2988,9 @@ def test_overlapping_pages_keep_corroborated_bookings_without_an_entry_reference
 
     first, one = fixture("A")
     second, two = fixture("B")
+    if absent_entry == "fee without invoice":
+        # A known different payee establishes the separate fee in the second statement.
+        second[-2]["creditor_account"] = {"iban": "DE00PAYEEB"}
     second[0] = first[0]
 
     def overlapping_pages(reports):

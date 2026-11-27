@@ -91,8 +91,10 @@ statements independently, even when another statement still needs review.
 The same reported balance can support more than one statement. The importer
 checks repeated reports together and uses the balances to identify any
 additional equal movements. Compatible booking facts can link repeated
-reports after their temporary lookup IDs change. A structured reference
-and known counterparty can help when the bank omits its entry reference.
+reports after their temporary lookup IDs change. When compatible reports
+show the same movement and ending balance, the other signed movements
+can establish whether that balance could recur. This check also works
+when reference or counterparty details are missing.
 Value and transaction dates can help identify a movement or place it when
 its booking date is missing.
 Movements on the same known booking day can follow any order consistent
