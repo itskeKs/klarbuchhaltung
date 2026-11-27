@@ -1054,7 +1054,7 @@ def _merge_fetch_copies(account_key, rows, account_rows):
             row["date"] = date.fromisoformat(effective_day).isoformat()
             row["_source_keys"] = tuple(dict.fromkeys(key for copy in versions for key in copy["_source_keys"]))
             row["prior_refs"].extend(copy["ref"] for copy in versions if copy["ref"])
-            if row["provider_ref"]:
+            if row["provider_ref"] and row["_entry_reference"]:
                 row["_dated_ref"] = fingerprint(account_key, "entry", row["_entry_reference"], row["date"],
                                                 row["_amount_key"], row["currency"])
                 row["ref"] = _dated_booking_ref(row["_dated_ref"], row)
@@ -2254,15 +2254,27 @@ def _joint_replay_subset(drafts, currency, candidates, members, bookings, observ
 
         return [index for index in {i for group in groups for i in candidates[currency, group]} if covered(drafts[index])]
 
-    choices = []
+    choices, unchanged = [], []
     for member, ((groups, _), old) in enumerate(zip(members, bookings)):
-        options = matching(groups, old)
+        weaker = matching(groups, old)
+        unchanged.append(set(weaker))
+        current = {index for group in groups for index in candidates[currency, group]}
+        # A positively identified report may supply new evidence. Prefer
+        # it as the booked member over sparse copies of that movement.
+        identified = []
+        for index in current:
+            row = drafts[index]
+            same_source = (old.provider_ref and old.provider_ref == row["provider_ref"]) or (old.ref and old.ref == row["ref"])
+            if same_source and core._joint_statement_source(row, groups, old):
+                identified.append(index)
+        options = identified or weaker
         # A previously established checkpoint can fall outside a shorter
         # response. Keep it as context only if no live report could replace
         # or contradict it, and still require the named subjects themselves.
-        if (not options and old.booked_day and old.balance_key and old.provider_ref not in provider_refs
+        if (not options and old.booked_day and old.balance_key and (not old.provider_ref or old.provider_ref not in provider_refs)
                 and subject_groups.isdisjoint(groups) and not any(candidates[currency, group] for group in groups)):
             options = [-member - 1]
+            unchanged[-1].update(options)
         choices.append(options)
     previous = list(bookings)
     for groups, facts in observations:
@@ -2271,23 +2283,45 @@ def _joint_replay_subset(drafts, currency, candidates, members, bookings, observ
                  if core._joint_proof_member_matches((groups, option), (other_groups, old), subject=True)}
         if len(names) == 1:
             option = option._replace(description=next(iter(names)))
-        choices.append(matching(groups, option))
+        compatible = matching(groups, option)
+        choices.append(compatible)
+        unchanged.append(set(compatible))
         previous.append(option)
 
     assigned = _joint_replay_assignment(choices, required=required)
     live = {index: member for index, member in assigned.items() if index >= 0}
-    replay = len(live) == len(drafts) and (len(live) < len(choices) or any(
+    same_evidence = len(live) == len(drafts) and all(index in unchanged[member] for index, member in live.items())
+    omissions = len(live) < len(choices) or any(
         any(getattr(previous[member], field) and not drafts[index][field] for field in core._BANK_IDENTITY_FIELDS)
         or (previous[member].description and previous[member].description != drafts[index]["description"])
         or set(previous[member].counterparty_ids) != set(drafts[index]["counterparty_ids"])
         for index, member in live.items()
-    ))
-    if replay:
-        return True, {}
+    )
+    if same_evidence and omissions:
+        return True, {}, {}
     # A report is an established movement only when every maximal matching
     # that covers the named movements assigns it to the same one.
     matched = _joint_replay_matches(choices, required=required)
-    return False, {index: member for index, member in matched.items() if member < required}
+    owners = Counter(index for options in choices[:required] for index in options)
+    exclusive = [[index for index in options if owners[index] == 1] for options in choices[:required]] + choices[required:]
+    distinct = _joint_replay_assignment(exclusive, required=required)
+    # Reserve one report for each known movement when equally complete
+    # assignments can identify their owners. Other reports stay available
+    # to the balance solver, with their observed facts intact.
+    representatives = distinct if len(distinct) == len(assigned) else live
+    for index, member in representatives.items():
+        if member < required and owners[index] == 1:
+            matched[index] = member
+    named = {index: member for index, member in matched.items() if member < required}
+    alternatives = {}
+    eligible = {index for options in choices for index in options if index >= 0}
+    if len(named) == required and len(live) == len(eligible):
+        # Once the booked occurrences are reserved, a weaker copy can be
+        # identified as a previously observed alternative by elimination.
+        remaining = [[index for index in options if index not in named] for options in choices[required:]]
+        alternatives = {index: previous[required + member]
+                        for index, member in _joint_replay_matches(remaining, required=0).items()}
+    return False, named, alternatives
 
 
 def _joint_checkpoint_context(conn, account, currency, groups, old, balances):
@@ -2309,6 +2343,12 @@ def _joint_checkpoint_context(conn, account, currency, groups, old, balances):
     }
 
 
+def _joint_common_fields(versions, fields):
+    # An omitted field does not contradict an earlier supplied value.
+    return {field: next(iter(values)) for field in fields
+            if len(values := {getattr(old, field) for old in versions if getattr(old, field)}) == 1}
+
+
 def _joint_replay_evidence(conn, account, first, last, drafts):
     """Use a complete matching witness before filling omissions on a replay."""
     saved = conn.execute(
@@ -2327,6 +2367,7 @@ def _joint_replay_evidence(conn, account, first, last, drafts):
             candidates[row["currency"], group].append(index)
     evidence, balances = defaultdict(list), defaultdict(dict)
     context = defaultdict(list)
+    alternatives = defaultdict(list)
     checked = set()
     for currency, encoded in saved:
         for proof in core._joint_evidence_versions(json.loads(encoded)):
@@ -2352,7 +2393,7 @@ def _joint_replay_evidence(conn, account, first, last, drafts):
                 bookings.append(_overlap_booking(facts)._replace(ref=booking.ref, description=booking.description))
             if len(bookings) != len(members):
                 continue
-            replay, covered = _joint_replay_subset(drafts, currency, candidates, members, bookings, proof["observations"])
+            replay, covered, options = _joint_replay_subset(drafts, currency, candidates, members, bookings, proof["observations"])
             if replay:
                 return {}, balances, (), True
 
@@ -2387,6 +2428,8 @@ def _joint_replay_evidence(conn, account, first, last, drafts):
                 for row in restored:
                     context[row["ref"]].append(row)
             balances[currency].update(confirmed_balances)
+            for index, option in options.items():
+                alternatives[index].append(option)
             for index, member in covered.items():
                 if index < 0:
                     continue
@@ -2399,12 +2442,18 @@ def _joint_replay_evidence(conn, account, first, last, drafts):
     for index, versions in evidence.items():
         if len({old.ref for old in versions}) != 1:
             continue
-        fields = (*_FIXED_BOOKING_FACTS, *_STATEMENT_DATE_FIELDS, "counterparty_ids", "description")
         # Different saved versions can be complementary. A conflict on a
         # typed field supplies no replacement for an omitted observation.
-        available = {field: next(iter(values)) for field in fields
-                     if len(values := {getattr(old, field) for old in versions if getattr(old, field)}) == 1}
+        available = _joint_common_fields(versions, (*core._BANK_IDENTITY_FIELDS, "counterparty_ids", "description"))
         witnessed[index] = versions[0].ref, available
+    for index, versions in alternatives.items():
+        if index not in witnessed:
+            # Alternative reports carry no posting identity, date or balance
+            # inferred from a different occurrence.
+            available = _joint_common_fields(versions, ("creditor_ref", "reference_schema", "counterparty_iban",
+                                                        "counterparty_ids", "description"))
+            if available:
+                witnessed[index] = None, available
     agreed = [rows[0] for rows in context.values()
               if len({(row["booked_day"], row["amount"], row["balance_key"]) for row in rows}) == 1]
     checkpoints = tuple(row | {"_report_index": -index} for index, row in enumerate(agreed, 1))
@@ -2479,7 +2528,7 @@ class _StatementFetch:
                 # A balance belongs to the corroborated observation. Do not
                 # also infer it for another copy whose balance is unknown.
                 page = row.get("_fetch_page")
-                if any(other is not row and (other["_report_index"] in witnessed
+                if any(other is not row and (witnessed.get(other["_report_index"], (None, {}))[0]
                        or (page is not None and other["_fetch_page"] != page)) and _sparse_reports_match(row, other)
                        for other in current_balances[currency, row["_amount_key"], key]):
                     continue
@@ -2503,7 +2552,13 @@ class _StatementFetch:
                 groups = {day: fingerprint(self.account_key, day, row["_amount_key"], row["currency"]) for day in dated.values()}
                 facts = {field: fields[field] for field in ("creditor_ref", "reference_schema", "counterparty_iban", "counterparty_ids")
                          if field in fields and not row[field]}
-                row = row | dated | facts | {"_confirmed_reference_aliases": {ref}, "bank_groups": row["bank_groups"] | groups}
+                row = row | dated | facts | {"bank_groups": row["bank_groups"] | groups}
+                if ref:
+                    row["_confirmed_reference_aliases"] = {ref}
+                if not row["provider_ref"] and "provider_ref" in fields:
+                    # The stored reference groups copies even when the
+                    # bank no longer sends the underlying entry identifier.
+                    row |= {"provider_ref": fields["provider_ref"], "ref": ref, "_dated_ref": ref}
                 if row["description"] == "Bankumsatz" and "description" in fields:
                     row["description"] = fields["description"]
                 if day := dated.get("booked_day"):
@@ -3075,7 +3130,7 @@ def _merge_balance_reports(account_key, versions, count, disputed, supported, pr
     if merged["booked_day"]:
         merged["date"] = merged["booked_day"]
     _merge_copy_metadata(merged, versions)
-    if merged["provider_ref"]:
+    if merged["provider_ref"] and merged["_entry_reference"]:
         merged["_dated_ref"] = fingerprint(account_key, "entry", merged["_entry_reference"], merged["date"],
                                             merged["_amount_key"], merged["currency"])
         merged["ref"] = _dated_booking_ref(merged["_dated_ref"], merged)

@@ -1334,14 +1334,20 @@ def test_joint_statement_later_checkpoints_bound_unsigned_receipts(sandbox, seed
 
 @pytest.mark.parametrize("cross_month", [False, True])
 @pytest.mark.parametrize("missing_checkpoint", ["opening", "closing"])
-def test_joint_statement_shortened_reply_keeps_known_movements_and_imports_a_new_fee(sandbox, cross_month, missing_checkpoint):
+@pytest.mark.parametrize("checkpoint_reference", [False, True])
+def test_joint_statement_shortened_reply_keeps_known_movements_and_imports_a_new_fee(
+    sandbox, cross_month, missing_checkpoint, checkpoint_reference,
+):
     import core
 
     reports, echoes = _joint_receipt_count_fixture(cross_month=cross_month)
+    checkpoint = 0 if missing_checkpoint == "opening" else -1
+    if not checkpoint_reference:
+        del reports[checkpoint]["entry_reference"]
     weaker = [row.copy() for row in reports]
     for field in ("entry_reference", "reference_number", "transaction_date", "value_date"):
         del weaker[1][field]
-    del weaker[0 if missing_checkpoint == "opening" else -1]
+    del weaker[checkpoint]
     fee = _bank_motion("2026-12-03" if cross_month else "2026-11-22", -20, 314, "New fee", entry_reference="new-fee")
     with closing(core.db()) as ledger:
         assert _sync_bank_pages(ledger, [reports, echoes]) == (4 if cross_month else 5)
@@ -1354,6 +1360,54 @@ def test_joint_statement_shortened_reply_keeps_known_movements_and_imports_a_new
                 [("unplaced", 119)] if cross_month else []
             )
             assert _sync_bank_pages(ledger, reply) == 0
+
+
+@pytest.mark.parametrize("cross_month", [False, True])
+@pytest.mark.parametrize("additional_amount", [0, -20, 119])
+@pytest.mark.parametrize("detail", ["dated", "partial", "anonymous"])
+def test_joint_statement_replay_reconciles_multiple_partial_movements(sandbox, cross_month, additional_amount, detail):
+    import core
+
+    reports, echoes = _joint_receipt_count_fixture(cross_month=cross_month)
+    if detail == "anonymous":
+        del reports[0]["entry_reference"]
+    weaker = [row.copy() for row in reports]
+    for field in ("entry_reference", "balance_after_transaction"):
+        del weaker[1][field]
+    for field in ("entry_reference", "transaction_date", "value_date"):
+        del weaker[2][field]
+    if detail != "dated":
+        del weaker[1]["booking_date"]
+        del weaker[2]["reference_number"]
+    if detail == "anonymous":
+        for index, fields in enumerate((
+            ("booking_date", "remittance_information"),
+            ("transaction_date", "remittance_information"),
+            ("remittance_information",),
+            ("transaction_date", "balance_after_transaction"),
+        )):
+            for field in fields:
+                del weaker[index][field]
+    additions = [_bank_motion("2026-12-03" if cross_month else "2026-11-22", additional_amount, 334 + additional_amount,
+                              "Separate movement", entry_reference="separate")] if additional_amount else []
+    expected = (4, 225) if cross_month else (5, 344)
+    with closing(core.db()) as ledger:
+        assert _sync_bank_pages(ledger, [reports, echoes]) == expected[0]
+        tx_id = ledger.execute("SELECT id FROM transactions WHERE description='Rent'").fetchone()[0]
+        core.set_tx_category(ledger, tx_id, "einnahme_sonstige", "Checked rent")
+        old = [tuple(row) for row in ledger.execute("SELECT id,ref,date,category,note FROM transactions ORDER BY id")]
+        for delivery, pages in enumerate(([[*weaker, *additions], echoes], [[*echoes, *weaker, *additions]],
+                                         [echoes, [*reports, *additions]])):
+            assert _sync_bank_pages(ledger, pages) == (len(additions) if delivery == 0 else 0)
+            assert [tuple(row) for row in ledger.execute(
+                "SELECT id,ref,date,category,note FROM transactions WHERE id <= ? ORDER BY id", (old[-1][0],),
+            )] == old
+            assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (
+                expected[0] + len(additions), expected[1] + additional_amount,
+            )
+            assert [(row["state"], row["amount"]) for row in core.pending_bank_statement_amounts(ledger)] == (
+                [("unplaced", 119)] if cross_month else []
+            )
 
 
 @pytest.mark.parametrize("cross_month", [False, True])

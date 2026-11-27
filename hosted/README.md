@@ -147,6 +147,10 @@ statement preserves its existing booked and possible amounts. The same reply
 can add a new movement or supply a balance that resolves an outstanding amount.
 When a shorter overlapping reply omits an established checkpoint entirely, its
 verified balance can still support the calculation without posting it again.
+The checkpoint can be recognized from the statement even if the provider never
+supplied an entry reference. If several weaker copies could represent the same
+booked movement, one represents that movement and the others remain candidates
+for the balance calculation.
 If the statement establishes both the amount and its purpose, **Zahlungen**
 shows the observed purpose.
 An entry reference can also change on a later page or fetch. Matching dates,
