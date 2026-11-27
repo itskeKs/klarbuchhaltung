@@ -3252,14 +3252,54 @@ def _bank_revision_assignments(incoming, previous, matches, families):
     return revisions
 
 
+def _bank_recover_revision_assignments(conn, incoming, recorded, matches, opening, currency):
+    """Recover an older checkpoint left behind by an already imported movement."""
+    stored = {old.ref: (old, movement) for group in recorded.values() for old, movement in group}
+    if len(stored) > _BANK_BALANCE_TRAIL_LIMIT:
+        return {}
+    assignments, identified, obsolete = {}, set(), set()
+    for reports in incoming.values():
+        for row in reports:
+            candidates = [(old, keys) for old, _, keys in matches[id(row)] if old.ref in stored]
+            if len(candidates) != 1:
+                return {}
+            old, keys = candidates[0]
+            if old.ref in identified:
+                return {}
+            identified.add(old.ref)
+            assignments[id(row)] = old.ref
+            if keys and row["balance_key"] and row["balance_key"] not in keys:
+                obsolete.add(old.ref)
+    if not obsolete or identified != stored.keys():
+        return {}
+
+    # All observed movements are already identified. Verify the old balance
+    # in the earlier ledger, before subsequently imported movements arrived.
+    ordered = sorted(stored, key=lambda ref: conn.execute("SELECT id FROM transactions WHERE ref=?", (ref,)).fetchone()[0])
+    prefix = defaultdict(list)
+    included = set()
+    for ref in ordered[:-1]:
+        old, movement = stored[ref]
+        prefix[movement.first].append((old, movement))
+        included.add(ref)
+        verifiable = obsolete & included
+        if verifiable and _bank_revision_order(prefix, opening, currency):
+            obsolete.difference_update(verifiable)
+            if not obsolete:
+                return assignments
+    return {}
+
+
 def _bank_aligned_balance_revisions(conn, account, currency, current, prior, matches):
     """Use assignments supported by both partially witnessed balance trails."""
     if not current:
         return {}
     first, last = min(current), max(current)
     recorded = {day: group for day, group in prior.items() if first <= day <= last}
-    if not any(row.balance_keys for group in recorded.values() for _, row in group):
+    if not recorded:
         return {}
+    # An older report may never have supplied running balances. Its booked
+    # amounts still participate in the trail anchored by the new statement.
     families = {row: frozenset(old.ref for old, _, _ in candidates) for row, candidates in matches.items()}
     reflected = defaultdict(set)
     for row, family in families.items():
@@ -3278,8 +3318,11 @@ def _bank_aligned_balance_revisions(conn, account, currency, current, prior, mat
         if previous is None:
             return {}
         if previous is False:
-            continue
-        assignments = _bank_revision_assignments(incoming[0], previous[0], matches, families)
+            assignments = _bank_recover_revision_assignments(conn, incoming[0], recorded, matches, opening, currency)
+            if not assignments:
+                continue
+        else:
+            assignments = _bank_revision_assignments(incoming[0], previous[0], matches, families)
         evidence = {row: (ref, incoming[2].get(row)) for row, ref in assignments.items()}
         if common is None:
             common = evidence
@@ -3296,7 +3339,7 @@ def _reconcile_bank_balance_revisions(conn, rows, assessments):
         account = row.get("_bank_account_key") or (row.get("account_key") if row.get("_statement_joint") and row["booked_day"] else None)
         if account:
             accounts[account, row["currency"]].append(row)
-    revisions = {}
+    revisions, verified = {}, set()
     for (account, currency), reports in accounts.items():
         days = [row["date"] for row in reports]
         history = list(_bank_account_bookings(conn, account, currency, min(days), max(days), include_undated=True))
@@ -3305,8 +3348,11 @@ def _reconcile_bank_balance_revisions(conn, rows, assessments):
             identified[amount].append((booking, amount, _bank_known_balance_keys(conn, booking)))
         matches = {id(row): [(old, amount, keys) for old, amount, keys in identified[Decimal(str(row["amount"]))]
                              if _bank_balance_only_difference(row, old)] for row in reports}
-        if not any(row["balance_key"] and any(old.balance_key and row["balance_key"] != old.balance_key
-                                              for old, _, _ in matches[id(row)]) for row in reports):
+        # An omitted checkpoint can conceal a revised balance. Use the same
+        # signed trail when either version supplied the checkpoint, including
+        # before a later reply fills the gap or identifies more occurrences.
+        if not any(row["balance_key"] != old.balance_key
+                   for row in reports for old, _, _ in matches[id(row)]):
             continue
 
         current, prior = defaultdict(list), defaultdict(list)
@@ -3375,6 +3421,8 @@ def _reconcile_bank_balance_revisions(conn, rows, assessments):
         if (_bank_same_undated_members(undated_reports, undated_bookings, matches)
                 and not any(entry.first != entry.last for entry in (*live, *recorded))):
             aligned = _bank_aligned_balance_revisions(conn, account, currency, live_days, prior_days, matches)
+            verified.update(row["ref"] for row in reports if id(row) in aligned
+                            and row.get("_bank_account_key") and row.get("_bank_observed_balance"))
         candidates = defaultdict(list)
         for day, reports in current.items():
             targets = [row for row in reports if id(row) in aligned or (
@@ -3407,7 +3455,7 @@ def _reconcile_bank_balance_revisions(conn, rows, assessments):
             if len(matches) == 1:
                 row, inferred = matches[0]
                 revisions[row["ref"]] = {"_bank_balance_revision": ref, "_bank_revision_balance": inferred}
-    return [row | revisions[row["ref"]] if row["ref"] in revisions else row for row in rows]
+    return [row | revisions[row["ref"]] if row["ref"] in revisions else row for row in rows], verified
 
 
 def _joint_statement_scope(account, amount, currency, checkpoints, dates, members):
@@ -3466,8 +3514,8 @@ def _joint_proof_member_matches(left, right, *, subject):
     ))
 
 
-def _joint_proof_covers(first, second, *, subjects):
-    """Find an injective correspondence between actual statement movements."""
+def _bank_statement_member_count(first, second, *, subjects):
+    """Count distinct correspondences between actual statement movements."""
     matching = {}
 
     def assign(index, visited):
@@ -3480,7 +3528,13 @@ def _joint_proof_covers(first, second, *, subjects):
                 return True
         return False
 
-    return all(assign(index, set()) for index in range(len(first)))
+    for index in range(len(first)):
+        assign(index, set())
+    return len(matching)
+
+
+def _joint_proof_covers(first, second, *, subjects):
+    return _bank_statement_member_count(first, second, subjects=subjects) == len(first)
 
 
 def _same_joint_statement(prior, current):
@@ -3951,6 +4005,44 @@ def _restore_joint_bank_reviews(conn, rows, assessments):
     return [*(row for i, row in enumerate(named) if i not in discarded), *additions], decisions, warnings, len(discarded)
 
 
+def _settle_booked_bank_occurrences(conn, rows, booked):
+    """Remove proven and now-booked occurrences from pending amounts."""
+    if len(booked) < 2:
+        return
+    witnesses = defaultdict(list)
+    for row in rows:
+        if account := row.get("_bank_account_key"):
+            witnesses[account, row["currency"]].append(
+                (row["bank_group"], _bank_statement_option(row), row["description"]),
+            )
+    scoped = defaultdict(list)
+    for row in booked.values():
+        scoped[row["_bank_account_key"], row["currency"], row["booked_day"]].append(row)
+    pending = conn.execute(
+        "SELECT review_key,account_key,currency,date,amount,details FROM bank_statement_assessments "
+        "WHERE state='pending' AND json_type(details, '$.occurrences')='array'",
+    ).fetchall()
+    for key, account, currency, day, amount, encoded in pending:
+        payments = scoped[account, currency, day]
+        details = json.loads(encoded)
+        lower, upper = details["occurrences"]
+        if len(payments) <= lower or not _bank_occurrence_witness_covered(conn, details.get("witnesses", ()),
+                                                                       witnesses[account, currency]):
+            continue
+        options = details["observations"]
+        candidates = [_bank_statement_option(row) for row in payments]
+        confirmed = min(upper, _bank_statement_member_count(options, candidates, subjects=True))
+        if confirmed <= lower:
+            continue
+        # The signed amount is also part of the statement groups. Use the
+        # stored per-occurrence amount even when this window has other payments.
+        amount = Decimal(str(amount)) / (upper - lower)
+        remainder = upper - confirmed
+        details["occurrences"] = [confirmed, upper]
+        conn.execute("UPDATE bank_statement_assessments SET amount=?, state=?, details=? WHERE review_key=?",
+                     (float(amount * (remainder or 1)), "pending" if remainder else "confirmed", json.dumps(details), key))
+
+
 def import_bank_rows(conn, rows: list, *, auto_match: bool = True, require_fx: bool = False, assessments=()) -> dict:
     """Fertig normalisierte Zahlungen aufnehmen (z. B. aus dem Wirex-Konto).
 
@@ -3958,10 +4050,11 @@ def import_bank_rows(conn, rows: list, *, auto_match: bool = True, require_fx: b
     'ref' ist UNIQUE, ein erneuter Abruf legt also nichts doppelt an."""
     imported = deferred = 0
     rows, assessments = _restore_bank_statement_fetches(conn, rows, assessments)
+    verified = set()
     if any(row.get("_bank_account_key") for row in rows):
         if not conn.in_transaction:
             conn.execute("BEGIN IMMEDIATE")
-        rows = _reconcile_bank_balance_revisions(conn, rows, assessments)
+        rows, verified = _reconcile_bank_balance_revisions(conn, rows, assessments)
     rows, assessments, joint_warnings, joint_dups = _restore_joint_bank_reviews(conn, rows, assessments)
     blocked, placements = _record_bank_statement_assessments(conn, assessments)
     if blocked:
@@ -3972,6 +4065,8 @@ def import_bank_rows(conn, rows: list, *, auto_match: bool = True, require_fx: b
     dups += joint_dups
     review_warnings += joint_warnings
     seen, ambiguous, storage_refs = _bank_matches(conn, named)
+    booked = {seen[row["ref"]]: row for row in named if row["ref"] in verified and row["ref"] in seen
+              and row["ref"] not in ambiguous}
     for r in (*named, *pending_reviews):
         ref = (r.get("ref") or "").strip()
         date_ = (r.get("date") or "")[:10]
@@ -4001,10 +4096,13 @@ def import_bank_rows(conn, rows: list, *, auto_match: bool = True, require_fx: b
         )
         if inserted.rowcount and r.get("bank_groups"):
             _remember_bank_booking(conn, ref, r)
+            if r["ref"] in verified:
+                booked[ref] = r
             if "_statement_review_options" in r:
                 _record_bank_statement_review(conn, r, ref)
         imported += inserted.rowcount
         dups += 1 - inserted.rowcount
+    _settle_booked_bank_occurrences(conn, named, booked)
     for key, date_, details in placements.values():
         # Keep the aggregate receipt through a deferred import (for example,
         # while the exchange rate for the newly known booking day is missing).
