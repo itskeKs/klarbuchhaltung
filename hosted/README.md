@@ -50,6 +50,8 @@ which of two bank versions fits the statement. When those balances leave both
 counts possible, **Banking** asks for review before adding a second payment.
 For several versions, the statement can establish how many payments share a
 reported posting day even when their secondary dates remain unclear.
+Compatible bank facts can support that check when an optional reference is
+missing. Reported balances can also confirm two otherwise identical payments.
 If a later statement contradicts a payment already in the ledger, **Banking**
 flags it and keeps the posted payment and category.
 The ledger remembers account identifiers as fingerprints and learns missing evidence

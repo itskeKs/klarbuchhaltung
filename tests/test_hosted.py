@@ -1587,6 +1587,143 @@ def test_statement_subject_cohort_respects_cardinality_and_posting_date(sandbox,
             assert len(list(ledger.execute(rent_rows))) == 2
 
 
+@pytest.mark.parametrize("omission", ["early-invoice", "late-invoice", "all-invoice", "late-bank-ref", "late-balance", "bridge"])
+@pytest.mark.parametrize("sign", [-1, 1])
+@pytest.mark.parametrize("seed", ["new", "early", "late"])
+def test_statement_cohort_accepts_redundant_partial_facts_and_reuses_existing_bookings(sandbox, omission, sign, seed):
+    import core
+
+    def movement(day, change, balance, ref, booked_day=None):
+        return bank_row(booking_date=booked_day or f"2026-11-{day:02}", transaction_date=f"2026-11-{day:02}",
+                        value_date=f"2026-11-{day:02}", entry_reference=ref, reference_number=ref,
+                        credit_debit_indicator="CRDT" if change * sign > 0 else "DBIT",
+                        transaction_amount={"amount": str(abs(change)), "currency": "EUR"},
+                        balance_after_transaction={"amount": str(balance * sign), "currency": "EUR"},
+                        debtor_account={"iban": "DE00PAYER"}, creditor_account={"iban": "DE00PAYEE"},
+                        remittance_information=[ref])
+
+    first = movement(19, 119, 119, "rent")
+    second = movement(21, 119, 119, "rent")
+    third = movement(22, 119, 119, "rent", booked_day="2026-11-21")
+    reversal = movement(20, -119, 0, "reversal")
+    fee = movement(24, -23, 96, "fee")
+    opening = movement(18, 10, 0, "opening")
+    early, middle, late = (row.copy() for row in (first, second, third))
+    if omission in {"early-invoice", "all-invoice", "bridge"}:
+        early["reference_number"] = None
+    if omission == "all-invoice":
+        middle["reference_number"] = None
+    field = {"late-invoice": "reference_number", "all-invoice": "reference_number",
+             "late-bank-ref": "entry_reference", "bridge": "entry_reference",
+             "late-balance": "balance_after_transaction"}.get(omission)
+    if field:
+        late[field] = None
+    whole = [opening, early, reversal, middle, late, fee]
+    with closing(core.db()) as ledger:
+        def sync(page):
+            mapped, skipped = transaction_rows("account-a", page)
+            result = core.import_bank_rows(ledger, mapped, auto_match=False, require_fx=True)
+            return result["imported"], skipped + result["ambiguous"]
+
+        if seed == "early":
+            assert sync([first])[0] == 1
+        elif seed == "late":
+            assert sync([opening, first, reversal, third, fee])[0] == 5
+        original = [tuple(row) for row in ledger.execute("SELECT id, ref, date FROM transactions WHERE description = 'rent'")]
+        for booking_id, _, _ in original:
+            core.set_tx_category(ledger, booking_id, "einnahme_sonstige")
+        for page in (whole, whole[::-1], [*whole, late.copy()], [*whole, third] if omission != "all-invoice" else whole):
+            sync(page)
+            assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (5, 106 * sign)
+            for booking_id, booking_ref, booked_day in original:
+                assert tuple(ledger.execute(
+                    "SELECT ref, date, category FROM transactions WHERE id = ?", (booking_id,),
+                ).fetchone()) == (booking_ref, booked_day, "einnahme_sonstige")
+        assert sync([early, middle, fee])[0] == 0
+        assert sync([early, late, fee])[0] == 0
+
+
+@pytest.mark.parametrize("physical_repeats", [False, True])
+@pytest.mark.parametrize("seed", [False, True])
+@pytest.mark.parametrize("sign", [-1, 1])
+@pytest.mark.parametrize("partial_page", [False, True])
+@pytest.mark.parametrize("axis,lookup", [
+    ("booked", "distinct"), ("booked", "one"), ("value", "none"), ("intraday", "same"), ("intraday", "distinct"),
+    ("intraday", "same-partial"),
+])
+def test_anchored_statement_distinguishes_identical_bookings_from_page_copies(
+    sandbox, physical_repeats, seed, sign, partial_page, axis, lookup,
+):
+    import core
+
+    def movement(day, change, balance, ref):
+        return bank_row(booking_date=day, transaction_date=day, value_date=day, entry_reference=ref, reference_number=ref,
+                        transaction_id=ref, remittance_information=[ref],
+                        transaction_amount={"amount": str(abs(change)), "currency": "EUR"},
+                        credit_debit_indicator="CRDT" if sign * change > 0 else "DBIT",
+                        balance_after_transaction={"amount": str(sign * balance), "currency": "EUR"},
+                        debtor_account={"iban": "DE00PAYER"}, creditor_account={"iban": "DE00PAYEE"})
+
+    first = movement("2026-11-21", 119, 119, "rent")
+    second = first | {"transaction_id": "next"}
+    if lookup == "none":
+        first["transaction_id"] = None
+    if lookup in {"none", "one", "same", "same-partial"}:
+        second["transaction_id"] = first["transaction_id"] if lookup.startswith("same") else None
+    if lookup == "same-partial":
+        second["reference_number"] = None
+    opening = movement("2026-11-20", 10, 0, "opening")
+    reverse = movement("2026-11-21", -119, 0, "reversal")
+    fee = movement("2026-11-22", -23, 96, "fee")
+    others = [reverse] if physical_repeats else []
+    whole = [opening, first, *others, second, fee]
+    if axis == "value":
+        for row in whole:
+            row["booking_date"] = "2026-11-25"
+    elif axis == "intraday":
+        for row in whole:
+            row.update(dict.fromkeys(("booking_date", "value_date", "transaction_date"), "2026-11-21"))
+    initial = [first | {"transaction_id": None}, *whole] if partial_page else whole
+    with closing(core.db()) as ledger:
+        def sync(page):
+            mapped, skipped = transaction_rows("account-a", page)
+            result = core.import_bank_rows(ledger, mapped, auto_match=False, require_fx=True)
+            return result["imported"], skipped + result["ambiguous"]
+
+        if seed:
+            assert sync([first, *others])[0] == 1 + len(others)
+            saved = tuple(ledger.execute("SELECT id, ref FROM transactions WHERE description = 'rent'").fetchone())
+            core.set_tx_category(ledger, saved[0], "einnahme_sonstige")
+        pages = [initial, whole[::-1], [*whole, first], [*whole, second], [*whole, *[first] * 10], [second, fee],
+                 [opening, first | {"transaction_id": "rotated-a"}, *others,
+                  second | {"transaction_id": "rotated-b"}, fee]]
+        if lookup == "same-partial":
+            pages.append([opening, first, *others, second | {"reference_number": "rent"}, fee])
+        for page in pages:
+            _, warnings = sync(page)
+            assert warnings == 0
+            assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (
+                5 if physical_repeats else 3, 106 * sign,
+            )
+            if seed:
+                assert tuple(ledger.execute(
+                    "SELECT ref, category FROM transactions WHERE id = ?", (saved[0],),
+                ).fetchone()) == (saved[1], "einnahme_sonstige")
+
+
+def test_partial_statement_identity_cannot_bridge_conflicting_bank_references():
+    first = bank_row(entry_reference="first", transaction_id="first",
+                     debtor_account={"iban": "DE00PAYER"}, reference_number="shared",
+                     balance_after_transaction={"amount": "119", "currency": "EUR"},
+                     remittance_information=["First"])
+    second = first | {"entry_reference": "second", "transaction_id": "second", "remittance_information": ["Second"]}
+    sparse = first | {"entry_reference": None, "transaction_id": None, "remittance_information": []}
+    for page in ([first, sparse, second], [second, sparse, first]):
+        rows, skipped = transaction_rows("account-a", page)
+        assert skipped == 1
+        assert sorted(row["description"] for row in rows) == ["First", "Second"]
+
+
 @pytest.mark.parametrize("mode", ["initial", "singleton", "overlap"])
 @pytest.mark.parametrize("reverse", [False, True])
 @pytest.mark.parametrize("omitted", [(), ("debtor_account",), ("reference_number",),

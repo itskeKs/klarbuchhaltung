@@ -476,7 +476,12 @@ def _statement_observations(account_rows, sources, currency):
     for index, row in enumerate(account_rows):
         if index in sources or row["currency"] != currency or not Decimal(row["amount"]):
             continue
-        row = _statement_evidence(row)
+        if row.get("_statement_capacity"):
+            # A linked copy group still has up to its observed number of
+            # occurrences when independent balances can settle the count.
+            row = row | {"_statement_sources": frozenset((index,)), "_statement_occurrence": True}
+        else:
+            row = _statement_evidence(row)
         provenance = row["_statement_sources"]
         previous = observations.get(provenance)
         if previous is None:
@@ -488,28 +493,100 @@ def _statement_observations(account_rows, sources, currency):
     return list(observations.values())
 
 
+def _same_statement_fact(first, second, field):
+    return bool(first[field] and first[field] == second[field])
+
+
+def _statement_identity_conflict(first, second):
+    return (_conflicting_facts(first, second, ("provider_ref", *_FIXED_BOOKING_FACTS))
+            or _conflicting_counterparties(first, second))
+
+
+def _statement_corroborates(first, second):
+    if _statement_identity_conflict(first, second):
+        return False
+    balance = _same_statement_fact(first, second, "balance_key")
+    invoice = _same_statement_fact(first, second, "creditor_ref")
+    payer = core._bank_account_match(first["counterparty_ids"], second["counterparty_ids"]) is True
+    return ((_same_statement_fact(first, second, "provider_ref") and (balance or invoice))
+            or (_same_statement_fact(first, second, "_transaction_id") and (balance or (invoice and payer)))
+            or (balance and invoice and payer and bool(first["provider_ref"] or second["provider_ref"])))
+
+
+def _statement_identity_keys(row):
+    for field in ("provider_ref", "_transaction_id"):
+        if row[field]:
+            yield field, row[field]
+    if row["balance_key"] and row["creditor_ref"]:
+        yield "financial", (row["balance_key"], row["creditor_ref"])
+
+
+def _statement_distinct_versions(first, second, date_fields):
+    lookup_distinguishes = bool(first["_transaction_id"] and second["_transaction_id"]
+                                and first["_transaction_id"] != second["_transaction_id"])
+    unlinked_observation = (first["_statement_sources"].isdisjoint(second["_statement_sources"])
+                            and any(not row["_transaction_id"] or row.get("_statement_occurrence")
+                                    for row in (first, second)))
+    return lookup_distinguishes or unlinked_observation or any(
+        first[field] and second[field] and first[field] != second[field] for field in date_fields
+    )
+
+
 def _statement_other_versions(observations):
-    """Keep date alternatives in the same proof, without asking which the ledger would import."""
-    by_identity = defaultdict(list)
+    """Group positively linked versions while leaving conflicting bridges unresolved."""
+    buckets = defaultdict(list)
+    for index, row in enumerate(observations):
+        for key in _statement_identity_keys(row):
+            buckets[row["currency"], row["_amount_key"], key].append(index)
+    links = defaultdict(set)
+    for (_, _, key), bucket in buckets.items():
+        if key[0] == "financial":
+            identified = [index for index in bucket if observations[index]["provider_ref"]]
+            sparse = [index for index in bucket if not observations[index]["provider_ref"]]
+            pairs = product(identified, sparse)
+        else:
+            pairs = combinations(bucket, 2)
+        for left, right in pairs:
+            if _statement_corroborates(observations[left], observations[right]):
+                links[left].add(right)
+                links[right].add(left)
     date_fields = ("booked_day", *_SECONDARY_BANK_DATES)
-    for row in observations:
-        identity = tuple(row[field] for field in ("provider_ref", *_REFERENCE_COPY_FACTS))
-        if all(identity):
-            by_identity[identity].append(row)
     cohorts = []
-    for variants in by_identity.values():
-        if len(variants) > 1 and all(
-            not _conflicting_facts(first, second, _FIXED_BOOKING_FACTS)
-            and _conflicting_facts(first, second, date_fields)
-            for first, second in combinations(variants, 2)
-        ):
-            cohorts.append(tuple(variants))
-    return cohorts
+    unresolved = False
+    remaining = set(links)
+    while remaining:
+        connected = {remaining.pop()}
+        pending = list(connected)
+        while pending:
+            adjacent = links[pending.pop()] & remaining
+            remaining.difference_update(adjacent)
+            pending.extend(adjacent)
+            connected.update(adjacent)
+        groups, uncertain = _compatible_copy_groups(
+            [observations[index] for index in sorted(connected)], _statement_identity_conflict,
+        )
+        unresolved |= bool(uncertain)
+        for variants in groups:
+            if (len(variants) > 1 and any(row["provider_ref"] for row in variants)
+                    and all(_statement_distinct_versions(first, second, date_fields)
+                            for first, second in combinations(variants, 2))):
+                cohorts.append(tuple(variants))
+    return cohorts, unresolved
 
 
-def _statement_choices(versions):
-    choices = (choice for count in range(len(versions), 0, -1) for choice in combinations(versions, count))
-    return tuple(islice(choices, _STATEMENT_PLACEMENT_BUDGET + 1))
+def _statement_shape(row):
+    return tuple(row[field] for field in _STATEMENT_OBSERVATION_FACTS if field != "_transaction_id") + (row["_remittance"],)
+
+
+def _statement_choices(versions, shapes):
+    repeated = defaultdict(list)
+    for version, shape in zip(versions, shapes):
+        repeated[shape].append(version)
+    groups = tuple(repeated.values())
+    counts = (range(len(group), -1, -1) for group in groups)
+    choices = (tuple(item for group, count in zip(groups, selected) for item in group[:count])
+               for selected in product(*counts) if any(selected))
+    return tuple(sorted(islice(choices, _STATEMENT_PLACEMENT_BUDGET + 1), key=len, reverse=True))
 
 
 def _statement_search(currency, observed, candidates, other_versions, floating, interval, *,
@@ -560,22 +637,29 @@ def _statement_boundary(currency, observed, choices, other_versions, interval, *
 def _statement_outcomes(versions, account_rows, date_fields):
     """Return all supported subsets, an indeterminate empty tuple, or no evidence."""
     versions = tuple(_statement_evidence(row) for row in versions)
+    if len({row["balance_key"] for row in versions if row["balance_key"]}) != 1:
+        return None
     first = versions[0]
-    if not first["balance_key"] or any(row["balance_key"] != first["balance_key"] for row in versions):
+    currency = first["currency"]
+    if not Decimal(first["amount"]) or any(row["_statement_balance"] and row["_statement_balance"][0] != currency
+                                            for row in versions):
         return None
-    currency, _ = first["_statement_balance"]
-    amount = Decimal(first["amount"])
-    if currency != first["currency"] or not amount:
-        return None
-    if not any(_conflicting_facts(one, two, date_fields) for one, two in combinations(versions, 2)):
+    if not any(_statement_distinct_versions(one, two, date_fields) for one, two in combinations(versions, 2)):
         return None
     indices = tuple(range(len(versions)))
-    choices = _statement_choices(indices)
+    choices = tuple(tuple(sorted(choice)) for choice in _statement_choices(indices, map(_statement_shape, versions)))
     if len(choices) > _STATEMENT_PLACEMENT_BUDGET:
         return ()
     sources = frozenset().union(*(row["_statement_sources"] for row in versions))
-    observations = _statement_observations(account_rows, sources, currency)
-    cohorts = _statement_other_versions(observations)
+    observed = _statement_observations(account_rows, (), currency)
+    all_cohorts, unresolved = _statement_other_versions(observed)
+    if unresolved:
+        return None
+    # Removing subject versions from the hypothesis must not turn an
+    # unidentified bridge into evidence that uniquely supports another group.
+    observations = [row for row in observed if row["_statement_sources"].isdisjoint(sources)]
+    cohorts = [tuple(row for row in cohort if row["_statement_sources"].isdisjoint(sources)) for cohort in all_cohorts]
+    cohorts = [cohort for cohort in cohorts if len(cohort) > 1]
     competing_sources = {row["_statement_sources"] for version in cohorts for row in version}
     fixed = [row for row in observations if row["_statement_sources"] not in competing_sources]
     supported = set()
@@ -583,6 +667,7 @@ def _statement_outcomes(versions, account_rows, date_fields):
     inconsistent = False
     uncertain = False
     axes = (*date_fields, "booked_day") if "booked_day" not in date_fields else date_fields
+    same_dates = len({tuple(row[field] for field in ("booked_day", *_SECONDARY_BANK_DATES)) for row in versions}) == 1
     for field in axes:
         days = tuple(row[field] for row in versions)
         if not all(days):
@@ -594,7 +679,8 @@ def _statement_outcomes(versions, account_rows, date_fields):
                 dated[row[field]].append(row)
             else:
                 floating.append(row)
-        others = [_statement_choices(tuple((row[field], row) for row in cohort)) for cohort in cohorts]
+        others = [_statement_choices(tuple((row[field], row) for row in cohort), map(_statement_shape, cohort))
+                  for cohort in cohorts]
         alternate_days = [row[field] for cohort in cohorts for row in cohort if row[field]]
         start, end = min(*days, *alternate_days), max(*days, *alternate_days)
         candidates = tuple(zip(days, versions))
@@ -604,13 +690,16 @@ def _statement_outcomes(versions, account_rows, date_fields):
                          if any(row["_statement_balance"] and row["_statement_balance"][0] == currency for row in rows)]
         prior = any(day < start for day in anchored_days)
         following = any(day > end for day in anchored_days)
+        intraday = same_dates and start == end and sum(
+            bool(row["_statement_balance"] and row["_statement_balance"][0] == currency) for row in dated[start]
+        ) >= 2
         undated = bool(floating) or any(row[field] is None for cohort in cohorts for row in cohort)
         if undated and not (prior and following):
             continue
-        if start == end and not (prior and following):
+        if start == end and not (intraday or (prior and following)):
             continue
-        has_prior = prior or (start in anchored_days and any(row["_statement_balance"] is None for row in dated[start]))
-        has_following = following or (end in anchored_days and any(row["_statement_balance"] is None for row in dated[end]))
+        has_prior = prior or intraday or (start in anchored_days and any(row["_statement_balance"] is None for row in dated[start]))
+        has_following = following or intraday or (end in anchored_days and any(row["_statement_balance"] is None for row in dated[end]))
         if not (has_prior or has_following):
             local, _ = _statement_search(currency, dated, candidates, others, floating, inside, find_any=True)
             direct |= bool(local)
@@ -620,7 +709,7 @@ def _statement_outcomes(versions, account_rows, date_fields):
         # balance provides it independently. A local closing is needed only
         # when the trailing statement gives no separate balance evidence.
         entering = leaving = None
-        if not prior:
+        if not (prior or intraday):
             local_openings, opened_completely = _statement_boundary(
                 currency, dated, candidate_sets, others, inside, backwards=True,
             )
@@ -733,38 +822,53 @@ def _statement_slots(versions, outcomes):
 def _resolve_statement_cohorts(drafts):
     """Apply the supported count and placements of larger cohorts once."""
     omitted = set()
+    selected = {}
     warnings = 0
     for currency in {row["currency"] for row in drafts}:
         observations = _statement_observations(drafts, (), currency)
-        for cohort in _statement_other_versions(observations):
-            if len(cohort) < 3:
+        cohorts, _ = _statement_other_versions(observations)
+        dates = ("booked_day", *_SECONDARY_BANK_DATES)
+        for cohort in cohorts:
+            if len(cohort) == 2 and all(row[field] for row in cohort for field in ("provider_ref", *_REFERENCE_COPY_FACTS)) and any(
+                cohort[0][field] and cohort[1][field] and cohort[0][field] != cohort[1][field] for field in dates
+            ):
                 continue
             versions = sorted(cohort, key=lambda row: (row["booked_day"] or row["date"],
                                                        *(row[field] or "" for field in _SECONDARY_BANK_DATES),
                                                        row["ref"] or ""))
-            outcomes = _statement_outcomes(versions, drafts, ("booked_day", *_SECONDARY_BANK_DATES))
+            outcomes = _statement_outcomes(versions, drafts, dates)
             if outcomes is None:
                 continue
             slots = _statement_slots(versions, outcomes)
             all_sources = frozenset().union(*(row["_statement_sources"] for row in versions))
             supported = {index for subset in outcomes for index in subset}
             rejected = [version for index, version in enumerate(versions) if outcomes and index not in supported]
-            occurrences = Counter(index for _, alternatives in slots for index in alternatives)
+            occurrences = Counter(index for _, alternatives in slots for index in set(alternatives))
             chosen = {index for index, _ in slots}
             kept = set()
             for position, (preferred, alternatives) in enumerate(slots):
                 compatible = {preferred, *(index for index in alternatives if occurrences[index] == 1 and index not in chosen)}
+                identified = next((versions[index] for index in sorted(compatible) if versions[index]["provider_ref"]), None)
                 for index in compatible:
                     sources = versions[index]["_statement_sources"]
                     kept.update(sources)
                     for source in sources:
-                        drafts[source]["_statement_slot"] = all_sources, position
+                        row = drafts[source] | {"_statement_slot": (all_sources, position), "_statement_sources": sources}
+                        if identified is not None and not row["provider_ref"]:
+                            for field in ("provider_ref", "_dated_ref", "_entry_reference"):
+                                row[field] = identified[field]
+                            row["ref"] = _dated_booking_ref(row["_dated_ref"], row)
                         if index == preferred:
-                            drafts[source]["_statement_choice"] = True
-                            _note_statement_rejections(drafts[source], versions[preferred], rejected)
+                            row["_statement_choice"] = True
+                            _note_statement_rejections(row, versions[preferred], rejected)
+                        selected[source] = row
             omitted.update(all_sources - kept)
-            warnings += int(len(outcomes) != 1 or len(slots) != len(outcomes[0]))
-    return [row for index, row in enumerate(drafts) if index not in omitted], warnings
+            ambiguous_dates = any(
+                len({tuple(versions[index][day] for day in dates) for index in alternatives}) > 1
+                for _, alternatives in slots
+            )
+            warnings += int({len(outcome) for outcome in outcomes} != {len(slots)} or ambiguous_dates)
+    return [selected.get(index, row) for index, row in enumerate(drafts) if index not in omitted], warnings
 
 
 def _dated_copies_conflict(first, second, account_rows):
@@ -918,7 +1022,8 @@ def _merge_reference_copies(rows):
             continue
         matches = {ref for evidence in _booking_evidence(row) for ref in by_evidence.get(evidence, ())
                    if not _conflicting_facts(row, identified[ref], fields)
-                   and not _conflicting_counterparties(row, identified[ref])}
+                   and not _conflicting_counterparties(row, identified[ref])
+                   and _statement_slot_conflict(row, identified[ref]) is not True}
         if len(matches) > 1:
             omitted.add(row["ref"])
             skipped += 1
@@ -993,21 +1098,24 @@ def _compare_posting_dates(rows, account_rows):
 
 
 def _statement_source_conflict(first, second):
+    if first is second:
+        return False
+    if first["_transaction_id"] and second["_transaction_id"] and first["_transaction_id"] != second["_transaction_id"]:
+        return True
     matching_id = any(first[field] and first[field] == second[field] for field in ("provider_ref", "_transaction_id"))
-    return not matching_id or _conflicting_facts(first, second, _FETCH_COPY_FACTS) or _conflicting_counterparties(first, second)
+    return (not (matching_id or _statement_corroborates(first, second))
+            or _conflicting_facts(first, second, _FETCH_COPY_FACTS) or _conflicting_counterparties(first, second))
 
 
 def _link_repeated_statement_sources(rows):
     """Link unambiguous same-day observations before testing alternative dates."""
     observations = defaultdict(list)
     for row in rows:
-        if row["provider_ref"] or row["_transaction_id"]:
+        if any(_statement_identity_keys(row)):
             observations[row["currency"], row["_amount_key"], row["date"]].append(row)
     for copies in observations.values():
-        identifiers = Counter((field, row[field]) for row in copies
-                              for field in ("provider_ref", "_transaction_id") if row[field])
-        candidates = [row for row in copies if any(identifiers[field, row[field]] > 1
-                                                 for field in ("provider_ref", "_transaction_id"))]
+        identifiers = Counter(key for row in copies for key in _statement_identity_keys(row))
+        candidates = [row for row in copies if any(identifiers[key] > 1 for key in _statement_identity_keys(row))]
         if len(candidates) < 2:
             continue
         groups, _ = _compatible_copy_groups(candidates, _statement_source_conflict)
@@ -1020,6 +1128,59 @@ def _link_repeated_statement_sources(rows):
             for row in versions:
                 row["_statement_sources"] = sources
                 row["_statement_evidence"] = evidence
+
+
+def _mark_statement_capacity(rows):
+    """Retain repeated observations for cash-flow proof with independent anchors."""
+    reported = defaultdict(list)
+    for row in rows:
+        if row["_statement_balance"] and row["_statement_balance"][0] == row["currency"] and Decimal(row["amount"]):
+            reported[row["currency"]].append(row)
+    considered = set()
+    confirmed = set()
+    date_fields = ("booked_day", *_SECONDARY_BANK_DATES)
+    for row in rows:
+        sources = row["_statement_sources"]
+        if len(sources) < 2 or sources in considered or not row["provider_ref"]:
+            continue
+        considered.add(sources)
+        independent = [other for other in reported[row["currency"]] if other["_statement_sources"].isdisjoint(sources)
+                       and (other["_amount_key"] != row["_amount_key"]
+                            or (other["provider_ref"] and other["provider_ref"] != row["provider_ref"]))]
+        for field in date_fields:
+            day = next((rows[index][field] for index in sources if rows[index][field]), None)
+            if day is None:
+                continue
+            dated = [(other[field], other["_statement_sources"]) for other in independent if other[field]]
+            surrounding = any(other_day < day for other_day, _ in dated) and any(other_day > day for other_day, _ in dated)
+            intraday = len({origins for other_day, origins in dated if other_day == day}) >= 2
+            if surrounding or intraday:
+                versions = [rows[index] | {"_statement_sources": frozenset((index,)), "_statement_occurrence": True}
+                            for index in sorted(sources)]
+                outcomes = _statement_outcomes(versions, rows, date_fields)
+                if outcomes and len({len(outcome) for outcome in outcomes}) == 1 and len(outcomes[0]) > 1:
+                    confirmed.update(sources)
+                break
+    for index in confirmed:
+        rows[index]["_statement_capacity"] = True
+
+
+def _separate_statement_references(rows):
+    """Number proven equal bookings without saving the response's lookup IDs."""
+    by_ref = defaultdict(list)
+    for row in rows:
+        if row.get("_statement_slot"):
+            by_ref[row["ref"]].append(row)
+    reserved = {row["ref"] for row in rows}
+    for copies in by_ref.values():
+        if len(copies) < 2 or len({row["_statement_slot"] for row in copies}) != len(copies):
+            continue
+        for row in sorted(copies, key=lambda item: item["_statement_slot"][1])[1:]:
+            ref = row["ref"]
+            while ref in reserved:
+                ref = core._occupied_bank_reference(ref, row)
+            row["ref"] = ref
+            reserved.add(ref)
 
 
 def transaction_rows(account_key, transactions):
@@ -1129,6 +1290,7 @@ def transaction_rows(account_key, transactions):
         row["prior_refs"] = list(dict.fromkeys(prior_refs))
         drafts.append(row)
     _link_repeated_statement_sources(drafts)
+    _mark_statement_capacity(drafts)
     selected, warnings = _resolve_statement_cohorts(drafts)
     skipped += warnings
     versions, warnings = _merge_fetch_copies(account_key, selected, drafts)
@@ -1156,12 +1318,14 @@ def transaction_rows(account_key, transactions):
             rows.extend(merged)
             skipped += warnings
     rows, warnings = _merge_reference_copies(rows)
+    _separate_statement_references(rows)
     rejected = _compare_posting_dates(rows, drafts)
     for row in rows:
         del row["_statement_balance"]
         del row["_statement_sources"]
         del row["_transaction_id"]
         row.pop("_statement_evidence", None)
+        row.pop("_statement_capacity", None)
         row.pop("_statement_choice", None)
         row.pop("_statement_slot", None)
     return [row for row in rows if row["ref"] not in rejected], skipped + warnings
