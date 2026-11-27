@@ -742,6 +742,16 @@ def test_paginated_bank_copy_needs_review_when_the_other_checkpoint_is_missing(s
     repeated.append(candidate)
     assert service.sync(force=True) == 0
     with closing(core.db()) as ledger:
+        assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (2, 96)
+        assert [(row["state"], row["amount"]) for row in core.pending_bank_statement_amounts(ledger)] == [("pending", amount)]
+    # The opposite-day balance alone cannot exclude a second copy outside
+    # the observed range. Add an actual checkpoint on the open side.
+    checkpoint = (_bank_motion("2026-11-19", 10, 0, "Opening", entry_reference="opening") if target == 0
+                  else _bank_motion("2026-11-22", -10, 86, "Closing", entry_reference="closing"))
+    reports.append(checkpoint)
+    assert service.sync(force=True) == 1
+    with closing(core.db()) as ledger:
+        assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (3, 106 if target == 0 else 86)
         assert not core.pending_bank_statement_amounts(ledger)
         assert tuple(ledger.execute("SELECT id,ref,date,category,note FROM transactions WHERE amount=?", (amount,)).fetchone()) == (
             *payment, "einnahme_sonstige", "Reviewed",
@@ -856,6 +866,109 @@ def test_paginated_unbalanced_payments_keep_a_proven_second_payment(sandbox, sep
             assert ledger.execute(
                 "SELECT count(DISTINCT provider_ref) FROM bank_import_facts JOIN transactions USING(ref) WHERE amount=119",
             ).fetchone()[0] == 2
+
+
+def _sync_bank_pages(ledger, pages):
+    import core
+
+    class PaginatedBank(StubProvider):
+        def request(self, method, path, *, query=None, data=None):
+            index = int(query.get("continuation_key", "0"))
+            response = {"transactions": pages[index]}
+            if index + 1 < len(pages):
+                response["continuation_key"] = str(index + 1)
+            return response
+
+    provider = PaginatedBank(APP_ID, b"fixture-key")
+    assessments = []
+    rows, _ = transaction_rows("account-a", provider.transactions(ACCOUNT, None, "2026-11-23"),
+                               assessments=assessments, ledger=ledger)
+    return core.import_bank_rows(ledger, rows, require_fx=True, auto_match=False, assessments=assessments)["imported"]
+
+
+def _bank_motion(day, amount, balance, label, **fields):
+    return bank_row(
+        booking_date=day, value_date=day, transaction_date=day,
+        credit_debit_indicator="CRDT" if amount > 0 else "DBIT",
+        transaction_amount={"amount": str(abs(amount)), "currency": "EUR"},
+        balance_after_transaction={"amount": str(balance), "currency": "EUR"} if balance is not None else None,
+        transaction_id=label, remittance_information=[label], **fields,
+    )
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+@pytest.mark.parametrize("ending", [96, 215])
+@pytest.mark.parametrize("packet", ["split", "reversed", "single"])
+def test_same_day_balance_can_prove_two_paginated_payments_without_balances(sandbox, sign, ending, packet):
+    import core
+
+    day = "2026-11-20"
+    opening = _bank_motion("2026-11-19", 10 * sign, 0, "Opening", entry_reference="opening")
+    receipt = _bank_motion(day, 119 * sign, None, "Payment", entry_reference="payment", reference_number="invoice")
+    other = _bank_motion(day, -23 * sign, ending * sign, "Fee", entry_reference="fee")
+    echo = receipt | {"entry_reference": None, "transaction_id": "rotated"}
+    split = [[opening, receipt, other], [echo]]
+    pages = [[opening, receipt, other, echo]] if packet == "single" else split
+    if packet == "reversed":
+        pages.reverse()
+    count = 4 if ending == 215 else 3
+    pending = [] if count == 4 else [("pending", 119 * sign)]
+    with closing(core.db()) as ledger:
+        assert _sync_bank_pages(ledger, pages) == count
+        saved = [tuple(row) for row in ledger.execute("SELECT id,ref FROM transactions WHERE amount=? ORDER BY id", (119 * sign,))]
+        assert len(saved) == count - 2
+        core.set_tx_category(ledger, saved[0][0], "einnahme_sonstige", "Checked")
+        for reply in (pages[::-1], split, [[opening, receipt, other]]):
+            assert _sync_bank_pages(ledger, reply) == 0
+            assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (
+                count, (119 * (count - 2) - 13) * sign,
+            )
+            assert [(row["state"], row["amount"]) for row in core.pending_bank_statement_amounts(ledger)] == pending
+        assert [tuple(row) for row in ledger.execute("SELECT id,ref FROM transactions WHERE amount=? ORDER BY id", (119 * sign,))] == saved
+        assert tuple(ledger.execute("SELECT category,note FROM transactions WHERE id=?", (saved[0][0],)).fetchone()) == (
+            "einnahme_sonstige", "Checked",
+        )
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+@pytest.mark.parametrize("sparse", [False, True])
+@pytest.mark.parametrize("seed", [False, True])
+@pytest.mark.parametrize("packet", ["split", "reversed", "single"])
+def test_paginated_balance_proof_uses_a_dated_and_undated_peer_once(sandbox, sign, sparse, seed, packet):
+    import core
+
+    subject = _bank_motion("2026-11-20", -119 * sign, -119 * sign, "Payment")
+    small = _bank_motion("2026-11-20", 3 * sign, -116 * sign, "Small payment", entry_reference="small")
+    peer = _bank_motion("2026-11-22", 119 * sign, 3 * sign, "Later payment", entry_reference="later")
+    subject_copy = subject | {"transaction_id": "renewed-one"}
+    peer_copy = peer | {"transaction_id": "renewed-two", "booking_date": None}
+    if sparse:
+        subject_copy["balance_after_transaction"] = None
+        peer_copy["entry_reference"] = None
+    base = [subject, small, peer]
+    split = [base, [subject_copy, peer_copy]]
+    pages = [[*base, subject_copy, peer_copy]] if packet == "single" else split
+    if packet == "reversed":
+        pages.reverse()
+    with closing(core.db()) as ledger:
+        if seed:
+            assert _sync_bank_pages(ledger, [base]) == 3
+        assert _sync_bank_pages(ledger, pages) == (0 if seed else 3)
+        saved = tuple(ledger.execute("SELECT id,ref,date FROM transactions WHERE amount=?", (-119 * sign,)).fetchone())
+        core.set_tx_category(ledger, saved[0], "einnahme_sonstige", "Checked")
+        for reply in (pages[::-1], split, [base]):
+            assert _sync_bank_pages(ledger, reply) == 0
+            assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (3, 3 * sign)
+            notices = [(row["state"], row["amount"]) for row in core.pending_bank_statement_amounts(ledger)]
+            assert notices == ([("pending", -119 * sign)] if sparse else [])
+        if sparse:
+            opening = _bank_motion("2026-11-19", 10 * sign, 0, "Opening", entry_reference="opening")
+            assert _sync_bank_pages(ledger, [[opening, *base]]) == 1
+            assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (4, 13 * sign)
+            assert core.pending_bank_statement_amounts(ledger) == []
+        assert tuple(ledger.execute("SELECT id,ref,date,category,note FROM transactions WHERE amount=?", (-119 * sign,)).fetchone()) == (
+            *saved, "einnahme_sonstige", "Checked",
+        )
 
 
 @pytest.mark.parametrize("extra_payment", [False, True])

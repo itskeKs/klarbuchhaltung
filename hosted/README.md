@@ -120,7 +120,10 @@ for multiple occurrences.
 Value and transaction dates can help identify a movement or place it when
 its booking date is missing.
 Movements on the same known booking day can follow any order consistent
-with the reported balances.
+with the reported balances. A balance on that day can establish the number
+of payments even when those payments have no individual balances. When the
+possible counts still differ, the extra amount stays in review until a
+reported balance resolves it.
 When the statement proves one additional payment and leaves a further payment
 possible, **Zahlungen** includes the proven amount and shows the possible
 remainder separately.

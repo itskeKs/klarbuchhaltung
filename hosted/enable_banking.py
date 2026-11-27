@@ -2284,9 +2284,10 @@ class _StatementFetch:
                     alternatives[group].append(booking)
             if state == "pending" and details.get("page_family"):
                 options = [core._BankBooking(*facts[:-1], tuple(map(tuple, facts[-1]))) for _, facts in details["observations"]]
+                sparse_days = frozenset(booking.booked_day for booking in options if not booking.balance_key)
                 groups = {group for group_ids, _ in details["observations"] for group in group_ids}
                 for group in groups:
-                    pending_pages[group].append((index, details["occurrences"][1], options))
+                    pending_pages[group].append((index, details["occurrences"][1], sparse_days, options))
         current_balances = defaultdict(list)
         for row in self.drafts:
             if row.get("_fetch_page") is not None and _reported_balance(row):
@@ -2297,10 +2298,11 @@ class _StatementFetch:
         for index, row in enumerate(self.drafts):
             groups = row["bank_groups"].values()
             if row.get("_fetch_page") is not None:
-                matches = {(key, upper) for group in groups for key, upper, options in pending_pages[group]
+                matches = {(key, upper, sparse_days) for group in groups
+                           for key, upper, sparse_days, options in pending_pages[group]
                            if _matches_page_occurrence(row, options)}
                 if len(matches) == 1:
-                    pending_counts[index] = next(iter(matches))[1]
+                    pending_counts[index] = next(iter(matches))[1:]
             if row["_statement_balance"]:
                 continue
             candidates = core._bank_statement_group_bookings(conn, groups)
@@ -2327,7 +2329,8 @@ class _StatementFetch:
             if key in known[currency]:
                 row = row | {"_statement_balance": (currency, known[currency][key]), "balance_key": key}
             if index in pending_counts:
-                row = row | {"_pending_page_count": pending_counts[index]}
+                count, sparse_days = pending_counts[index]
+                row = row | {"_pending_page_count": count, "_pending_sparse_days": sparse_days}
             drafts.append(row | {"bank_groups": row["bank_groups"].copy(), "prior_refs": row["prior_refs"].copy()})
         overlaps = [overlap for state, amount, currency, details in saved if state in {"unplaced", "confirmed"}
                     and (overlap := _overlap_proof_rows(conn, self.account_key, amount, currency, details, drafts))]
@@ -2531,6 +2534,25 @@ def _signed_edge_variants(edge, sparse, count, complete):
             yield known, [*([edge] * known), *(((row["booked_day"], None, None), row) for row in gaps)]
 
 
+def _balance_witness_groups(rows, currency):
+    """Use corroborated versions of a bank witness as one minimum occurrence."""
+    consumed = set()
+    provider_reports = sum(row.get("_fetch_page") is not None for row in rows)
+    observations = _statement_review_observations(rows, currency) if provider_reports > 1 else ()
+    for representative, versions, origins in observations:
+        if sum(row.get("_fetch_page") is not None for row in versions) < 2:
+            continue
+        consumed.update(origins)
+        representative["bank_groups"] = {day: group for row in versions for day, group in row["bank_groups"].items()}
+        copies = [row for row in versions if row["_statement_sources"] != representative["_statement_sources"]]
+        yield [representative, *sorted(copies, key=_balance_report_preference)]
+    exact = defaultdict(list)
+    for index, row in enumerate(rows):
+        if index not in consumed:
+            exact[row["_amount_key"], _statement_shape(row)].append(row)
+    yield from exact.values()
+
+
 def _supported_edge_count(versions, observed):
     """Find the occurrence counts compatible with the signed statement window."""
     first = versions[0]
@@ -2546,12 +2568,19 @@ def _supported_edge_count(versions, observed):
     opening = first["_statement_balance"][1] - amount
     sparse = [row for row in versions if not _reported_balance(row)]
     complete = len(versions) - len(sparse)
+    previous = max(row.get("_pending_page_count", 0) for row in versions)
+    if previous > _STATEMENT_PLACEMENT_BUDGET:
+        return None
+    saved_days = set().union(*(row.get("_pending_sparse_days", ()) for row in versions))
+    if previous > len(versions) and len(saved_days) == 1:
+        # The prior unsigned report need not occur in a weaker response.
+        # Recheck its placement, but only actual reports can be imported.
+        sparse.extend([{"booked_day": next(iter(saved_days)), "_statement_balance": None, "amount": first["amount"]}]
+                      * (previous - len(versions)))
     dated = first["booked_day"] if sparse else day
     edge = ((dated, None, None), first)
-    witness_groups = defaultdict(list)
-    for row in observed:
-        witness_groups[row["_amount_key"], _statement_shape(row)].append(row)
-    witnesses = tuple(witness_groups.values())
+    witnesses = tuple(_balance_witness_groups(observed, first["currency"]))
+    paginated = bool(previous or all(row.get("_fetch_page") is not None for row in versions))
     counts = (1,) * len(witnesses)
     pending = [counts]
     checked = {counts}
@@ -2567,14 +2596,15 @@ def _supported_edge_count(versions, observed):
             # edge at this balance. Its actual position is tested below.
             gaps = len(peers) - len(signed)
             minimum = max(1, -1 - departure - gaps - len(sparse))
-            maximum = min(max(2, len(versions)), 1 - departure + gaps + 2 * len(sparse))
+            maximum = min(max(2, complete + len(sparse)), 1 - departure + gaps + 2 * len(sparse))
             peer_edges = [((row["booked_day"], None, None), row) for row in peers]
             for count in range(minimum, maximum + 1):
                 for known, subjects in _signed_edge_variants(edge, sparse, count, complete):
                     if sparse and trials >= _STATEMENT_PLACEMENT_BUDGET:
                         return None
                     trials += 1
-                    candidates = range(len(peer_edges) + known, len(peer_edges) + len(subjects))
+                    candidates = [len(peer_edges) + index for index in range(known, len(subjects))
+                                  if not paginated or not subjects[index][0][0]]
                     fits = _review_joint_trail(first["currency"], [*peer_edges, *subjects], (), sparse_occurrences=candidates)
                     if fits is None:
                         return None
@@ -2914,13 +2944,13 @@ def _unbalanced_page_support(versions, peers, minimum, related):
             representatives.extend(min(group, key=_balance_report_preference) for group in families)
             selected.difference_update(origins)
     unrelated = [row for row in peers if row["_report_index"] in selected]
-    evidence = [*unrelated, *representatives]
-    dated_checkpoints = {row["booked_day"] for row in unrelated if row["booked_day"] and _reported_balance(row)}
-    if (len(peers) + len(versions) > _STATEMENT_PLACEMENT_BUDGET
-            or not any(before < day for before in dated_checkpoints) or not any(after > day for after in dated_checkpoints)):
+    independent = [copies[0] for copies in _balance_witness_groups(unrelated, versions[0]["currency"])]
+    evidence = [*independent, *representatives]
+    checkpoint_days = [row["booked_day"] for row in independent if row["booked_day"] and _reported_balance(row)]
+    if (len(peers) + len(versions) > _STATEMENT_PLACEMENT_BUDGET or len(checkpoint_days) < 2
+            or (day not in checkpoint_days and not min(checkpoint_days) < day < max(checkpoint_days))):
         return set(), evidence
-    independent = {(row["_amount_key"], _statement_shape(row)): row for row in unrelated}
-    witnesses = [((row["booked_day"], None, None), row) for row in independent.values()]
+    witnesses = [((row["booked_day"], None, None), row) for row in independent]
     choices = [list(islice(_unbalanced_placements(group, lower), _STATEMENT_PLACEMENT_BUDGET + 1))
                for group, lower in [(versions, minimum), *coupled]]
     supported = set()
@@ -2928,8 +2958,10 @@ def _unbalanced_page_support(versions, peers, minimum, related):
         if trial >= _STATEMENT_PLACEMENT_BUDGET:
             return set(), evidence
         motions = [*witnesses, *subject, *(motion for group in companions for motion in group)]
-        fits = _review_joint_trail(versions[0]["currency"], motions, (),
-                                  sparse_occurrences=range(len(witnesses), len(motions)))
+        # A recorded BOOK day can put an unsigned movement before or after
+        # the last numeric checkpoint on that day. Keep both placements.
+        constrained = [index for index in range(len(witnesses), len(motions)) if not motions[index][0][0]]
+        fits = _review_joint_trail(versions[0]["currency"], motions, (), sparse_occurrences=constrained)
         if fits is None:
             return set(), evidence
         if fits:
@@ -2964,15 +2996,15 @@ def _reconcile_balance_reports(account_key, drafts, account_rows, assessments, t
     page_families = []
     for families, contested in unbalanced:
         versions = [*(row for group in families for row in group), *contested]
-        separate_pages = len({row["_fetch_page"] for row in versions}) > 1
-        if (separate_pages or any(row.get("_pending_page_count") for row in versions)) and not independently_reviewed(versions):
+        if (len(versions) > 1 or any(row.get("_pending_page_count") for row in versions)) and not independently_reviewed(versions):
             page_families.append((versions, families))
     for versions, families in page_families:
         origins = {row["_report_index"] for row in versions}
         observed = [row for row in account_by_currency[versions[0]["currency"]] if row["_report_index"] not in origins]
         related = ((other, groups) for other, groups in page_families if other is not versions)
         supported, peers = _unbalanced_page_support(versions, observed, len(families), related)
-        if len({row["_fetch_page"] for row in versions}) == 1 and (len(supported) != 1 or min(supported) > len(versions)):
+        separate_pages = len({row["_fetch_page"] for row in versions}) > 1
+        if not separate_pages and (not supported or min(supported) > len(versions)):
             continue
         if not supported:
             references = {row["provider_ref"] for row in versions}
@@ -3027,8 +3059,7 @@ def _reconcile_balance_reports(account_key, drafts, account_rows, assessments, t
         first = versions[0]
         origins = {row["_report_index"] for row in versions}
         observed = [row for row in account_by_currency[first["currency"]] if row["_report_index"] not in origins]
-        pages = {row.get("_fetch_page") for row in versions}
-        paginated = len(pages) > 1 and None not in pages
+        paginated = all(row.get("_fetch_page") is not None for row in versions)
         if paginated and first["booked_day"]:
             # A settled statement may contain previously witnessed movements
             # on this day that a short fetch no longer returns.
