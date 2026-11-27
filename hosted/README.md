@@ -102,8 +102,9 @@ still supports several counts, the importer books the supported minimum.
 Any possible additional amount appears in Payments for review outside the
 totals until further bank evidence settles it. When a later page omits a
 balance, the same signed statement can establish the total count across
-several compatible payments. Reference and counterparty details can help
-identify a payment when they are available. A short sync that cannot resolve an
+several compatible payments. An additional observation without a balance
+can support another payment when it connects reported balances. A bank
+reference can identify a report even when another copy omits it. A short sync that cannot resolve an
 amended report against the established booking flags it for review and
 preserves the original amount and assignment. Updated bank descriptions
 can still corroborate an earlier statement when the monetary facts agree.

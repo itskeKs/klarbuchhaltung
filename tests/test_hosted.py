@@ -286,12 +286,23 @@ def reported_balance_pair():
     return credit, debit
 
 
-def test_two_hosted_services_keep_balance_proven_overlap_payments_once(sandbox, monkeypatch):
+@pytest.mark.parametrize("redact_reference", [False, True])
+def test_two_hosted_services_keep_balance_proven_overlap_payments_once(sandbox, monkeypatch, redact_reference):
     import core
     from hosted.bank_service import BankingService
 
     booked = reported_balance_pair()
+    if redact_reference:
+        booked = tuple(row | {"entry_reference": row["transaction_id"], "reference_number": "invoice-" + row["transaction_id"]}
+                       for row in booked)
     repeated = []
+
+    def overlap_copy(row, lookup):
+        copy = row | {"transaction_id": lookup}
+        if redact_reference:
+            for field in ("entry_reference", "reference_number", "balance_after_transaction"):
+                copy.pop(field, None)
+        return copy
 
     class PaginatedBank(StubProvider):
         auth_origin = "https://tilisy.enablebanking.com"
@@ -309,7 +320,7 @@ def test_two_hosted_services_keep_balance_proven_overlap_payments_once(sandbox, 
         workspace = sandbox / who
         workspace.mkdir()
         monkeypatch.setattr(core, "DB_PATH", workspace / "bookkeeping.db")
-        repeated[:] = [booked[1] | {"transaction_id": None}] if index else []
+        repeated[:] = [overlap_copy(booked[1], None)] if index else []
         service = BankingService(workspace, workspace, SITE + "/api/bank/callback", client_factory=PaginatedBank)
         service.save_credentials(APP_ID, b"fixture-key")
         begin = service.begin(who, "DE", BANK, "business")
@@ -324,7 +335,7 @@ def test_two_hosted_services_keep_balance_proven_overlap_payments_once(sandbox, 
 
     for index, (db_path, payment, debit_id, service) in enumerate(receipts):
         monkeypatch.setattr(core, "DB_PATH", db_path)
-        repeated[:] = [booked[0] | {"transaction_id": "renewed"}, booked[1] | {"transaction_id": None}]
+        repeated[:] = [overlap_copy(booked[0], "renewed"), overlap_copy(booked[1], None)]
         assert service.sync(force=True) == 0
         assert service.consents()[0]["skipped"] == 0
         repeated.clear()
@@ -338,6 +349,7 @@ def test_two_hosted_services_keep_balance_proven_overlap_payments_once(sandbox, 
     credit, debit = booked
     credit = credit | {"value_date": credit["booking_date"]}
     opening = credit | {"booking_date": "2026-11-19", "transaction_date": "2026-11-19", "transaction_id": "opening",
+                        "entry_reference": None, "reference_number": None,
                         "remittance_information": ["Opening"], "transaction_amount": {"amount": "10", "currency": "EUR"},
                         "balance_after_transaction": {"amount": "0", "currency": "EUR"}}
     booked = (opening, credit, debit)
@@ -593,7 +605,8 @@ def test_closed_balance_path_learns_amended_reference_less_observation(sandbox, 
 @pytest.mark.parametrize("seed", [False, True])
 @pytest.mark.parametrize("reverse", [False, True])
 @pytest.mark.parametrize("sign", [-1, 1])
-def test_balance_path_reconciles_a_sparse_page_copy(sandbox, position, seed, reverse, sign):
+@pytest.mark.parametrize("referenced", ["neither", "complete", "sparse", "both"])
+def test_balance_path_reconciles_a_sparse_page_copy(sandbox, position, seed, reverse, sign, referenced):
     import core
 
     page = list(reported_balance_pair())
@@ -603,6 +616,12 @@ def test_balance_path_reconciles_a_sparse_page_copy(sandbox, position, seed, rev
             balance = row["balance_after_transaction"]
             row["balance_after_transaction"] = balance | {"amount": str(-int(balance["amount"]))}
     sparse = page[position] | {"transaction_id": "renewed", "balance_after_transaction": None}
+    if referenced in {"complete", "both"}:
+        page[position]["entry_reference"] = "bank-ref"
+        page[position]["reference_number"] = "creditor-ref"
+    if referenced in {"sparse", "both"}:
+        sparse["entry_reference"] = "bank-ref"
+        sparse["reference_number"] = "creditor-ref"
     overlap = [*page, sparse]
     with closing(core.db()) as ledger:
         def sync(items):
@@ -628,7 +647,8 @@ def test_balance_path_reconciles_a_sparse_page_copy(sandbox, position, seed, rev
 @pytest.mark.parametrize("sign", [-1, 1])
 @pytest.mark.parametrize("third", [False, True])
 @pytest.mark.parametrize("seed", [False, True])
-def test_signed_balance_family_counts_sparse_reports_without_guessing_their_origin(sandbox, sign, third, seed):
+@pytest.mark.parametrize("window", ["both", "before", "after"])
+def test_signed_balance_family_counts_sparse_reports_without_guessing_their_origin(sandbox, sign, third, seed, window):
     import core
 
     credit, fee = reported_balance_pair()
@@ -644,9 +664,13 @@ def test_signed_balance_family_counts_sparse_reports_without_guessing_their_orig
             if balance := row["balance_after_transaction"]:
                 row["balance_after_transaction"] = balance | {"amount": str(-int(balance["amount"]))}
     clean = [opening, credit, second, *([sparse] if third else []), fee]
-    repeated = [*clean, sparse | {"transaction_id": "renewed"}]
-    reused_lookup = [row | {"transaction_id": credit["transaction_id"]} for row in repeated if row is not opening and row is not fee]
-    reused_lookup = [opening, *reused_lookup, fee]
+    shown = clean if window == "both" else clean[:-1] if window == "before" else clean[1:]
+    repeated = [*shown, sparse | {"transaction_id": "renewed"}]
+    reused_lookup = [row if row is opening or row is fee else row | {"transaction_id": credit["transaction_id"]} for row in repeated]
+    count = len(clean) if seed else len(shown) - int(third and window == "before")
+    amount = 344 if third else 225
+    if not seed and window != "both":
+        amount += 23 - 119 * int(third) if window == "before" else -10
     with closing(core.db()) as ledger:
         def sync(page):
             assessments = []
@@ -657,14 +681,45 @@ def test_signed_balance_family_counts_sparse_reports_without_guessing_their_orig
 
         if seed:
             assert sync(clean) == len(clean)
-        assert sync(reused_lookup[::-1]) == (0 if seed else len(clean))
+        assert sync(reused_lookup[::-1]) == (0 if seed else count)
+        assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (count, amount * sign)
+        old = [tuple(row) for row in ledger.execute("SELECT id,ref,date,amount FROM transactions ORDER BY id")]
+        assert sync(repeated) == sync(reused_lookup) == 0
+        assert [tuple(row) for row in ledger.execute("SELECT id,ref,date,amount FROM transactions ORDER BY id")] == old
+        assert sync(clean) == len(clean) - count
         assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (
             len(clean), (344 if third else 225) * sign,
         )
         old = [tuple(row) for row in ledger.execute("SELECT id,ref,date,amount FROM transactions ORDER BY id")]
-        assert sync(repeated) == sync(clean) == sync(reused_lookup) == 0
+        assert sync(reused_lookup) == 0
         assert not core.pending_bank_statement_amounts(ledger)
         assert [tuple(row) for row in ledger.execute("SELECT id,ref,date,amount FROM transactions ORDER BY id")] == old
+
+
+@pytest.mark.parametrize("distinct_payer", [False, True])
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_equal_signed_payments_can_corroborate_a_sparse_copy(sandbox, distinct_payer, sign):
+    import core
+
+    first, _ = reported_balance_pair()
+    first["entry_reference"] = "first"
+    second = first | {"entry_reference": "second", "transaction_id": "another",
+                      "balance_after_transaction": {"amount": "238", "currency": "EUR"}}
+    if distinct_payer:
+        second["debtor_account"] = {"iban": "DE00OTHER"}
+    sparse = first | {"entry_reference": None, "transaction_id": "overlap", "balance_after_transaction": None}
+    if sign < 0:
+        for row in (first, second, sparse):
+            row["credit_debit_indicator"] = "DBIT"
+            row["creditor_account"] = row["debtor_account"]
+            if balance := row["balance_after_transaction"]:
+                row["balance_after_transaction"] = balance | {"amount": str(-int(balance["amount"]))}
+    with closing(core.db()) as ledger:
+        for page, count in (([first, second, sparse], 2), ([sparse, second, first], 0), ([first, second], 0)):
+            rows, warnings = transaction_rows("account-a", page, ledger=ledger)
+            result = core.import_bank_rows(ledger, rows, require_fx=True, auto_match=False)
+            assert (result["imported"], warnings + result["ambiguous"]) == (count, int(not distinct_payer and len(page) == 3))
+            assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (2, 238 * sign)
 
 
 def test_signed_balance_family_accepts_complementary_dates_on_a_sparse_copy(sandbox):

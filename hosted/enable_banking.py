@@ -1481,7 +1481,7 @@ def _review_predecessors(dates, axes):
     return before
 
 
-def _review_joint_trail(currency, movements, axes):
+def _review_joint_trail(currency, movements, axes, *, sparse_occurrences=()):
     """Check balances against posting order and compatible secondary dates."""
     before = _review_predecessors([days for days, _ in movements], axes)
 
@@ -1489,11 +1489,16 @@ def _review_joint_trail(currency, movements, axes):
     balances = [balance[1] if (balance := row["_statement_balance"]) and balance[0] == currency else None
                 for _, row in movements]
     order = sorted(range(len(movements)), key=lambda index: balances[index] is None)
+    known = sum(1 << index for index, balance in enumerate(balances) if balance is not None) if sparse_occurrences else 0
 
     def successors(remaining, running):
         for index in order:
             bit = 1 << index
             if not remaining & bit or before[index] & remaining:
+                continue
+            # An optional copy only adds an occurrence when it can connect
+            # reported balances. An open end can absorb any signed amount.
+            if index in sparse_occurrences and (running is None or not remaining & known):
                 continue
             balance = balances[index]
             ending = None if running is None else running + amounts[index]
@@ -2476,10 +2481,7 @@ def _supported_edge_count(versions, observed):
     first = versions[0]
     day = first["booked_day"] if all(row["booked_day"] for row in versions) else None
     if day:
-        days = {row["booked_day"] for row in observed if row["booked_day"]}
-        start = max((other for other in days if other < day), default=day)
-        end = min((other for other in days if other > day), default=day)
-        observed = [row for row in observed if not row["booked_day"] or start <= row["booked_day"] <= end]
+        observed = _booked_balance_window(observed, day)
     if len(observed) > _STATEMENT_PLACEMENT_BUDGET or not any(_reported_balance(row) for row in observed):
         return None
 
@@ -2517,7 +2519,8 @@ def _supported_edge_count(versions, observed):
                     if sparse and trials >= _STATEMENT_PLACEMENT_BUDGET:
                         return None
                     trials += 1
-                    fits = _review_joint_trail(first["currency"], [*peer_edges, *subjects], ())
+                    candidates = range(len(peer_edges) + known, len(peer_edges) + len(subjects))
+                    fits = _review_joint_trail(first["currency"], [*peer_edges, *subjects], (), sparse_occurrences=candidates)
                     if fits is None:
                         return None
                     if fits:
@@ -2603,17 +2606,16 @@ def _signed_observation_groups(drafts, shared):
         yield from groups
 
 
-def _dated_balance_window(rows, day):
-    before = [row["booked_day"] for row in rows if row["booked_day"] and row["booked_day"] < day and _reported_balance(row)]
-    after = [row["booked_day"] for row in rows if row["booked_day"] and row["booked_day"] > day and _reported_balance(row)]
-    if before and after:
-        start, end = max(before), min(after)
-        return [row for row in rows if not row["booked_day"] or start <= row["booked_day"] <= end]
-    return []
+def _booked_balance_window(rows, day):
+    days = {row["booked_day"] for row in rows if row["booked_day"]}
+    start = max((other for other in days if other < day), default=day)
+    end = min((other for other in days if other > day), default=day)
+    return [row for row in rows if not row["booked_day"] or start <= row["booked_day"] <= end]
 
 
 def _shared_sparse_occurrences(groups, sparse, account_rows):
     """Count unbalanced reports in a family without claiming which edge each repeats."""
+    contested = {row["_report_index"] for row in sparse}
     complete = [[row for row in group if _reported_balance(row)] for group in groups]
     sparse = [*sparse, *(row for group in groups for row in group if not _reported_balance(row))]
     first = complete[0][0]
@@ -2621,12 +2623,14 @@ def _shared_sparse_occurrences(groups, sparse, account_rows):
         row["date"] for group in complete for row in group
     }
     if len(days) != 1:
-        return set(), []
+        return set(), [], 0
     origins = {row["_report_index"] for row in (*sparse, *(row for group in complete for row in group))}
     observed = [row for row in account_rows if row["currency"] == first["currency"] and row["_report_index"] not in origins]
-    window = _dated_balance_window(observed, next(iter(days)))
-    if not window or len(window) + len(origins) > _STATEMENT_PLACEMENT_BUDGET:
-        return set(), []
+    window = _booked_balance_window(observed, next(iter(days)))
+    if len(window) + len(origins) > _STATEMENT_PLACEMENT_BUDGET:
+        return set(), [], 0
+    if window and not any(_reported_balance(row) for row in window):
+        return set(), [], 0
     independent = {(row["_amount_key"], _statement_shape(row)): row for row in window}
     peers = [((row["booked_day"], None, None), row) for row in independent.values()]
     by_day = defaultdict(list)
@@ -2637,20 +2641,24 @@ def _shared_sparse_occurrences(groups, sparse, account_rows):
     preferred = None
     for trial, selected in enumerate(counts):
         if trial >= _STATEMENT_PLACEMENT_BUDGET:
-            return set(), []
+            return set(), [], 0
         reports = [row for rows, count in zip(buckets, selected) for row in rows[:count]]
         subject = [((row["booked_day"], None, None), row) for row in reports]
-        fits = _review_joint_trail(first["currency"], [*peers, *subject], ())
+        candidates = {len(peers) + index for index, row in enumerate(reports) if not _reported_balance(row)}
+        fits = _review_joint_trail(first["currency"], [*peers, *subject], (), sparse_occurrences=candidates)
         if fits is None:
-            return set(), []
+            return set(), [], 0
         if fits:
             live = [row for row in reports if not _reported_balance(row)]
             if preferred is None or (len(reports), len(live)) < preferred[0]:
                 preferred = (len(reports), len(live)), live
     if preferred is None:
-        return set(), []
+        return set(), [], 0
     _, live = preferred
-    return {row["_report_index"] for row in sparse} - {row["_report_index"] for row in live}, live
+    dropped = {row["_report_index"] for row in sparse} - {row["_report_index"] for row in live}
+    # The signed payments alone can settle the count while leaving the
+    # sparse observation's identity unresolved.
+    return dropped, live, int(not window and bool(contested & dropped))
 
 
 def _balance_occurrence_reports(versions, count, anchored=None):
@@ -2734,8 +2742,9 @@ def _reconcile_balance_reports(account_key, drafts, account_rows, assessments, t
     groups = list(_signed_observation_groups(drafts, shared))
     retained_sparse = set()
     for family, sparse in shared:
-        dropped, live = _shared_sparse_occurrences(family, sparse, account_rows)
+        dropped, live, unidentified = _shared_sparse_occurrences(family, sparse, account_rows)
         omitted.update(dropped)
+        warnings += unidentified
         retained_sparse.update(row["_report_index"] for row in live)
         for row in live:
             replacements[row["_report_index"]] = row | {"_statement_edge_occurrence": True, "_statement_extra_sparse": True}
@@ -2744,7 +2753,8 @@ def _reconcile_balance_reports(account_key, drafts, account_rows, assessments, t
                                for currency, rows in account_by_currency.items()}
     for group in groups:
         versions = [row for row in group if row["_report_index"] not in omitted | retained_sparse]
-        if all(row["provider_ref"] for row in versions):
+        sparse = [row for row in versions if not _reported_balance(row)]
+        if not sparse and all(row["provider_ref"] for row in versions):
             continue
         # A separate statement assessment can already have established
         # independent canonical movements on the same signed edge.
@@ -2757,16 +2767,9 @@ def _reconcile_balance_reports(account_key, drafts, account_rows, assessments, t
         # preserve source occurrences until independent movements can
         # constrain whether the balance was reached again.
         has_context = any(
-            row["_amount_key"] != first["_amount_key"]
-            or (_reported_balance(row) not in (None, first["_statement_balance"]))
-            for row in observed if Decimal(row["amount"])
+            (row["_amount_key"] != first["_amount_key"] or balance not in (None, first["_statement_balance"]))
+            for row in observed if Decimal(row["amount"]) and ((balance := _reported_balance(row)) or not sparse)
         )
-        sparse = [row for row in versions if not _reported_balance(row)]
-        if sparse:
-            signed_peers = any(row["_amount_key"] != first["_amount_key"] and _reported_balance(row) for row in observed)
-            all_referenced = all(row["provider_ref"] for row in versions if _reported_balance(row))
-            if not signed_peers or (all_referenced and not _dated_balance_window(observed, first["date"])):
-                continue
         if not has_context:
             continue
         supported, proof_peers = _supported_edge_count(versions, observed) or ({}, ())
@@ -2784,7 +2787,7 @@ def _reconcile_balance_reports(account_key, drafts, account_rows, assessments, t
             omitted.update(dropped)
             warnings += 1
             continue
-        count = min(supported) if supported and (sparse or disputed or len(supported) == 1) else None
+        count = min(supported) if disputed or len(supported) == 1 else None
         if sparse and count is None:
             continue
         if count is None:
