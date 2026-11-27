@@ -2512,6 +2512,9 @@ def _record_bank_statement_assessments(conn, observations):
         observed_balances.update(row.get("_statement_observed_balances", ()))
         if observed_balances:
             details["balances"] = sorted(observed_balances.items())
+        overlap = row.get("_statement_overlap") or previous_details.get("overlap")
+        if overlap:
+            details["overlap"] = overlap
         if previous == "unplaced":
             if state == "pending":
                 continue

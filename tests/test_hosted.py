@@ -1379,10 +1379,18 @@ def test_statement_context_compares_both_payment_counts_without_dropping_sparse_
         net -= 10
 
     batch = [first, reversal, second, *neighbors]
+    unanchored_before = outcome == "two" and context == "before" and day_field == "transaction_date"
+    unanchored_one = outcome == "one" and day_field == "transaction_date"
     with closing(core.db()) as ledger:
         def sync(page):
             mapper = (_confirmed_statement_rows if outcome == "two" and day_field == "transaction_date" and context != "before"
                       else transaction_rows)
+            if unanchored_before or unanchored_one:
+                assessments = []
+                rows, skipped = mapper("account-a", page, assessments=assessments)
+                result = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True, assessments=assessments)
+                warning = skipped + result["ambiguous"] or len(core.pending_bank_statement_amounts(ledger))
+                return result["imported"], warning
             rows, skipped = mapper("account-a", page)
             result = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True)
             return result["imported"], skipped + result["ambiguous"]
@@ -1398,10 +1406,14 @@ def test_statement_context_compares_both_payment_counts_without_dropping_sparse_
                 imported, warnings = sync(batch[:-1])
                 assert imported == len(neighbors) - 1 and warnings > 0
         expected_count = 1 + len(neighbors) + (2 if outcome == "two" else 1)
+        if unanchored_before:
+            expected_count -= 1
+            net -= 119
         if seed == "both":
             expected_count += 1
             net += 119
-        expected_warning = outcome == "ambiguous" or seed == "both" or (seed == "alternate" and day_field == "booking_date")
+        expected_warning = (outcome == "ambiguous" or seed == "both" or unanchored_before or unanchored_one
+                            or (seed == "alternate" and day_field == "booking_date"))
         if outcome == "ambiguous" and day_field == "booking_date" and not seed:
             expected_count -= 1
             net -= 119
@@ -1413,24 +1425,51 @@ def test_statement_context_compares_both_payment_counts_without_dropping_sparse_
             [first | {"balance_after_transaction": None}, *batch],
             [*batch, second | {"reference_number": None}],
         ))
-        for page in pages:
+        for replay, page in enumerate(pages):
             _, warnings = sync(page)
-            assert bool(warnings) == expected_warning
+            actual = tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone())
+            assert bool(warnings) == expected_warning, (replay, actual)
             if seed == "alternate":
-                assert warnings == int(day_field == "booking_date")
-            assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (
-                expected_count, net * ledger_sign,
-            )
+                assert warnings == int(day_field == "booking_date" or unanchored_one)
+            if unanchored_before:
+                assert [(row["state"], row["amount"]) for row in core.pending_bank_statement_amounts(ledger)] == [
+                    ("pending", 119 * ledger_sign),
+                ]
+            assert actual == (expected_count, net * ledger_sign)
             for booking_id, booking_ref, booking_date in saved:
                 assert tuple(ledger.execute(
                     "SELECT id, ref, date, category FROM transactions WHERE id = ?", (booking_id,),
                 ).fetchone()) == (booking_id, booking_ref, booking_date, "einnahme_sonstige")
         if outcome == "two":
-            assert sync([second, first]) == (0, 0)
+            assert sync([second, first]) == (0, int(unanchored_before))
             assert sync(batch[:-1])[0] == 0
             assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (
                 expected_count, net * ledger_sign,
             )
+
+    if unanchored_before:
+        supplies, fee, tail = neighbors
+        lower = [tail, supplies, fee, second, reversal]
+        higher = [*lower, first]
+        for path, total in ((lower, 86), (higher, 205)):
+            running = 205 * sign
+            for row in path:
+                amount = float(row["transaction_amount"]["amount"])
+                running += amount if row["credit_debit_indicator"] == "CRDT" else -amount
+                if balance := row["balance_after_transaction"]:
+                    assert running == float(balance["amount"])
+            assert running - 205 * sign == total * ledger_sign
+
+        closing_checkpoint = tail | dict.fromkeys(("booking_date", "value_date", "transaction_date"), "2026-11-28") | {
+            "entry_reference": "closing-checkpoint", "reference_number": "closing-checkpoint", "transaction_id": "closing-checkpoint",
+            "remittance_information": ["Closing checkpoint"], "balance_after_transaction": {"amount": str(10 * sign), "currency": "EUR"},
+        }
+        proved = [*batch[:-1], tail | {"booking_date": "2026-11-19"}, closing_checkpoint]
+        decisions = []
+        mapped, _ = transaction_rows("account-a", proved, assessments=decisions)
+        assert [row["state"] for row in decisions] == ["confirmed"]
+        tested = [row for row in mapped if row["description"] != "Closing checkpoint"]
+        assert len(tested) == 6 and sum(float(row["amount"]) for row in tested) == 205 * ledger_sign
 
 
 def ambiguous_reference_statement(sign=1):
@@ -1451,11 +1490,11 @@ def ambiguous_reference_statement(sign=1):
     return [rent, reversal, later_rent, supplies, fee, closing_fee]
 
 
-def _confirmed_statement_rows(account, page):
+def _confirmed_statement_rows(account, page, *, assessments=None):
     """Give the mapper an independent opening, while testing the disputed period alone."""
     rent = next((row for row in page if row["remittance_information"] == ["Rent"]), None)
     if rent is None:
-        return transaction_rows(account, page)
+        return transaction_rows(account, page, assessments=assessments)
     earliest = min(date.fromisoformat(row[field]) for row in page
                    for field in ("booking_date", "value_date", "transaction_date") if row.get(field))
     preceding = []
@@ -1468,7 +1507,7 @@ def _confirmed_statement_rows(account, page):
                                   reference_number=label, transaction_id=label, credit_debit_indicator=original_direction,
                                   remittance_information=[label], transaction_amount={"amount": "10", "currency": "EUR"},
                                   balance_after_transaction={"amount": str(ending), "currency": "EUR"}))
-    rows, warnings = transaction_rows(account, [*preceding, *page])
+    rows, warnings = transaction_rows(account, [*preceding, *page], assessments=assessments)
     return [row for row in rows if row["description"] not in {"Opening receipt", "Opening reversal"}], warnings
 
 
@@ -1627,17 +1666,18 @@ def test_statement_review_preserves_independent_evidence(sandbox, copies):
         page = [*whole, whole[3] | changes[copies]]
     with closing(core.db()) as ledger:
         for response in (page, page[::-1]):
-            rows, warnings = _confirmed_statement_rows("account-a", response)
-            result = core.import_bank_rows(ledger, rows, require_fx=True)
+            decisions = [] if copies == "undated-option" else None
+            rows, warnings = _confirmed_statement_rows("account-a", response, assessments=decisions)
+            result = core.import_bank_rows(ledger, rows, require_fx=True, assessments=decisions or ())
             descriptions = [row[0] for row in ledger.execute("SELECT description FROM transactions WHERE amount = 119")]
             total = tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone())
             if copies in {"rotated-page", "many-pages"}:
                 assert total == (6, 205)
                 assert sorted(descriptions) == ["Kontoauszug prüfen", "Rent", "Supplies"]
             elif copies == "undated-option":
-                assert total == (5, 86)
-                assert sorted(descriptions) == ["Rent", "Supplies"]
-                assert warnings + result["ambiguous"] > 0
+                assert total == (6, 205)
+                assert sorted(descriptions) == ["Kontoauszug prüfen", "Rent", "Supplies"]
+                assert [(row["state"], row["amount"]) for row in core.pending_bank_statement_amounts(ledger)] == [("pending", 119)]
             else:
                 assert total == (6, 205)
                 assert sorted(descriptions) == ["Rent", "Supplies", "Supplies"]
@@ -1662,13 +1702,19 @@ def test_statement_review_keeps_economic_identity_on_corrected_data(sandbox, cor
 
     first, second = (corrected, original) if first_corrected else (original, corrected)
     with closing(core.db()) as ledger:
-        def sync(page):
+        def sync(page, expected=(6, 205)):
             rows, skipped = _confirmed_statement_rows("account-a", page)
             result = core.import_bank_rows(ledger, rows, require_fx=True)
-            assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (6, 205)
+            assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == expected
             return skipped + result["ambiguous"]
 
-        sync(first * 2)
+        if first_corrected and correction == "credit-booked":
+            # No BOOK-ordered path can reach the reported debit balances from
+            # the verified opening when all the credits are posted next day.
+            assert sync(first * 2, (5, 86)) > 0
+            sync(second * 2)
+        else:
+            sync(first * 2)
         saved = tuple(ledger.execute("SELECT id, ref, date FROM transactions WHERE description = 'Kontoauszug prüfen'").fetchone())
         core.set_tx_category(ledger, saved[0], "einnahme_sonstige")
         if correction == "later-entry-reference":
@@ -1933,8 +1979,10 @@ def test_scoped_statement_balance_constraints_resolve_sparse_observations(sign, 
         if variant == "ordinary":
             assert (len(rows), total, neutral, warnings) == (2, sign * 96, 0, 0)
         elif variant == "undated-same-day":
-            assert neutral == 0
-            assert warnings > 0
+            assert (len(rows), total, neutral, warnings) == (6, sign * 205, 1, 0)
+            assert sorted(row["description"] for row in rows if float(row["amount"]) == 119 * sign) == [
+                "Kontoauszug prüfen", "Rent", "Supplies",
+            ]
         else:
             assert (len(rows), total, neutral, warnings) == (6, sign * 205, 1, 0)
 
@@ -2539,6 +2587,87 @@ def test_statement_restore_keeps_other_fetch_assessments_for_the_same_account(sa
             ]
 
 
+@pytest.mark.parametrize("late", [False, True])
+@pytest.mark.parametrize("missing_witness", [None, 1, 5, "only changed", "only changed and unrelated", "older proof", "new balance"])
+def test_overlapping_reply_reuses_only_witnesses_from_the_proven_statement(sandbox, late, missing_witness):
+    import core
+
+    statement = [row | {"booking_date": "2026-11-30"} for row in ambiguous_reference_statement()]
+    statement[-1]["booking_date"] = "2026-12-01"
+    opening = statement[1] | dict.fromkeys(("booking_date", "value_date", "transaction_date"), "2026-10-31") | {
+        "entry_reference": "opening", "reference_number": "opening", "transaction_id": "opening",
+        "remittance_information": ["Opening checkpoint"],
+    }
+    partial = [row | {"booking_date": None} if i == 3 else row for i, row in enumerate(statement)]
+    complete = [row | {"booking_date": "2026-12-01" if late else "2026-11-30"} if i == 3 else row
+                for i, row in enumerate(statement) if i != missing_witness]
+    unrelated = missing_witness == "only changed and unrelated"
+    legacy = missing_witness == "older proof"
+    if isinstance(missing_witness, str):
+        complete = [complete[3]]
+    if missing_witness == "new balance":
+        complete[0]["balance_after_transaction"] = {"amount": "215", "currency": "EUR"}
+    if unrelated:
+        complete.append(statement[0] | dict.fromkeys(("booking_date", "value_date", "transaction_date"), "2026-12-02") | {
+            "entry_reference": "separate", "reference_number": "separate", "transaction_id": "separate",
+            "remittance_information": ["Separate payment"],
+            "balance_after_transaction": {"amount": "324", "currency": "EUR"},
+        })
+    with closing(core.db()) as ledger:
+        def sync(page):
+            assessments = []
+            rows, _ = transaction_rows("account-a", page, ledger=None if legacy else ledger, assessments=assessments)
+            return core.import_bank_rows(ledger, rows, require_fx=True, assessments=assessments)
+
+        assert sync([opening, *partial])["imported"] == 6
+        assert [(row["state"], row["amount"]) for row in core.pending_bank_statement_amounts(ledger)] == [("unplaced", 119)]
+        if legacy:
+            ledger.execute("UPDATE bank_statement_assessments SET details = json_remove(details, '$.overlap', '$.balances')")
+        old = tuple(ledger.execute("SELECT id,ref,date FROM transactions WHERE description='Rent'").fetchone())
+        core.set_tx_category(ledger, old[0], "einnahme_sonstige", "Checked statement")
+        for page, new in ((complete, 1 + unrelated), (complete[::-1], 0), (partial, 0)):
+            assert sync(page)["imported"] == new
+            monthly = [tuple(row) for row in ledger.execute("SELECT substr(date,1,7),count(*),sum(amount) FROM transactions "
+                                                           "WHERE date >= '2026-11-01' GROUP BY 1 ORDER BY 1")]
+            extra = 119 if unrelated else 0
+            assert monthly == ([("2026-11", 4, 96), ("2026-12", 2 + unrelated, 109 + extra)] if late else
+                               [("2026-11", 5, 215), ("2026-12", 1 + unrelated, -10 + extra)])
+            assert core.pending_bank_statement_amounts(ledger) == []
+            assert tuple(ledger.execute("SELECT id,ref,date,category FROM transactions WHERE id=?", (old[0],)).fetchone()) == (
+                *old, "einnahme_sonstige",
+            )
+
+
+@pytest.mark.parametrize("changed", ["fee", "later rent"])
+@pytest.mark.parametrize("sign", [-1, 1])
+@pytest.mark.parametrize("same_day", [False, True])
+@pytest.mark.parametrize("anchored", [False, True])
+def test_secondary_order_does_not_establish_a_surplus_or_its_purpose(sandbox, changed, sign, same_day, anchored):
+    import core
+
+    statement = [row | {"booking_date": "2026-11-30"} for row in ambiguous_reference_statement(sign)]
+    statement[-1]["booking_date"] = "2026-11-30" if same_day else "2026-12-01"
+    if changed == "fee":
+        statement[4].update(value_date="2026-11-20", transaction_date="2026-11-21")
+    else:
+        statement[2].update(value_date="2026-11-23", transaction_date="2026-11-23")
+    if anchored:
+        statement.insert(0, statement[1] | dict.fromkeys(("booking_date", "value_date", "transaction_date"), "2026-10-31") | {
+            "entry_reference": "opening", "reference_number": "opening", "transaction_id": "opening",
+        })
+    with closing(core.db()) as ledger:
+        for page in (statement, statement[::-1], statement * 2):
+            assessments = []
+            rows, _ = transaction_rows("account-a", page, ledger=ledger, assessments=assessments)
+            core.import_bank_rows(ledger, rows, require_fx=True, assessments=assessments)
+            actual = tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions WHERE date >= '2026-11-01'").fetchone())
+            assert actual == ((6, 205 * sign) if anchored else (5, 86 * sign))
+            assert ledger.execute("SELECT count(*) FROM transactions WHERE description='Kontoauszug prüfen'").fetchone()[0] == int(anchored)
+            assert [(row["state"], row["amount"]) for row in core.pending_bank_statement_amounts(ledger)] == (
+                [] if anchored else [("pending", 119 * sign)]
+            )
+
+
 def test_confirmed_ambiguous_year_boundary_is_counted_only_in_covering_range(sandbox, monkeypatch):
     import core
     from app import app
@@ -2727,7 +2856,7 @@ def test_one_page_replay_corrects_only_an_untouched_legacy_named_extra(sandbox, 
 
 @pytest.mark.parametrize("purpose", ["Rent", "Supplies"])
 @pytest.mark.parametrize("sign", [-1, 1])
-def test_new_independent_checkpoint_confirms_the_named_source_of_a_pending_receipt(sandbox, purpose, sign):
+def test_secondary_checkpoints_do_not_assign_the_source_of_a_proven_receipt(sandbox, purpose, sign):
     import core
 
     bare = ambiguous_reference_statement(sign)
@@ -2756,8 +2885,41 @@ def test_new_independent_checkpoint_confirms_the_named_source_of_a_pending_recei
         assert sync(bare) == 0
         assert core.pending_bank_statement_amounts(ledger) == []
         named = [row[0] for row in ledger.execute("SELECT description FROM transactions WHERE amount = ?", (119 * sign,))]
-        assert sorted(named) == sorted(("Rent", "Supplies", purpose))
+        assert sorted(named) == ["Kontoauszug prüfen", "Rent", "Supplies"]
         assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (9, 195 * sign)
+
+    # When the checkpoints are actual booking days, the source can be known:
+    # Rent either happens twice with the reversal between those days, or
+    # both Rent observations precede the only movement that lets Rent recur.
+    days = (19, 20, 21, 22, 22, 23) if purpose == "Rent" else (19, 21, 19, 21, 21, 23)
+    ordered = [row | {"booking_date": f"2026-11-{day}"} for row, day in zip(bare, days)]
+    rows, warnings = _confirmed_statement_rows("account-a", ordered)
+    assert (len(rows), sum(float(row["amount"]) for row in rows), warnings) == (6, 205 * sign, 0)
+    assert sorted(row["description"] for row in rows if float(row["amount"]) == 119 * sign) == sorted((
+        "Rent", "Supplies", purpose,
+    ))
+
+
+@pytest.mark.parametrize("same_day", [False, True])
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_opening_balance_does_not_make_an_intra_day_balance_the_close(sandbox, same_day, sign):
+    import core
+
+    statement = [row | {"booking_date": "2026-11-30"} for row in ambiguous_reference_statement(sign)]
+    statement[-1].update(booking_date="2026-11-30" if same_day else "2026-12-01",
+                         balance_after_transaction={"amount": str(86 * sign), "currency": "EUR"})
+    with closing(core.db()) as ledger:
+        for known_opening in (False, True, True):
+            assessments = []
+            if known_opening:
+                rows, _ = _confirmed_statement_rows("account-a", statement[::-1], assessments=assessments)
+            else:
+                rows, _ = transaction_rows("account-a", statement, assessments=assessments)
+            core.import_bank_rows(ledger, rows, require_fx=True, assessments=assessments)
+            assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (5, 86 * sign)
+            assert [(row["state"], row["amount"]) for row in core.pending_bank_statement_amounts(ledger)] == (
+                [("pending", 119 * sign)] if not known_opening or same_day else []
+            )
 
 
 @pytest.mark.parametrize("sign", [-1, 1])

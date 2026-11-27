@@ -84,6 +84,12 @@ the review without reposting the existing payments.
 An overlapping reply can still resolve the review when it omits a balance
 already observed for the same uniquely identified payment. An explicitly
 reported balance or conflicting bank fact is assessed as new evidence.
+A shorter reply can identify the booking date of a previously confirmed
+payment. Saved observations from that statement can support the decision
+without importing those movements again. Value and transaction dates can
+help identify a movement or place it when its booking date is missing.
+Movements on the same known booking day can follow any order consistent
+with the reported balances.
 When the statement proves one additional payment and leaves a further payment
 possible, **Zahlungen** includes the proven amount and shows the possible
 remainder separately.
