@@ -1934,6 +1934,15 @@ def _bank_statement_observation_alias(ref):
     return "statement-observation:" + ref
 
 
+def _bank_balance_hash(currency, balance):
+    raw = json.dumps((currency, str(balance.normalize()) if balance else "0"), separators=(",", ":"))
+    return sha256(raw.encode()).hexdigest()
+
+
+def _bank_balance_revision_key(ref, balance):
+    return f"statement-balance:{ref}:{balance}"
+
+
 def _remember_bank_booking(conn, ref, row):
     conn.execute("INSERT OR IGNORE INTO bank_import_identity (ref, booking_group) VALUES (?, ?)",
                  (ref, row["bank_group"]))
@@ -1943,6 +1952,10 @@ def _remember_bank_booking(conn, ref, row):
         observed = {*observed, row["ref"]}
         conn.executemany("INSERT OR IGNORE INTO bank_import_date_aliases (booking_group, ref) VALUES (?, ?)",
                          ((_bank_statement_observation_alias(alias), ref) for alias in observed))
+    if row.get("_bank_balance_revision") == ref:
+        conn.execute("INSERT OR IGNORE INTO bank_import_date_aliases VALUES (?, ?)", (
+            _bank_balance_revision_key(ref, row["balance_key"]), ref,
+        ))
     alternate = {pair for pair in row["counterparty_ids"] if pair != ("IBAN", row["counterparty_iban"])}
     identifiers = None
     if alternate:
@@ -1972,6 +1985,14 @@ def _bank_facts_conflict(row, old):
     return (any(row[field] and getattr(old, field) and row[field] != getattr(old, field)
                 for field in _BANK_IDENTITY_FIELDS if field not in _BANK_SECONDARY_DATES)
             or _bank_account_match(row["counterparty_ids"], old.counterparty_ids) is False)
+
+
+def _bank_balance_only_difference(row, old):
+    same_reference = old.provider_ref and row["provider_ref"] == old.provider_ref
+    same_invoice = (not (old.provider_ref and row["provider_ref"]) and old.creditor_ref and row["creditor_ref"] == old.creditor_ref)
+    return ((same_reference or same_invoice) and _bank_has_shared_date(row, old)
+            and _stored_secondary_match(row, old) is not False
+            and not _bank_facts_conflict(row | {"balance_key": old.balance_key}, old))
 
 
 def _bank_secondary_match(first, second):
@@ -2217,12 +2238,14 @@ def _bank_matches(conn, rows):
         },
     )
     by_provider = lookup("f.provider_ref = ?", {r["provider_ref"] for r in bank_rows if r["provider_ref"]})
-    by_alias = lookup("t.ref = ?", {ref for row in bank_rows for ref in row.get("_confirmed_reference_aliases", ())})
+    by_alias = lookup("t.ref = ?", {ref for row in bank_rows for ref in row.get("_confirmed_reference_aliases", ())}
+                      | {row["_bank_balance_revision"] for row in bank_rows if row.get("_bank_balance_revision")})
     options = {}
     posting_conflicts = set()
     corrections = {}
     amended_observations = set()
     proven_matches = {}
+    revised = {row["_bank_balance_revision"]: row["ref"] for row in bank_rows if row.get("_bank_balance_revision")}
     unconfirmed_payers = defaultdict(list)
     cohorts = defaultdict(list)
     for row in bank_rows:
@@ -2234,6 +2257,8 @@ def _bank_matches(conn, rows):
         aliases = row.get("_confirmed_reference_aliases", ())
         candidates = {old for old in same_reference if old.booked_day in row["bank_groups"]}
         candidates.update(old for ref in aliases for old in by_alias[ref])
+        if revision := row.get("_bank_balance_revision"):
+            candidates.update(by_alias[revision])
         for group in row["bank_groups"].values():
             candidates.update(by_day[group])
         ref = row["ref"]
@@ -2244,6 +2269,7 @@ def _bank_matches(conn, rows):
                 candidates.add(existing)
                 break
             ref = _occupied_bank_reference(ref, row)
+        candidates = {old for old in candidates if revised.get(old.ref, row["ref"]) == row["ref"]}
         source_refs = _bank_source_refs(row, candidates)
         observed_refs = _bank_observed_secondary_refs(row, by_day)
         overlaps = {old for old in candidates if _bank_balance_overlap(row, old)}
@@ -2268,6 +2294,8 @@ def _bank_matches(conn, rows):
             proven_matches[row["ref"]] = original.ref
         confirmed = {old.ref for old in candidates if old.ref in aliases
                      and not _bank_facts_conflict(row | {"provider_ref": old.provider_ref}, old)}
+        if revision := row.get("_bank_balance_revision"):
+            confirmed.add(revision)
         if row["ref"] in proven_matches:
             confirmed.add(proven_matches[row["ref"]])
         ranked = [(old, rank) for old in candidates
@@ -2434,6 +2462,23 @@ def _bank_statement_group_bookings(conn, groups):
               + "SELECT ref FROM bank_import_identity WHERE booking_group = ?1 "
               + "UNION ALL SELECT ref FROM bank_import_date_aliases WHERE booking_group = ?1)")
     return {_bank_booking(record) for group in groups for record in conn.execute(select, (group,))}
+
+
+def _bank_account_bookings(conn, account, currency, first, last, *, include_undated=False):
+    """Load booked movements using the same account/amount group as the import."""
+    query = ("SELECT t.ref,t.description," + ",".join(f"f.{field}" for field in _BANK_IDENTITY_FIELDS)
+             + ",f.counterparty_ids,t.amount,t.date FROM bank_import_facts f JOIN transactions t USING(ref) "
+             "WHERE t.currency=? AND " + ("COALESCE(f.booked_day,t.date)" if include_undated else "f.booked_day") + " BETWEEN ? AND ?")
+    for record in conn.execute(query, (currency, first, last)):
+        booking = _bank_booking(record[:-2])
+        amount = Decimal(str(record[-2]))
+        raw = json.dumps((account, booking.booked_day or record[-1], str(amount.normalize()), currency),
+                         ensure_ascii=False, separators=(",", ":"))
+        group = sha256(raw.encode()).hexdigest()
+        if conn.execute("SELECT 1 FROM bank_import_date_aliases WHERE ref=? AND booking_group=? "
+                        "UNION ALL SELECT 1 FROM bank_import_identity WHERE ref=? AND booking_group=?",
+                        (booking.ref, group, booking.ref, group)).fetchone():
+            yield booking, amount
 
 
 def _bank_statement_members(conn, observations):
@@ -2888,11 +2933,11 @@ def _bank_date_predecessors(dates):
     return before
 
 
-def _bank_balance_trail(dates, amounts, balances, before, sparse_occurrences=()):
+def _bank_balance_trail(dates, amounts, balances, before, sparse_occurrences=(), *, opening=None, currency=None, balance_keys=()):
     """Check an ordered account history against its reported balances."""
     order = sorted(range(len(dates)), key=lambda index: balances[index] is None)
     known = sum(1 << index for index, balance in enumerate(balances) if balance is not None) if sparse_occurrences else 0
-    effect = [(days, amount, balance, index in sparse_occurrences)
+    effect = [(days, amount, balance, balance_keys[index] if balance_keys else (), index in sparse_occurrences)
               for index, (days, amount, balance) in enumerate(zip(dates, amounts, balances))]
 
     def successors(remaining, running):
@@ -2909,6 +2954,9 @@ def _bank_balance_trail(dates, amounts, balances, before, sparse_occurrences=())
             ending = None if running is None else running + amounts[index]
             if balance is not None and ending is not None and balance != ending:
                 continue
+            expected = balance_keys[index] if balance_keys else ()
+            if expected and (ending is None or _bank_balance_hash(currency, ending) not in expected):
+                continue
             # Equal movements on the same timeline are interchangeable
             # here. Keep their multiplicity without exploring permutations.
             if effect[index] in choices:
@@ -2919,7 +2967,7 @@ def _bank_balance_trail(dates, amounts, balances, before, sparse_occurrences=())
     # Traverse lazily so the bound also limits retained states. Extra states
     # proportional to the number of movements allow a long ordered trail.
     budget = _BANK_BALANCE_TRAIL_LIMIT + len(dates)
-    stack = [iter((((1 << len(dates)) - 1, None),))]
+    stack = [iter((((1 << len(dates)) - 1, opening),))]
     seen = set()
     while stack:
         state = next(stack[-1], None)
@@ -2936,6 +2984,190 @@ def _bank_balance_trail(dates, amounts, balances, before, sparse_occurrences=())
         seen.add(state)
         stack.append(successors(remaining, running))
     return False
+
+
+def _bank_known_balance_keys(conn, booking):
+    keys = {booking.balance_key} if booking.balance_key else set()
+    prefix = _bank_balance_revision_key(booking.ref, "")
+    keys.update(group[len(prefix):] for group, in conn.execute(
+        "SELECT booking_group FROM bank_import_date_aliases WHERE ref=? AND booking_group LIKE ?",
+        (booking.ref, prefix + "%"),
+    ))
+    return frozenset(keys)
+
+
+_BankMovement = namedtuple("_BankMovement", ("first", "last", "amount", "balance", "balance_keys"), defaults=(None, ()))
+
+
+def _bank_movement_trail(movements, currency, opening):
+    """Check a signed trail while keeping any unresolved booking days open."""
+    groups = []
+    for row in sorted(movements, key=lambda entry: entry.first):
+        if not groups or end < row.first:
+            groups.append([])
+            end = row.last
+        groups[-1].append(row)
+        end = max(end, row.last)
+    for group in groups:
+        if len(group) == 1:
+            row = group[0]
+            opening += row.amount
+            if (row.balance is not None and row.balance != opening
+                    or row.balance_keys and _bank_balance_hash(currency, opening) not in row.balance_keys):
+                return False
+            continue
+        if len(group) > _BANK_BALANCE_TRAIL_LIMIT:
+            return None
+        before = [sum(1 << i for i, other in enumerate(group) if other.last < row.first) for row in group]
+        fits = _bank_balance_trail([(row.first, row.last) for row in group], [row.amount for row in group],
+                                   [row.balance for row in group], before, opening=opening, currency=currency,
+                                   balance_keys=[row.balance_keys for row in group])
+        if fits is not True:
+            return fits
+        opening += sum(row.amount for row in group)
+    return True
+
+
+def _bank_statement_window_amounts(movements, undated, currency, anchor, day, opening):
+    """Find the signed amounts that could precede the day's known movements."""
+    window = [entry for entry in movements if anchor < entry.first and entry.last <= day]
+    base = sum(entry.amount for entry in window if entry.last < day)
+    first = (date.fromisoformat(anchor) + timedelta(days=1)).isoformat()
+    last = (date.fromisoformat(day) - timedelta(days=1)).isoformat()
+    amounts = set()
+    for trial, choices in enumerate(product((False, True), repeat=len(undated))):
+        if trial >= _BANK_BALANCE_TRAIL_LIMIT:
+            return set()
+        earlier = [entry._replace(first=first, last=last) for entry, include in zip(undated, choices) if include]
+        if earlier and first > last:
+            continue
+        fits = _bank_movement_trail([*window, *earlier], currency, opening)
+        if fits is None:
+            return set()
+        if fits:
+            amounts.add(base + sum(entry.amount for entry in earlier))
+    return amounts
+
+
+def _bank_shared_closing_balance(reports, stored, matches, currency, day):
+    if not reports or len(reports) != len(stored) or not all(row.get("_bank_observed_balance") for row in reports):
+        return None
+    matched = []
+    for row in reports:
+        corresponding = [old for old, _, keys in matches[id(row)] if row["balance_key"] in keys]
+        if len(corresponding) != 1:
+            return None
+        matched.extend(corresponding)
+    if set(matched) != {booking for booking, _, _ in stored}:
+        return None
+    movements = [_BankMovement(day, day, Decimal(str(row["amount"])), row["_bank_observed_balance"][1]) for row in reports]
+    endings = Counter(row.balance for row in movements)
+    openings = Counter(row.balance - row.amount for row in movements)
+    ends, starts = tuple((endings - openings).elements()), tuple((openings - endings).elements())
+    if len(ends) == len(starts) == 1 and _bank_movement_trail(movements, currency, starts[0]):
+        return ends[0]
+    if len(endings) == len(openings) == 1 and endings == openings:
+        return next(iter(endings))
+    return None
+
+
+def _reconcile_bank_balance_revisions(conn, rows, assessments):
+    """Reconcile changed running balances against dated, signed histories."""
+    accounts = defaultdict(list)
+    for row in rows:
+        account = row.get("_bank_account_key") or (row.get("account_key") if row.get("_statement_joint") and row["booked_day"] else None)
+        if account:
+            accounts[account, row["currency"]].append(row)
+    revisions = {}
+    for (account, currency), reports in accounts.items():
+        days = [row["date"] for row in reports]
+        history = list(_bank_account_bookings(conn, account, currency, min(days), max(days), include_undated=True))
+        identified = defaultdict(list)
+        for booking, amount in history:
+            identified[amount].append((booking, amount, _bank_known_balance_keys(conn, booking)))
+        matches = {id(row): [(old, amount, keys) for old, amount, keys in identified[Decimal(str(row["amount"]))]
+                             if _bank_balance_only_difference(row, old)] for row in reports}
+        if not any(row["balance_key"] and any(old.balance_key and row["balance_key"] != old.balance_key
+                                              for old, _, _ in matches[id(row)]) for row in reports):
+            continue
+
+        current, prior = defaultdict(list), defaultdict(list)
+        live_undated, old_undated = [], []
+        observed_days = defaultdict(set)
+        for row in reports:
+            counterparts = matches[id(row)]
+            day = row["booked_day"]
+            days = {old.booked_day for old, _, _ in counterparts if old.booked_day}
+            if not day and len(days) == 1:
+                day = next(iter(days))
+            if (not day and row["balance_key"] and row["value_day"] == row["transaction_day"]
+                    and any(old.balance_key and old.balance_key != row["balance_key"]
+                            and old.value_day == old.transaction_day == row["value_day"] for old, _, _ in counterparts)):
+                # The same identified movement is the comparison endpoint.
+                # This label does not supply a missing BOOK date to the ledger.
+                day = row["value_day"]
+            if day:
+                current[day].append(row)
+                for old, _, _ in counterparts:
+                    observed_days[old].add(day)
+            else:
+                balance = row.get("_bank_observed_balance")
+                live_undated.append(_BankMovement(None, None, Decimal(str(row["amount"])), balance[1] if balance else None))
+        for booking, amount, keys in (entry for entries in identified.values() for entry in entries):
+            days = observed_days[booking]
+            day = booking.booked_day or (next(iter(days)) if len(days) == 1 else None)
+            if day:
+                prior[day].append((booking, amount, keys))
+            else:
+                old_undated.append(_BankMovement(None, None, amount, balance_keys=keys))
+
+        live = [_BankMovement(day, day, Decimal(str(row["amount"])), balance[1] if (balance := row.get("_bank_observed_balance")) else None)
+                for day, payments in current.items() for row in payments]
+        recorded = [_BankMovement(day, day, amount, balance_keys=keys)
+                    for day, payments in prior.items() for _, amount, keys in payments]
+        live.extend(_BankMovement(*row["_statement_fiscal_bounds"], Decimal(str(row["amount"])))
+                    for row in assessments if row.get("_statement_joint") and row["state"] == "unplaced"
+                    and row["account_key"] == account and row["currency"] == currency)
+        for amount, encoded in conn.execute("SELECT amount, details FROM bank_statement_assessments "
+                                            "WHERE account_key=? AND currency=? AND state='unplaced' "
+                                            "AND json_type(details, '$.joint')='object'", (account, currency)):
+            if bounds := json.loads(encoded).get("fiscal_bounds"):
+                recorded.append(_BankMovement(*bounds, Decimal(str(amount))))
+
+        anchors = {}
+        for day, payments in current.items():
+            if not all(row["booked_day"] == day for row in payments) or not all(old.booked_day == day for old, _, _ in prior[day]):
+                continue
+            if any(entry.first != entry.last and entry.first <= day <= entry.last for entry in (*live, *recorded)):
+                continue
+            if (ending := _bank_shared_closing_balance(payments, prior[day], matches, currency, day)) is not None:
+                anchors[day] = ending
+
+        candidates = defaultdict(list)
+        for day in sorted(current):
+            targets = [row for row in current[day] if row.get("_bank_observed_balance")
+                       and any(old.balance_key and old.balance_key != row["balance_key"] for old, _, _ in matches[id(row)])]
+            if not targets:
+                continue
+            before = max((anchor for anchor in anchors if anchor < day), default=None)
+            delta = None
+            if before and not any(entry.first <= day < entry.last for entry in (*live, *recorded)):
+                current_amounts = _bank_statement_window_amounts(live, live_undated, currency, before, day, anchors[before])
+                previous_amounts = _bank_statement_window_amounts(recorded, old_undated, currency, before, day, anchors[before])
+                if len(current_amounts) == len(previous_amounts) == 1:
+                    delta = next(iter(current_amounts)) - next(iter(previous_amounts))
+            for row in targets:
+                source = [(old, keys) for old, _, keys in matches[id(row)]]
+                known = {old.ref for old, keys in source if row["balance_key"] != old.balance_key and row["balance_key"] in keys}
+                if not known and delta:
+                    previous_balance = _bank_balance_hash(currency, row["_bank_observed_balance"][1] - delta)
+                    known = {old.ref for old, keys in source if previous_balance in keys and row["balance_key"] not in keys}
+                if len(known) == 1:
+                    candidates[next(iter(known))].append(row)
+        for ref, matches in candidates.items():
+            if len(matches) == 1:
+                revisions[matches[0]["ref"]] = ref
+    return [row | {"_bank_balance_revision": revisions[row["ref"]]} if row["ref"] in revisions else row for row in rows]
 
 
 def _joint_statement_scope(account, amount, currency, checkpoints, dates, members):
@@ -3026,9 +3258,8 @@ def _same_joint_statement(prior, current):
         groups = {group for groups, _ in details["observations"] for group in groups}
         return [member for member in details["joint"]["members"] if not groups.isdisjoint(member[0])]
 
-    old_subjects, new_subjects = subjects(prior), subjects(current)
-    if (len(old_subjects) < 2 or len(old_subjects) != len(new_subjects)
-            or not _joint_proof_covers(old_subjects, new_subjects, subjects=True)):
+    smaller, larger = sorted((subjects(prior), subjects(current)), key=len)
+    if len(smaller) < 2 or not _joint_proof_covers(smaller, larger, subjects=True):
         return False
     old, new = before["members"], after["members"]
     # The subject correspondence alone would confuse two separate windows.
@@ -3045,6 +3276,10 @@ def _same_joint_statement(prior, current):
 
 def _joint_statement_membership(rows, groups, facts, *, subject):
     booking = _BankBooking(*facts)
+    revised = {i for i, row in rows.items() if row.get("_bank_balance_revision") == booking.ref
+               and _bank_balance_only_difference(row, booking)}
+    if revised:
+        return revised
     compatible = {i for i, row in rows.items() if _joint_statement_source(row, groups, booking)}
     direct = {i for i in compatible if (booking.ref and rows[i]["ref"] == booking.ref)
               or (booking.provider_ref and rows[i]["provider_ref"] == booking.provider_ref)}
@@ -3052,7 +3287,7 @@ def _joint_statement_membership(rows, groups, facts, *, subject):
                                    if _joint_proof_member_matches((groups, facts), _bank_statement_option(row), subject=subject)}
 
 
-def _joint_statement_existing(conn, joint, options):
+def _joint_statement_existing(conn, joint, options, currency):
     """Find previously booked named movements in this statement's scope."""
     groups = {group for groups, _ in (*joint["members"], *options) for group in groups}
     candidates = {group: _bank_statement_group_bookings(conn, (group,)) for group in groups}
@@ -3061,21 +3296,72 @@ def _joint_statement_existing(conn, joint, options):
         return {booking for group in groups for booking in candidates[group]}
 
     subjects = {group for groups, _ in options for group in groups}
-    members = []
+    members = {}
+    shifted_balance = False
     for groups, facts in joint["members"]:
         bank_groups = {group: group for group in groups}
         rows = {booking.ref: booking._asdict() | {"bank_groups": bank_groups} for booking in in_groups(groups)}
         matches = _joint_statement_membership(rows, groups, facts, subject=not subjects.isdisjoint(groups))
-        if len(matches) != 1:
+        observation = _BankBooking(*facts)
+        if not matches:
+            matches = {ref for ref, row in rows.items() if _bank_balance_only_difference(row, observation)}
+            shifted_balance = True
+        if len(matches) != 1 or not matches.isdisjoint(members):
             return {}
-        members.extend(matches)
-    if len(set(members)) != len(joint["members"]):
-        return {}
+        members[next(iter(matches))] = observation
     dates = _joint_statement_dates(joint, options)
-    return {booking.ref: booking for groups, facts in options for booking in in_groups(groups)
-            if booking.ref not in members and booking.provider_ref and booking.booked_day
-            and dates[0] <= booking.booked_day <= dates[1]
-            and _bank_statement_option_match(booking._asdict(), _BankBooking(*facts))}
+    scoped = {booking for groups, _ in options for booking in in_groups(groups) if booking.ref not in members
+              and booking.provider_ref and booking.booked_day and dates[0] <= booking.booked_day <= dates[1]}
+    existing = {booking.ref: booking for booking in scoped
+                if any(booking in in_groups(groups) and _bank_statement_option_match(booking._asdict(), _BankBooking(*facts))
+                       for groups, facts in options)}
+    if shifted_balance or scoped - set(existing.values()):
+        confirmed = _joint_booked_interval(conn, joint, currency, dates, members, scoped)
+        if shifted_balance:
+            existing = {}
+        existing.update((booking.ref, booking) for booking in confirmed)
+    return existing
+
+
+def _joint_booked_interval(conn, joint, currency, dates, members, candidates):
+    """Verify earlier named ledger movements against the stored closing balances."""
+    account = joint["account_key"]
+    saved = {key: Decimal(value) for key, value in joint.get("balances", ())}
+    ledger = dict(_bank_account_bookings(conn, account, currency, *joint["bounds"]))
+    references = {booking.ref: booking for booking in ledger}
+    if not ledger or len(ledger) > _BANK_BALANCE_TRAIL_LIMIT or not members.keys() <= references.keys():
+        return ()
+    first = min(booking.booked_day for booking in ledger)
+    first_rows = [booking for booking in ledger if booking.booked_day == first]
+    if len(first_rows) != 1 or first_rows[0].balance_key not in saved:
+        return ()
+    opening = saved[first_rows[0].balance_key] - ledger[first_rows[0]]
+    keys = {booking: _bank_known_balance_keys(conn, booking) for booking in ledger}
+    actual = [_BankMovement(booking.booked_day, booking.booked_day, amount, balance_keys=keys[booking])
+              for booking, amount in ledger.items()]
+    if not _bank_movement_trail(actual, currency, opening):
+        return ()
+    observed = [(booking, ledger[references[ref]]) for ref, booking in members.items()]
+    proven = ()
+    for trial, subset in enumerate(combinations(sorted(candidates, key=lambda booking: booking.ref), joint.get("minimum", 1))):
+        if trial >= _BANK_BALANCE_TRAIL_LIMIT:
+            return ()
+        report = [*observed, *((booking, ledger[booking]) for booking in subset if booking in ledger)]
+        amounts = [booking._asdict() | {"_bank_account_key": account, "currency": currency, "amount": amount,
+                                       "_bank_observed_balance": (currency, saved[booking.balance_key]) if booking.balance_key in saved else None}
+                   for booking, amount in report]
+        if not _joint_statement_has_closing_bound(amounts, account, currency, dates):
+            continue
+        projected = [_BankMovement(booking.booked_day, booking.booked_day, amount, saved.get(booking.balance_key),
+                                   keys[booking] if booking in subset else ()) for booking, amount in report]
+        fits = _bank_movement_trail(projected, currency, opening)
+        if fits is None:
+            return ()
+        if fits:
+            if proven:
+                return ()
+            proven = subset
+    return proven
 
 
 def _joint_statement_allocation(rows, joint, options, currency, amount):
@@ -3102,6 +3388,10 @@ def _joint_statement_allocation(rows, joint, options, currency, amount):
         if (all(days) and all(eligible[i]["provider_ref"] or eligible[i].get("_statement_edge_occurrence")
                               for i in eligible.keys() - known)
                 and _bank_balance_trail(days, movements, balances, _bank_date_predecessors(days)) is True):
+            if _joint_statement_has_closing_bound(eligible.values(), joint["account_key"], currency, dates):
+                alternatives.update(i for i, row in eligible.items() if i not in known
+                                    and Decimal(str(row["amount"])) == amount and row.get("_bank_observed_balance")
+                                    and dates[0] <= row["booked_day"] <= dates[1])
             verified = {i for i in alternatives if (eligible[i]["provider_ref"] or eligible[i].get("_statement_edge_occurrence"))
                         and dates[0] <= eligible[i]["booked_day"] <= dates[1]}
     return verified, alternatives
@@ -3114,9 +3404,7 @@ def _joint_statement_slot_matches(conn, rows, candidates, slots):
         report = rows[source]
         choices[source] = {index for index, (_, ref, day, saved) in enumerate(slots)
                            if (report["booked_day"] == day if ref else (
-                               saved["fiscal_bounds"][0] <= report["booked_day"] <= saved["fiscal_bounds"][1]))
-                           and any(_bank_statement_option_match(report, _BankBooking(*facts))
-                                   for _, facts in saved["observations"])}
+                               saved["fiscal_bounds"][0] <= report["booked_day"] <= saved["fiscal_bounds"][1]))}
     degree = Counter(index for options in choices.values() for index in options)
     assigned = {index: source for source, options in choices.items() if len(options) == 1
                 for index in options if degree[index] == 1}
@@ -3322,7 +3610,7 @@ def _restore_joint_bank_reviews(conn, rows, assessments):
                     clean, alternatives = current
         if not incoming and not alternatives:
             continue
-        existing = _joint_statement_existing(conn, joint, options)
+        existing = _joint_statement_existing(conn, joint, options, currency)
         previously_named = {i for i in alternatives if any(
             _joint_statement_source(named[i], named[i]["bank_groups"].values(), booking) for booking in existing.values()
         )}
@@ -3430,6 +3718,10 @@ def import_bank_rows(conn, rows: list, *, auto_match: bool = True, require_fx: b
     'ref' ist UNIQUE, ein erneuter Abruf legt also nichts doppelt an."""
     imported = deferred = 0
     rows, assessments = _restore_bank_statement_fetches(conn, rows, assessments)
+    if any(row.get("_bank_account_key") for row in rows):
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+        rows = _reconcile_bank_balance_revisions(conn, rows, assessments)
     rows, assessments, joint_warnings, joint_dups = _restore_joint_bank_reviews(conn, rows, assessments)
     blocked, placements = _record_bank_statement_assessments(conn, assessments)
     if blocked:

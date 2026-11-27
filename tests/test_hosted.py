@@ -1550,6 +1550,141 @@ def test_joint_statement_clears_possible_overflow_only_after_a_later_checkpoint(
             assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (6, 334)
 
 
+@pytest.mark.parametrize("cross_month", [False, True])
+@pytest.mark.parametrize("named_first", [False, True])
+@pytest.mark.parametrize("assigned", [False, True])
+def test_joint_statement_accepts_newly_identified_purpose_for_established_receipt(sandbox, cross_month, named_first, assigned):
+    import core
+
+    reports, echoes = _joint_receipt_count_fixture(cross_month=cross_month)
+    receipt = _bank_motion(reports[2]["booking_date"], 119, 357, "Different transfer",
+                           entry_reference="new-bank-ref", reference_number="new-invoice")
+    precise = [*reports[:3], receipt, reports[-1]]
+    with closing(core.db()) as ledger:
+        _sync_bank_pages(ledger, [precise] if named_first else [reports, echoes])
+        existing = ledger.execute("SELECT id,ref FROM transactions WHERE description=?", (
+            "Different transfer" if named_first else "Kontoauszug prüfen",
+        )).fetchone()
+        if assigned:
+            payment = existing or ledger.execute("SELECT id,ref FROM transactions WHERE description='Rent'").fetchone()
+            core.set_tx_category(ledger, payment["id"], "einnahme_sonstige", "Checked")
+        for reply in ([precise], [echoes, reports], [[*precise, *echoes]], [precise]):
+            _sync_bank_pages(ledger, reply)
+            assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (5, 344)
+            assert core.pending_bank_statement_amounts(ledger) == []
+        if existing:
+            row = ledger.execute("SELECT ref,description,category,note FROM transactions WHERE id=?", (existing["id"],)).fetchone()
+            assert tuple(row) == (existing["ref"], "Kontoauszug prüfen" if assigned and not named_first else "Different transfer",
+                                  "einnahme_sonstige" if assigned else "offen", "Checked" if assigned else None)
+        else:
+            assert tuple(ledger.execute("SELECT date,amount FROM transactions WHERE description='Different transfer'").fetchone()) == (
+                receipt["booking_date"], 119,
+            )
+
+
+@pytest.mark.parametrize("strong_first", [False, True])
+@pytest.mark.parametrize("cross_month", [False, True])
+def test_earlier_joint_statement_counts_receipts_already_proven_by_a_larger_interval(sandbox, strong_first, cross_month):
+    import core
+
+    reports, echoes = _joint_receipt_count_fixture(cross_month=cross_month)
+    day = reports[2]["booking_date"]
+    receipts = [_bank_motion(day, 119, balance, label, entry_reference=label, reference_number=label)
+                for balance, label in ((357, "Different transfer"), (476, "Another transfer"))]
+    fee = reports[-1] | {"balance_after_transaction": {"amount": "453", "currency": "EUR"}}
+    complete = [*reports[:3], *receipts, fee]
+    with closing(core.db()) as ledger:
+        _sync_bank_pages(ledger, [complete] if strong_first else [reports, echoes])
+        for reply in ([[*complete, *echoes]], [echoes, reports], [complete]):
+            _sync_bank_pages(ledger, reply)
+            assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (6, 463)
+            assert core.pending_bank_statement_amounts(ledger) == []
+
+
+@pytest.mark.parametrize("strong_first", [False, True])
+def test_joint_statement_extends_a_balance_proof_without_reserving_the_same_receipt_twice(sandbox, strong_first):
+    import core
+
+    reports, echoes = _joint_receipt_count_fixture(close_same_day=True)
+    extra = _bank_motion(reports[-1]["booking_date"], 119, 453, "Separate credit",
+                         entry_reference="new-same-day", reference_number="new-invoice")
+    old, extended = [reports, echoes], [[*reports, extra], echoes]
+    with closing(core.db()) as ledger:
+        assert _sync_bank_pages(ledger, extended if strong_first else old) == (6 if strong_first else 5)
+        for reply in (extended, old, extended[::-1], [[*reports, *echoes, extra]]):
+            _sync_bank_pages(ledger, reply)
+            assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (6, 463)
+            assert [(row["state"], row["amount"]) for row in core.pending_bank_statement_amounts(ledger)] == [("pending", 119)]
+        assert ledger.execute("SELECT count(*) FROM transactions WHERE description='Separate credit'").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("sign", [1, -1])
+@pytest.mark.parametrize("late_first", [False, True])
+@pytest.mark.parametrize("fee_count", [1, 3])
+def test_late_bank_posting_explains_a_new_balance_without_duplicating_the_fee(sandbox, sign, late_first, fee_count):
+    import core
+
+    def motion(day, amount, balance, label):
+        return _bank_motion(f"2026-11-{day}", amount * sign, balance * sign, label, entry_reference=label, reference_number=label)
+
+    opening, rent = motion(19, 10, 0, "Opening"), motion(20, 119, 119, "Rent")
+    old = [opening, rent, motion(22, -23, 96, "Fee")]
+    precise = [opening, rent, motion(21, 50, 169, "Late movement"),
+               *(motion(22, -23, 169 - 23 * step, "Fee") for step in range(1, fee_count + 1))]
+    with closing(core.db()) as ledger:
+        assert _sync_bank_pages(ledger, [precise if late_first else old]) == (3 + fee_count if late_first else 3)
+        existing = ledger.execute("SELECT id,ref FROM transactions WHERE description='Fee' ORDER BY id LIMIT 1").fetchone()
+        core.set_tx_category(ledger, existing["id"], "gebuehr", "Checked fee")
+        for reply in ([precise[::-1]], [old], [precise[::2], precise[1::2]], [precise]):
+            _sync_bank_pages(ledger, reply)
+            assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (
+                3 + fee_count, sign * (179 - 23 * fee_count),
+            )
+            assert core.pending_bank_statement_amounts(ledger) == []
+            assert tuple(ledger.execute("SELECT ref,category,note FROM transactions WHERE id=?", (existing["id"],)).fetchone()) == (
+                existing["ref"], "gebuehr", "Checked fee",
+            )
+
+
+@pytest.mark.parametrize("shape", ["undated tail", "dense days", "long trail", "unreferenced fee", "undated rent", "undated fee"])
+def test_bank_balance_revision_uses_the_evidenced_interval(sandbox, shape):
+    import core
+
+    first = date(2026, 11, 19)
+    steps = [(0, 10, "Opening"), (1, 119, "Rent"), (2, 50, "Late movement"), (3, -23, "Fee")]
+    if shape == "dense days":
+        steps = [steps[0], (0, 3, "Second opening movement"), steps[1], (1, -4, "Postage"), *steps[2:]]
+    elif shape == "long trail":
+        steps = [*steps[:3], *((day, -1, f"Movement {day}") for day in range(3, 135))]
+
+    def statement(with_late):
+        balance = -10
+        rows = []
+        for day, amount, name in steps:
+            if name == "Late movement" and not with_late:
+                continue
+            balance += amount
+            report = _bank_motion(str(first + timedelta(days=day)), amount, balance, name, entry_reference=name, reference_number=name)
+            if shape == "unreferenced fee" and name == "Fee":
+                del report["entry_reference"]
+            if (shape, name) in {("undated rent", "Rent"), ("undated fee", "Fee")}:
+                del report["booking_date"]
+            rows.append(report)
+        if shape == "undated tail":
+            rows.append(_bank_motion("2026-11-24", -3, None, "Independent charge", entry_reference="tail") | {"booking_date": None})
+        return rows
+
+    older, newer = statement(False), statement(True)
+    with closing(core.db()) as ledger:
+        assert _sync_bank_pages(ledger, [older]) == len(older)
+        for index, reply in enumerate(([newer[::2], newer[1::2]], [older], [newer[::-1]])):
+            assert _sync_bank_pages(ledger, reply) == int(index == 0)
+            assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (
+                len(newer), sum(amount for _, amount, _ in steps) - (3 if shape == "undated tail" else 0),
+            )
+            assert core.pending_bank_statement_amounts(ledger) == []
+
+
 @pytest.mark.parametrize("sign", [-1, 1])
 @pytest.mark.parametrize("seed", [False, True])
 @pytest.mark.parametrize("shape, has_balance", [

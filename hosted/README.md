@@ -141,6 +141,13 @@ reuse corroborated balances from the same account if the bank omits them.
 A checkpoint on the same booking day can prove a minimum while leaving
 another payment possible after that checkpoint. A later closing balance
 can resolve the remaining amount, and a weaker replay keeps that resolution.
+When an updated statement proves the identity of an already counted payment,
+the import keeps its ledger entry and any user assignment. An extended
+statement can also prove a genuinely separate payment. A late movement can
+explain a revised balance on an existing entry when the earlier and newer
+signed histories both reconcile against the same checkpoint. Observations
+without a booking date contribute only when the signed history supports
+their effect in the relevant interval.
 Receiving the same observations on one page or several pages leaves the booked
 amount unchanged. A report that only omits known details from the same complete
 statement preserves its existing booked and possible amounts. The same reply
