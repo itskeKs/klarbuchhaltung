@@ -3180,17 +3180,29 @@ def _bank_revision_order(groups, opening, currency, family=None, *, infer=False)
 
 
 def _bank_align_revision_family(reports, stored, matches):
-    """Keep exact occurrences when they cover the shorter signed sequence."""
+    """Assign distinct descriptions before comparing balances and occurrence order."""
+    incoming_labels = Counter(row["description"] for row in reports)
+    stored_labels = Counter(old.description for old in stored)
+    named = {old.description: old.ref for old in stored if old.description not in {None, "", "Bankumsatz"}
+             and incoming_labels[old.description] == stored_labels[old.description] == 1}
+    assignments = {id(row): named[row["description"]] for row in reports if row["description"] in named}
+    reserved = set(assignments.values())
+    reports = [row for row in reports if id(row) not in assignments]
+    stored = [old for old in stored if old.ref not in reserved]
+
     positions = {old.ref: index for index, old in enumerate(stored)}
     exact = []
     for index, row in enumerate(reports):
-        candidates = [positions[old.ref] for old, _, keys in matches[id(row)] if row["balance_key"] in keys]
+        candidates = [positions[old.ref] for old, _, keys in matches[id(row)]
+                      if old.ref in positions and row["balance_key"] in keys]
         if len(candidates) == 1:
             exact.append((index, candidates[0]))
     known = [index for _, index in exact]
     if len(exact) == min(len(reports), len(stored)) and all(a < b for a, b in zip(known, known[1:])):
-        return {id(reports[current]): stored[previous].ref for current, previous in exact}
-    return {id(row): old.ref for row, old in zip(reports, stored)}
+        assignments.update((id(reports[current]), stored[previous].ref) for current, previous in exact)
+    else:
+        assignments.update((id(row), old.ref) for row, old in zip(reports, stored))
+    return assignments
 
 
 def _bank_same_undated_members(reports, prior, matches):
@@ -3235,7 +3247,7 @@ def _bank_previous_revision_order(conn, account, currency, first, recorded, open
     return previous
 
 
-def _bank_revision_assignments(incoming, previous, matches, families):
+def _bank_revision_assignments(incoming, previous, matches, families, *, complete_families=False):
     revisions = {}
     for day, reports in incoming.items():
         by_family = defaultdict(list)
@@ -3246,48 +3258,36 @@ def _bank_revision_assignments(incoming, previous, matches, families):
             if any(family & other for other in by_family if family != other):
                 continue
             existing = [old for old in previous.get(day, ()) if old.ref in family]
-            if existing:
+            if existing and (not complete_families or len(existing) == len(family) <= len(siblings)):
                 assignments = _bank_align_revision_family(siblings, existing, matches)
                 revisions.update((id(row), assignments.get(id(row))) for row in siblings)
     return revisions
 
 
-def _bank_recover_revision_assignments(conn, incoming, recorded, matches, opening, currency):
-    """Recover an older checkpoint left behind by an already imported movement."""
+def _bank_recover_revision_assignments(conn, incoming, recorded, matches, families, opening, currency, previous_family):
+    """Join complete families to earlier trails that predate a newly booked movement."""
     stored = {old.ref: (old, movement) for group in recorded.values() for old, movement in group}
-    if len(stored) > _BANK_BALANCE_TRAIL_LIMIT:
-        return {}
-    assignments, identified, obsolete = {}, set(), set()
-    for reports in incoming.values():
-        for row in reports:
-            candidates = [(old, keys) for old, _, keys in matches[id(row)] if old.ref in stored]
-            if len(candidates) != 1:
-                return {}
-            old, keys = candidates[0]
-            if old.ref in identified:
-                return {}
-            identified.add(old.ref)
-            assignments[id(row)] = old.ref
-            if keys and row["balance_key"] and row["balance_key"] not in keys:
-                obsolete.add(old.ref)
-    if not obsolete or identified != stored.keys():
+    identified = {ref for reports in incoming.values() for row in reports for ref in families[id(row)]}
+    if len(stored) > _BANK_BALANCE_TRAIL_LIMIT or not stored.keys() <= identified:
         return {}
 
-    # All observed movements are already identified. Verify the old balance
-    # in the earlier ledger, before subsequently imported movements arrived.
+    # A stored ledger can contain checkpoints learned in different replies.
+    # Reconstruct feasible earlier versions from the booking insertion order.
     ordered = sorted(stored, key=lambda ref: conn.execute("SELECT id FROM transactions WHERE ref=?", (ref,)).fetchone()[0])
     prefix = defaultdict(list)
-    included = set()
+    proposals = defaultdict(set)
     for ref in ordered[:-1]:
         old, movement = stored[ref]
         prefix[movement.first].append((old, movement))
-        included.add(ref)
-        verifiable = obsolete & included
-        if verifiable and _bank_revision_order(prefix, opening, currency):
-            obsolete.difference_update(verifiable)
-            if not obsolete:
-                return assignments
-    return {}
+        previous = _bank_revision_order(prefix, opening, currency, previous_family)
+        if previous is None:
+            return {}
+        if previous is False:
+            continue
+        assignments = _bank_revision_assignments(incoming, previous[0], matches, families, complete_families=True)
+        for row, assigned in assignments.items():
+            proposals[row].add(assigned)
+    return {row: next(iter(options)) for row, options in proposals.items() if len(options) == 1}
 
 
 def _bank_aligned_balance_revisions(conn, account, currency, current, prior, matches):
@@ -3306,6 +3306,9 @@ def _bank_aligned_balance_revisions(conn, account, currency, current, prior, mat
         for ref in family:
             reflected[ref].add(row)
 
+    def previous_family(old):
+        return frozenset(reflected[old.ref])
+
     common = None
     for opening in _bank_revision_openings(current):
         incoming = _bank_revision_order(current, opening, currency, lambda row: families[id(row)], infer=True)
@@ -3313,12 +3316,13 @@ def _bank_aligned_balance_revisions(conn, account, currency, current, prior, mat
             return {}
         if incoming is False:
             continue
-        previous = _bank_previous_revision_order(conn, account, currency, first, recorded, opening,
-                                                 lambda old: frozenset(reflected[old.ref]))
+        previous = _bank_previous_revision_order(conn, account, currency, first, recorded, opening, previous_family)
         if previous is None:
             return {}
         if previous is False:
-            assignments = _bank_recover_revision_assignments(conn, incoming[0], recorded, matches, opening, currency)
+            assignments = _bank_recover_revision_assignments(
+                conn, incoming[0], recorded, matches, families, opening, currency, previous_family,
+            )
             if not assignments:
                 continue
         else:
