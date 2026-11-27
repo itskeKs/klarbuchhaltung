@@ -2,6 +2,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, closing
 from datetime import date, datetime, timedelta, timezone
+import csv
 import io
 import json
 import os
@@ -5048,6 +5049,80 @@ def test_proven_surplus_counts_only_in_a_period_covering_both_months(sandbox, mo
                     single = client.get(f"/zahlungen?p={period}").get_data(as_text=True)
                     assert "Buchungsmonat noch offen" in single
                     assert "In den Summen dieses Zeitraums nicht enthalten" in single
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_full_payments_csv_tracks_the_confirmed_receipt_across_booking_months(sandbox, monkeypatch, sign):
+    import core
+
+    monkeypatch.setenv("KLAR_PUBLIC_ORIGIN", SITE)
+    private = sandbox / "secrets"
+    passwords = provision(private, ["Alex", "Blake"])
+    complete = [row | {"booking_date": "2026-11-30"} for row in ambiguous_reference_statement(sign)]
+    complete[-1]["booking_date"] = "2026-12-01"
+    partial = [row.copy() for row in complete]
+    partial[3]["booking_date"] = None
+
+    def export(client):
+        response = fetch(client, "/zahlungen/export")
+        assert response.status_code == 200 and response.mimetype == "text/csv"
+        reader = csv.DictReader(io.StringIO(response.get_data(as_text=True)))
+        assert reader.fieldnames == ["Datum", "Beschreibung", "Betrag", "Währung", "Betrag_EUR", "Kategorie", "Typ"]
+        return list(reader)
+
+    with ExitStack() as stack:
+        upstreams = {tenant: start_tenant(stack, sandbox / tenant, private / tenant, tenant)
+                     for tenant in ("tenant-a", "tenant-b")}
+        gateway = create_app(private / "gateway.json", sandbox, upstreams)
+        alex, blake = gateway.test_client(), gateway.test_client()
+        for client, name, tenant in ((alex, "Alex", "tenant-a"), (blake, "Blake", "tenant-b")):
+            (sandbox / tenant / "config.toml").write_bytes(core.CONFIG_PATH.read_bytes())
+            assert post(client, "/login", {"username": name, "password": passwords[name]}).location == "/"
+            assert export(client) == []
+
+        ledger = stack.enter_context(closing(sqlite3.connect(sandbox / "tenant-a" / "data" / "bookkeeping.db")))
+        ledger.row_factory = sqlite3.Row
+        for phase, mapper, page in (("uncertain", transaction_rows, partial),
+                                    ("confirmed", _confirmed_statement_rows, partial),
+                                    ("resolved", _confirmed_statement_rows, complete)):
+            decisions = []
+            rows, _ = mapper("account-a", page, assessments=decisions)
+            core.import_bank_rows(ledger, rows, require_fx=True, assessments=decisions)
+            count, net = (5, 86 * sign) if phase == "uncertain" else (6, 205 * sign)
+            combined = fetch(alex, "/zahlungen?p=all").get_data(as_text=True)
+            assert f"{count} Buchungen" in combined and core.eur(net) in combined
+            exported = export(alex)
+            assert (len(exported), sum(float(row["Betrag"]) for row in exported)) == (count, net)
+            assert export(alex) == exported and export(blake) == []
+            if phase == "uncertain":
+                dated = exported
+            else:
+                if phase == "confirmed":
+                    receipt, = [row for row in exported if not row["Datum"]]
+                    assert [row for row in exported if row["Datum"]] == dated
+                else:
+                    receipt, = [row for row in exported if row["Beschreibung"] == "Kontoauszug prüfen"]
+                    assert all(row["Datum"] for row in exported)
+                assert float(receipt["Betrag"]) == float(receipt["Betrag_EUR"]) == 119 * sign
+                assert receipt["Währung"] == "EUR"
+                assert receipt["Datum"] == ("" if phase == "confirmed" else "2026-11-30")
+                assert ("Buchungsmonat noch offen" in receipt["Beschreibung"]) == (phase == "confirmed")
+
+
+def test_undated_foreign_payment_csv_leaves_conversion_open(sandbox, monkeypatch):
+    import core
+    from app import app
+
+    with closing(core.db()) as ledger, ledger:
+        ledger.execute("INSERT INTO bank_statement_assessments "
+                       "(review_key, account_key, date, amount, currency, state, details) "
+                       "VALUES ('fixture', 'account-a', '2026-11-30', -23, 'GBP', 'unplaced', ?)",
+                       (json.dumps({"fiscal_bounds": ["2026-11-30", "2026-12-01"]}),))
+    monkeypatch.setitem(app.config, "KLAR_HOSTED", True)
+    response = app.test_client().get("/zahlungen/export")
+    row, = csv.DictReader(io.StringIO(response.get_data(as_text=True)))
+    assert row["Datum"] == row["Betrag_EUR"] == ""
+    assert row["Währung"] == "GBP" and float(row["Betrag"]) == -23
 
 
 @pytest.mark.parametrize("axis", ["value_date", "transaction_date"])

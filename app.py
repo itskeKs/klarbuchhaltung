@@ -822,21 +822,35 @@ def zahlungen():
 def zahlungen_export():
     import csv
     import io
+    from contextlib import closing
     from flask import Response
-    conn = core.db()
+    hosted = app.config.get("KLAR_HOSTED")
+    with closing(core.db()) as conn:
+        # Read one snapshot even if a sync assigns a booking date during export.
+        conn.execute("BEGIN")
+        transactions = core.list_transactions(conn)
+        reviews = core.pending_bank_statement_amounts(conn) if hosted else []
     out = io.StringIO()
     w = csv.writer(out)
     w.writerow(["Datum", "Beschreibung", "Betrag", "Währung", "Betrag_EUR",
                 "Kategorie", "Typ"])
     def sheet_text(text):
-        if (app.config.get("KLAR_HOSTED") and text
+        if (hosted and text
                 and (text.startswith(("\t", "\r", "\n")) or text.lstrip().startswith(("=", "+", "-", "@")))):
             return "'" + text
         return text
 
-    for t in core.list_transactions(conn):
+    for t in transactions:
         w.writerow([t["date"], sheet_text(t["description"]), t["amount"], sheet_text(t["currency"]),
                     t["amount_home"], sheet_text(t["category"]), sheet_text(t["tx_type"])])
+    if reviews:
+        home = core._fx_norm(core.home_currency())
+        for row in reviews:
+            if row["covered"]:
+                amount, currency = row["amount"], row["currency"]
+                w.writerow(["", "Bestätigter Bankumsatz – Buchungsmonat noch offen", amount,
+                            sheet_text(currency), amount if core._fx_norm(currency) == home else None,
+                            "offen", ""])
     return Response(out.getvalue(), mimetype="text/csv",
                     headers={"Content-Disposition": "attachment; filename=zahlungen.csv"})
 

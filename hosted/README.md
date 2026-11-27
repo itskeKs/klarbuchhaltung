@@ -67,6 +67,9 @@ If a confirmed payment could fall in different months, **Zahlungen** shows the
 amount with its month open. It counts once in periods that cover every possible
 booking month and stays outside the individual monthly totals until assigned
 by bank evidence. Use **Alle Jahre** if the possible months span a year boundary.
+**Export CSV** includes each confirmed payment once across the full history.
+Until its booking month is known, the date is blank and the description says
+**Buchungsmonat noch offen**. A possible payment stays out of the export until confirmed.
 For a foreign-currency payment, the home-currency totals use the exchange rate
 once the booking date is known.
 If the statement proves an additional payment on a known booking date and
