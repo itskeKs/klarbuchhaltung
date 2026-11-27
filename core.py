@@ -2213,7 +2213,7 @@ def _bank_matches(conn, rows):
         "t.ref IN (SELECT ref FROM bank_import_identity WHERE booking_group = ?1 "
         "UNION ALL SELECT ref FROM bank_import_date_aliases WHERE booking_group = ?1)",
         {g for row in bank_rows for g in row["bank_groups"].values()} | {
-            _bank_statement_observation_alias(row["ref"]) for row in bank_rows if row["balance_key"] and not row["provider_ref"]
+            _bank_statement_observation_alias(row["ref"]) for row in bank_rows if not row["provider_ref"]
         },
     )
     by_provider = lookup("f.provider_ref = ?", {r["provider_ref"] for r in bank_rows if r["provider_ref"]})
@@ -2607,11 +2607,37 @@ def _record_bank_statement_occurrences(conn, key, row, saved):
     details = {"proof": row["_statement_review_proof"], "observations": row["_statement_review_options"],
                "occurrences": (lower, upper), "balances": sorted(balances.items()),
                "witnesses": [option for _, option, _ in witnesses]}
+    if page_family := row.get("_statement_page_family"):
+        details["page_family"] = page_family
     amount = float(row["amount"]) * (upper - lower if state == "pending" else 1)
     conn.execute("INSERT INTO bank_statement_assessments VALUES (?, ?, ?, ?, ?, ?, ?) "
                  "ON CONFLICT(review_key) DO UPDATE SET amount = excluded.amount, state = excluded.state, details = excluded.details",
                  (key, row["account_key"], row["date"], amount, row["currency"], state, json.dumps(details)))
     return state, details
+
+
+def _bank_statement_assessment_matches(conn, row, saved):
+    current, previous = row["_statement_review_proof"], saved["proof"]
+    same_proof = _bank_statement_same_proof(current, previous)
+    page_family = row.get("_statement_page_family")
+    if not page_family or page_family != saved.get("page_family") or current[1] != previous[1]:
+        return same_proof or _bank_statement_matches_partial_proof(conn, row, saved)
+
+    def bookings(options):
+        return [_BankBooking(*facts[:-1], tuple(map(tuple, facts[-1]))) for _, facts in options]
+
+    before, after = bookings(saved["observations"]), bookings(row["_statement_review_options"])
+    references = [{old.provider_ref for old in candidates if old.provider_ref} for candidates in (before, after)]
+    if all(references) and references[0].isdisjoint(references[1]):
+        return False
+    if same_proof:
+        return True
+    # A family that lacked a running balance can acquire one without
+    # abandoning its earlier review. Keep incompatible signed edges separate.
+    if all(any(facts[0] for facts in proof[2]) for proof in (current, previous)):
+        return False
+    return any(_bank_has_shared_date(new._asdict(), old) and not _bank_facts_conflict(new._asdict(), old)
+               for old, new in product(before, after))
 
 
 def _record_bank_statement_assessments(conn, observations):
@@ -2626,8 +2652,7 @@ def _record_bank_statement_assessments(conn, observations):
     )}
     for row in observations:
         proof = row["_statement_review_proof"]
-        matches = [key for key, (_, saved) in stored.items() if _bank_statement_same_proof(proof, saved["proof"])
-                   or _bank_statement_matches_partial_proof(conn, row, saved)]
+        matches = [key for key, (_, saved) in stored.items() if _bank_statement_assessment_matches(conn, row, saved)]
         if len(matches) > 1:
             blocked.add(row["ref"])
             continue

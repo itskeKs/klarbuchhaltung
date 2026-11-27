@@ -103,11 +103,20 @@ Any possible additional amount appears in Payments for review outside the
 totals until further bank evidence settles it. When a later page omits a
 balance, the same signed statement can establish the total count across
 several compatible payments. An additional observation without a balance
-can support another payment when it connects reported balances. A bank
+can support another payment when it connects reported balances. Movements
+without a reported balance stay in the interval between checkpoints. The
+surrounding balances can establish the count even if no version of a
+payment reports its own balance. If pages overlap and a checkpoint is
+missing, the established
+payment is booked and a possible extra amount remains in review. A bank
 reference can identify a report even when another copy omits it. A short sync that cannot resolve an
 amended report against the established booking flags it for review and
 preserves the original amount and assignment. Updated bank descriptions
 can still corroborate an earlier statement when the monetary facts agree.
+After the bank establishes a payment's booking month, replays of its confirmed
+reports can use the same statement evidence even if the fetch only covers that month.
+Previously confirmed movements on that day can also help check a new report
+for multiple occurrences.
 Value and transaction dates can help identify a movement or place it when
 its booking date is missing.
 Movements on the same known booking day can follow any order consistent

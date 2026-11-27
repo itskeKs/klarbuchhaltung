@@ -644,6 +644,268 @@ def test_balance_path_reconciles_a_sparse_page_copy(sandbox, position, seed, rev
         )
 
 
+@pytest.mark.parametrize("target", [0, -1])
+@pytest.mark.parametrize("gaps", [1, 3])
+@pytest.mark.parametrize("sign", [-1, 1])
+@pytest.mark.parametrize("seed", [False, True])
+def test_balance_window_keeps_every_movement_before_the_reported_checkpoint(sandbox, target, gaps, sign, seed):
+    import core
+
+    credit, debit = reported_balance_pair()
+    debit.update(booking_date=f"2026-11-{21 + gaps}", value_date=f"2026-11-{21 + gaps}")
+    middle = [bank_row(booking_date=f"2026-11-{21 + index}", transaction_id=f"mid-{index}", entry_reference=f"mid-{index}",
+                       transaction_amount={"amount": str(3 + index), "currency": "EUR"}) for index in range(gaps)]
+    total = 96 + sum(range(3, 3 + gaps))
+    debit["balance_after_transaction"] = {"amount": str(total), "currency": "EUR"}
+    complete = [credit, *middle, debit]
+    complete[target]["entry_reference"] = "source"
+    sparse = complete[target] | {"entry_reference": None, "transaction_id": "renewed", "balance_after_transaction": None}
+    if sign < 0:
+        for row in (*complete, sparse):
+            row["credit_debit_indicator"] = "DBIT" if row["credit_debit_indicator"] == "CRDT" else "CRDT"
+            if balance := row.get("balance_after_transaction"):
+                row["balance_after_transaction"] = balance | {"amount": str(-int(balance["amount"]))}
+    overlap = [*complete, sparse]
+    with closing(core.db()) as ledger:
+        def sync(page):
+            assessments = []
+            rows, skipped = transaction_rows("account-a", page, assessments=assessments, ledger=ledger)
+            result = core.import_bank_rows(ledger, rows, require_fx=True, auto_match=False, assessments=assessments)
+            assert skipped + result["ambiguous"] == 0
+            return result["imported"]
+
+        if seed:
+            assert sync(complete) == len(complete)
+        assert sync(overlap[::-1]) == (0 if seed else len(complete))
+        assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (len(complete), total * sign)
+        saved = [tuple(row) for row in ledger.execute("SELECT id,ref,date,amount FROM transactions ORDER BY id")]
+        core.set_tx_category(ledger, saved[0][0], "einnahme_sonstige", "Checked")
+        assert sync(overlap) == sync(complete) == sync([sparse]) == 0
+        assert not core.pending_bank_statement_amounts(ledger)
+        assert [tuple(row) for row in ledger.execute("SELECT id,ref,date,amount FROM transactions ORDER BY id")] == saved
+        assert tuple(ledger.execute("SELECT category,note FROM transactions WHERE id=?", (saved[0][0],)).fetchone()) == (
+            "einnahme_sonstige", "Checked",
+        )
+
+
+@pytest.mark.parametrize("seed", [False, True])
+@pytest.mark.parametrize("target", [0, 1])
+@pytest.mark.parametrize("whole_page", [False, True])
+def test_paginated_bank_copy_needs_review_when_the_other_checkpoint_is_missing(sandbox, seed, target, whole_page):
+    import core
+    from hosted.bank_service import BankingService
+
+    reports = list(reported_balance_pair())
+    reports[target]["entry_reference"] = "signed"
+    reports[1 - target].pop("balance_after_transaction")
+    reports[1 - target]["entry_reference"] = "other-payment"
+    candidate = reports[target] | {"entry_reference": None, "transaction_id": "rotated", "balance_after_transaction": None}
+    repeated = []
+    queries = []
+
+    class PaginatedBank(StubProvider):
+        def request(self, method, path, *, query=None, data=None):
+            if method == "GET" and path.endswith("/transactions"):
+                if query.get("continuation_key"):
+                    return {"transactions": list(repeated)}
+                queries.append(query)
+                return {"transactions": list(reports), "continuation_key": "overlap"}
+            return super().request(method, path, query=query, data=data)
+
+    service = BankingService(sandbox, sandbox, SITE + "/api/bank/callback", client_factory=PaginatedBank)
+    service.save_credentials(APP_ID, b"fixture-key")
+    state = parse_qs(urlsplit(service.begin("tenant", "DE", BANK, "business")).query)["state"][0]
+    service.finish("tenant", state, "fixture-code", "")
+    now = datetime.now(timezone.utc)
+    if seed:
+        assert service.sync(force=True, now=now) == 2
+    copies = [reports[target] | {"transaction_id": "repeated-signed"},
+              reports[1 - target] | {"transaction_id": "repeated-neighbor"}, candidate | {"transaction_id": "another-copy"}]
+    repeated[:] = [candidate, *(copies if whole_page else [])]
+    assert service.sync(force=True, now=now + timedelta(days=1)) == (0 if seed else 2)
+    if seed:
+        assert queries[-1]["date_from"] == (now.date() - timedelta(days=14)).isoformat()
+    amount = 119 if target == 0 else -23
+    with closing(core.db()) as ledger:
+        assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (2, 96)
+        assert [(row["state"], row["amount"]) for row in core.pending_bank_statement_amounts(ledger)] == [("pending", amount)]
+        payment = tuple(ledger.execute("SELECT id,ref,date FROM transactions WHERE amount=?", (amount,)).fetchone())
+        core.set_tx_category(ledger, payment[0], "einnahme_sonstige", "Reviewed")
+    assert service.sync(force=True) == 0
+    repeated[:] = [candidate, *copies]
+    assert service.sync(force=True) == 0
+    repeated.clear()
+    assert service.sync(force=True) == 0
+    with closing(core.db()) as ledger:
+        assert [(row["state"], row["amount"]) for row in core.pending_bank_statement_amounts(ledger)] == [("pending", amount)]
+    reports[1 - target]["balance_after_transaction"] = {"amount": "96" if target == 0 else "119", "currency": "EUR"}
+    repeated.append(candidate)
+    assert service.sync(force=True) == 0
+    with closing(core.db()) as ledger:
+        assert not core.pending_bank_statement_amounts(ledger)
+        assert tuple(ledger.execute("SELECT id,ref,date,category,note FROM transactions WHERE amount=?", (amount,)).fetchone()) == (
+            *payment, "einnahme_sonstige", "Reviewed",
+        )
+
+
+@pytest.mark.parametrize("target", [0, 1])
+@pytest.mark.parametrize("bookends,repeat_at_resolution", [(False, False), (False, True), (True, False)])
+@pytest.mark.parametrize("seed", [False, True])
+@pytest.mark.parametrize("both_sparse", [False, True])
+def test_paginated_copy_of_a_payment_without_any_balance(sandbox, target, bookends, repeat_at_resolution, seed, both_sparse):
+    import core
+
+    reports = list(reported_balance_pair())
+    subject = reports[target]
+    balance = subject.pop("balance_after_transaction")
+    subject["entry_reference"] = "bank-entry"
+    other = reports[1 - target]
+    other["entry_reference"] = "other-entry"
+    sparse = subject | {"entry_reference": None, "transaction_id": "rotated"}
+    continuation = [sparse]
+    if both_sparse:
+        other.pop("balance_after_transaction")
+        continuation.append(other | {"entry_reference": None, "transaction_id": "other-copy"})
+    amount = 119 if target == 0 else -23
+    pending = [] if bookends else [("pending", value) for value in ([119, -23] if both_sparse else [amount])]
+    opening = bank_row(entry_reference="opening", booking_date="2026-11-19", remittance_information=["Opening"],
+                       transaction_amount={"amount": "10", "currency": "EUR"}, balance_after_transaction={"amount": "0", "currency": "EUR"})
+    tail = bank_row(entry_reference="tail", booking_date="2026-11-22", remittance_information=["Closing"], credit_debit_indicator="DBIT",
+                    transaction_amount={"amount": "10", "currency": "EUR"}, balance_after_transaction={"amount": "86", "currency": "EUR"})
+    base = [opening, *reports, tail] if bookends else reports
+    pages = [base]
+
+    class PaginatedBank(StubProvider):
+        def request(self, method, path, *, query=None, data=None):
+            index = int(query.get("continuation_key", "0"))
+            result = {"transactions": pages[index]}
+            if index + 1 < len(pages):
+                result["continuation_key"] = str(index + 1)
+            return result
+
+    provider = PaginatedBank(APP_ID, b"fixture-key")
+    with closing(core.db()) as ledger:
+        def sync():
+            assessments = []
+            incoming = provider.transactions(ACCOUNT, None, "2026-11-23")
+            rows, _ = transaction_rows("account-a", incoming, assessments=assessments, ledger=ledger)
+            result = core.import_bank_rows(ledger, rows, require_fx=True, auto_match=False, assessments=assessments)
+            return result["imported"]
+
+        def state():
+            totals = tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone())
+            pending = [(row["state"], row["amount"]) for row in core.pending_bank_statement_amounts(ledger)]
+            return totals, pending
+
+        if seed:
+            assert sync() == len(base)
+        pages[:] = [base, continuation, [row | {"transaction_id": "another-" + row["transaction_id"]} for row in continuation]]
+        assert sync() == (0 if seed else len(base))
+        assert state() == ((len(base), 96), pending)
+        original = tuple(ledger.execute("SELECT id,ref,date FROM transactions WHERE amount=?", (amount,)).fetchone())
+        core.set_tx_category(ledger, original[0], "einnahme_sonstige", "Reviewed")
+        pages.reverse()
+        assert sync() == 0
+        pages[:] = [base]
+        assert sync() == 0
+        assert state() == ((len(base), 96), pending)
+        if not bookends:
+            if not both_sparse:
+                subject["balance_after_transaction"] = balance
+            pages[:] = [[opening, *reports, tail], *([continuation] if repeat_at_resolution else [])]
+            assert sync() == 2
+            assert state() == ((4, 96), [])
+        assert tuple(ledger.execute("SELECT id,ref,date,category,note FROM transactions WHERE amount=?", (amount,)).fetchone()) == (
+            *original, "einnahme_sonstige", "Reviewed",
+        )
+
+
+@pytest.mark.parametrize("separate_on_page", [False, True])
+@pytest.mark.parametrize("distinct_reference", [False, True])
+def test_paginated_unbalanced_payments_keep_a_proven_second_payment(sandbox, separate_on_page, distinct_reference):
+    import core
+
+    first, debit = reported_balance_pair()
+    first.pop("balance_after_transaction")
+    first["entry_reference"] = "one"
+    second = first | {"entry_reference": "two" if distinct_reference else None, "transaction_id": "second"}
+    sparse = second | {"entry_reference": None}
+    opening = bank_row(entry_reference="opening", booking_date="2026-11-19", transaction_amount={"amount": "10", "currency": "EUR"},
+                       balance_after_transaction={"amount": "0", "currency": "EUR"})
+    debit["balance_after_transaction"] = {"amount": "215", "currency": "EUR"}
+    continuation = sparse if separate_on_page else second
+    pages = [[opening, first, *([second] if separate_on_page else []), debit], [continuation | {"transaction_id": "rotated"}]]
+
+    class PaginatedBank(StubProvider):
+        def request(self, method, path, *, query=None, data=None):
+            if query.get("continuation_key"):
+                return {"transactions": list(pages[1])}
+            return {"transactions": list(pages[0]), "continuation_key": "more"}
+
+    provider = PaginatedBank(APP_ID, b"fixture-key")
+    with closing(core.db()) as ledger:
+        for count in (4, 0, 0):
+            assessments = []
+            rows, _ = transaction_rows("account-a", provider.transactions(ACCOUNT, None, "2026-11-23"),
+                                       assessments=assessments, ledger=ledger)
+            assert core.import_bank_rows(ledger, rows, require_fx=True, auto_match=False, assessments=assessments)["imported"] == count
+            assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (4, 225)
+            assert not core.pending_bank_statement_amounts(ledger)
+            pages[1].append(sparse | {"transaction_id": f"another-{len(pages[1])}"})
+        if distinct_reference:
+            assert ledger.execute(
+                "SELECT count(DISTINCT provider_ref) FROM bank_import_facts JOIN transactions USING(ref) WHERE amount=119",
+            ).fetchone()[0] == 2
+
+
+@pytest.mark.parametrize("extra_payment", [False, True])
+def test_paginated_bank_copy_can_be_a_copy_of_either_known_payment(sandbox, extra_payment):
+    import core
+
+    first, fee = reported_balance_pair()
+    second = first | {"transaction_id": "second", "balance_after_transaction": {"amount": "238", "currency": "EUR"}}
+    fee["entry_reference"] = "fee"
+    fee.pop("balance_after_transaction")
+    sparse = first | {"transaction_id": "continuation", "balance_after_transaction": None}
+    observations = [first, second, fee]
+
+    class PaginatedBank(StubProvider):
+        def request(self, method, path, *, query=None, data=None):
+            if query.get("continuation_key"):
+                return {"transactions": [sparse]}
+            return {"transactions": list(observations), "continuation_key": "more"}
+
+    provider = PaginatedBank(APP_ID, b"fixture-key")
+    with closing(core.db()) as ledger:
+        def sync():
+            assessments = []
+            incoming = provider.transactions(ACCOUNT, None, "2026-11-23")
+            rows, _ = transaction_rows("account-a", incoming, assessments=assessments, ledger=ledger)
+            result = core.import_bank_rows(ledger, rows, require_fx=True, auto_match=False, assessments=assessments)
+            return result["imported"]
+
+        def state():
+            totals = tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone())
+            pending = [(row["state"], row["amount"]) for row in core.pending_bank_statement_amounts(ledger)]
+            return totals, pending
+
+        assert sync() == 3
+        assert state() == ((3, 215), [("pending", 119)])
+        credit_ids = [row[0] for row in ledger.execute("SELECT id FROM transactions WHERE amount=119 ORDER BY id")]
+        core.set_tx_category(ledger, credit_ids[0], "einnahme_sonstige", "Reviewed")
+        sparse["transaction_id"] = "renewed"
+        observations.reverse()
+        assert sync() == 0
+        assert state() == ((3, 215), [("pending", 119)])
+        fee["balance_after_transaction"] = {"amount": "334" if extra_payment else "215", "currency": "EUR"}
+        assert sync() == int(extra_payment)
+        assert sync() == 0
+        assert state() == ((4, 334) if extra_payment else (3, 215), [])
+        assert tuple(ledger.execute("SELECT category,note FROM transactions WHERE id=?", (credit_ids[0],)).fetchone()) == (
+            "einnahme_sonstige", "Reviewed",
+        )
+
+
 @pytest.mark.parametrize("sign", [-1, 1])
 @pytest.mark.parametrize("third", [False, True])
 @pytest.mark.parametrize("seed", [False, True])
@@ -3353,8 +3615,11 @@ def test_statement_corrections_are_owned_by_payment_evidence(sandbox, relation, 
 
 
 @pytest.mark.parametrize("absent_entry", ["fee", "all", "fee without payer", "fee without invoice"])
-@pytest.mark.parametrize("lookup", ["same", "renewed", "absent"])
-def test_overlapping_pages_keep_corroborated_bookings_without_an_entry_reference(sandbox, absent_entry, lookup):
+@pytest.mark.parametrize("lookup, paginated, extra_count", [
+    ("same", False, 1), ("renewed", False, 1), ("absent", False, 1),
+    ("renewed", True, 1), ("absent", True, 1), ("renewed", True, 2),
+])
+def test_overlapping_pages_keep_corroborated_bookings_without_an_entry_reference(sandbox, absent_entry, lookup, paginated, extra_count):
     import core
 
     def omit_entry(row, name):
@@ -3377,6 +3642,15 @@ def test_overlapping_pages_keep_corroborated_bookings_without_an_entry_reference
         # A known different payee establishes the separate fee in the second statement.
         second[-2]["creditor_account"] = {"iban": "DE00PAYEEB"}
     second[0] = first[0]
+    pages = []
+
+    class PaginatedBank(StubProvider):
+        def request(self, method, path, *, query=None, data=None):
+            index = int(query.get("continuation_key", "0"))
+            result = {"transactions": pages[index]}
+            if index + 1 < len(pages):
+                result["continuation_key"] = str(index + 1)
+            return result
 
     def overlapping_pages(reports):
         copies = [row.copy() for row in reports]
@@ -3385,6 +3659,9 @@ def test_overlapping_pages_keep_corroborated_bookings_without_an_entry_reference
                 row["transaction_id"] += "-later"
             elif lookup == "absent":
                 del row["transaction_id"]
+        if paginated:
+            pages[:] = [reports, copies]
+            return list(PaginatedBank(APP_ID, b"fixture-key").transactions(ACCOUNT, None, "2026-12-01"))
         return [*reports, *copies]
 
     with closing(core.db()) as ledger:
@@ -3406,13 +3683,49 @@ def test_overlapping_pages_keep_corroborated_bookings_without_an_entry_reference
         assert totals() == [("2026-11", 8, 0), ("2026-12", 2, -238)]
         assert [(row["state"], row["amount"]) for row in core.pending_bank_statement_amounts(ledger)] == [("unplaced", 119)] * 2
         assert sync(overlapping_pages([one, two])) == 2
-        assert sync([two, one]) == 0
-        booked = [tuple(row) for row in ledger.execute("SELECT id,ref,date,amount,description FROM transactions ORDER BY id")]
+        assert core.pending_bank_statement_amounts(ledger) == []
+        categorized = ledger.execute("SELECT id FROM transactions WHERE description='Supplies A' AND date='2026-12-01'").fetchone()[0]
+        core.set_tx_category(ledger, categorized, "einnahme_sonstige", "Checked payment")
+
+        def bookings():
+            return [tuple(row) for row in ledger.execute("SELECT id,ref,date,amount,description,category,note FROM transactions ORDER BY id")]
+
+        booked = bookings()
+        assert sync(overlapping_pages([two, one] * 2) if paginated else [two, one]) == 0
+        assert core.pending_bank_statement_amounts(ledger) == []
+        assert bookings() == booked
         full = [*first[:4], one, *first[5:], *second[:4], two, *second[5:]]
         assert sync(overlapping_pages(full)[::-1]) == 0
-        assert [tuple(row) for row in ledger.execute("SELECT id,ref,date,amount,description FROM transactions ORDER BY id")] == booked
+        assert bookings() == booked
         assert totals() == [("2026-11", 8, 0), ("2026-12", 4, 0)]
         assert core.pending_bank_statement_amounts(ledger) == []
+        if paginated:
+            extra_count = extra_count if absent_entry == "all" else 1
+            new_day = "2026-12-01" if absent_entry == "all" else "2026-12-02"
+            additional = one | dict.fromkeys(("booking_date", "value_date", "transaction_date"), new_day) | {
+                "reference_number": "separate-december-receipt",
+                "transaction_id": "additional",
+                "remittance_information": ["Separate December receipt"],
+                "balance_after_transaction": {"amount": "119", "currency": "EUR"},
+            }
+            checkpoint = first[-1] | dict.fromkeys(("booking_date", "value_date", "transaction_date"), "2026-12-03") | {
+                "reference_number": "december-checkpoint",
+                "transaction_id": "december-checkpoint",
+                "transaction_amount": {"amount": "23", "currency": "EUR"},
+                "balance_after_transaction": {"amount": str(119 * extra_count - 23), "currency": "EUR"},
+            }
+            if absent_entry == "all":
+                assert sync(overlapping_pages([one, two, additional])) == 1
+                assert sync(overlapping_pages([additional, two, one])[::-1]) == 0
+                assert totals() == [("2026-11", 8, 0), ("2026-12", 5, 119)]
+                assert [(row["state"], row["amount"]) for row in core.pending_bank_statement_amounts(ledger)] == [("pending", 119)]
+                assert sync(overlapping_pages([*full, additional, checkpoint])) == extra_count
+            else:
+                assert sync(overlapping_pages([one, two, additional, checkpoint])) == 2
+            assert sync(overlapping_pages([checkpoint, additional, two, one])) == 0
+            assert totals() == [("2026-11", 8, 0), ("2026-12", 5 + extra_count, 119 * extra_count - 23)]
+            assert bookings()[:len(booked)] == booked
+            assert core.pending_bank_statement_amounts(ledger) == []
 
 
 @pytest.mark.parametrize("changed", ["fee", "later rent"])
