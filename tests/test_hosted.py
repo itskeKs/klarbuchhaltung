@@ -1650,6 +1650,9 @@ def test_statement_cohort_accepts_redundant_partial_facts_and_reuses_existing_bo
 @pytest.mark.parametrize("axis,lookup", [
     ("booked", "distinct"), ("booked", "one"), ("value", "none"), ("intraday", "same"), ("intraday", "distinct"),
     ("intraday", "same-partial"),
+    ("missing-booking_date", "distinct"), ("missing-value_date", "distinct"),
+    ("missing-transaction_date", "distinct"), ("mixed-dates", "distinct"), ("disjoint-dates", "distinct"),
+    ("complementary", "distinct"),
 ])
 def test_anchored_statement_distinguishes_identical_bookings_from_page_copies(
     sandbox, physical_repeats, seed, sign, partial_page, axis, lookup,
@@ -1680,9 +1683,30 @@ def test_anchored_statement_distinguishes_identical_bookings_from_page_copies(
     if axis == "value":
         for row in whole:
             row["booking_date"] = "2026-11-25"
-    elif axis == "intraday":
+    elif axis != "booked":
         for row in whole:
             row.update(dict.fromkeys(("booking_date", "value_date", "transaction_date"), "2026-11-21"))
+    if axis.startswith("missing-"):
+        second[axis.removeprefix("missing-")] = None
+    if axis == "mixed-dates":
+        first["booking_date"] = None
+        second["value_date"] = None
+        opening["transaction_date"] = None
+        fee["booking_date"] = None
+        reverse["value_date"] = None
+    if axis == "disjoint-dates":
+        first["value_date"] = first["transaction_date"] = None
+        second["booking_date"] = None
+    if axis == "complementary":
+        first["entry_reference"] = None
+        second["reference_number"] = None
+    if physical_repeats and (axis.startswith("missing-") or axis.endswith("-dates")):
+        mapped, skipped = transaction_rows("account-a", whole)
+        assert skipped == 0
+        actual = [(row["booked_day"], row["value_day"], row["transaction_day"])
+                  for row in mapped if row["description"] == "rent"]
+        expected = [(row["booking_date"], row["value_date"], row["transaction_date"]) for row in (first, second)]
+        assert sorted(actual, key=repr) == sorted(expected, key=repr)
     initial = [first | {"transaction_id": None}, *whole] if partial_page else whole
     with closing(core.db()) as ledger:
         def sync(page):
@@ -1711,6 +1735,49 @@ def test_anchored_statement_distinguishes_identical_bookings_from_page_copies(
                 ).fetchone()) == (saved[1], "einnahme_sonstige")
 
 
+@pytest.mark.parametrize("first_repeats,second_repeats", [(True, True), (True, False), (False, True), (False, False)])
+@pytest.mark.parametrize("sign", [-1, 1])
+@pytest.mark.parametrize("lookup", [None, "shared"])
+def test_statement_proves_repeat_counts_of_two_groups_together(sandbox, first_repeats, second_repeats, sign, lookup):
+    import core
+
+    def movement(day, change, balance, ref):
+        return bank_row(booking_date=day, transaction_date=day, value_date=day, entry_reference=ref, reference_number=ref,
+                        transaction_id=lookup, remittance_information=[ref],
+                        transaction_amount={"amount": str(abs(change)), "currency": "EUR"},
+                        credit_debit_indicator="CRDT" if sign * change > 0 else "DBIT",
+                        balance_after_transaction={"amount": str(sign * balance), "currency": "EUR"},
+                        debtor_account={"iban": "DE00PAYER"}, creditor_account={"iban": "DE00PAYEE"})
+
+    opening = movement("2026-11-19", 10, 0, "opening")
+    first = movement("2026-11-20", 119, 119, "Rent")
+    second = movement("2026-11-21", 20, 139, "Supplies")
+    rent_reversal = movement("2026-11-20", -119, 0, "Rent reversal")
+    supplies_reversal = movement("2026-11-21", -20, 119, "Supplies reversal")
+    fee = movement("2026-11-22", -23, 116, "fee")
+    reversals = ([rent_reversal] if first_repeats else []) + ([supplies_reversal] if second_repeats else [])
+    whole = [opening, first, first.copy(), second, second.copy(), *reversals, fee]
+    expected = (4 + 2 * first_repeats + 2 * second_repeats, 126 * sign)
+    with closing(core.db()) as ledger:
+        def sync(page):
+            rows, skipped = transaction_rows("account-a", page)
+            result = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True)
+            assert skipped + result["ambiguous"] == 0
+
+        if lookup:
+            sync([first, second])
+        saved = [tuple(row) for row in ledger.execute("SELECT id, ref, date FROM transactions")]
+        for booking_id, _, _ in saved:
+            core.set_tx_category(ledger, booking_id, "einnahme_sonstige")
+        for page in (whole, whole[::-1], [*whole, *[first, second] * 3], [first, second, fee], whole):
+            sync(page)
+            assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == expected
+            for booking_id, ref, day in saved:
+                assert tuple(ledger.execute(
+                    "SELECT ref, date, category FROM transactions WHERE id = ?", (booking_id,),
+                ).fetchone()) == (ref, day, "einnahme_sonstige")
+
+
 def test_partial_statement_identity_cannot_bridge_conflicting_bank_references():
     first = bank_row(entry_reference="first", transaction_id="first",
                      debtor_account={"iban": "DE00PAYER"}, reference_number="shared",
@@ -1722,6 +1789,26 @@ def test_partial_statement_identity_cannot_bridge_conflicting_bank_references():
         rows, skipped = transaction_rows("account-a", page)
         assert skipped == 1
         assert sorted(row["description"] for row in rows) == ["First", "Second"]
+
+
+@pytest.mark.parametrize("count", [1, 2])
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_isolated_statement_gap_proves_count_without_reported_payment_balances(count, sign):
+    def movement(day, amount, balance, ref):
+        return bank_row(booking_date=day, transaction_date=day, value_date=day, entry_reference=ref, reference_number=ref,
+                        remittance_information=[ref], transaction_amount={"amount": str(abs(amount)), "currency": "EUR"},
+                        credit_debit_indicator="CRDT" if sign * amount > 0 else "DBIT",
+                        balance_after_transaction=None if balance is None else
+                        {"amount": str(sign * balance), "currency": "EUR"})
+
+    opening = movement("2026-11-20", 10, 0, "opening")
+    supplies = movement("2026-11-21", 119, None, "Supplies")
+    fee = movement("2026-11-22", -23, 119 * count - 23, "fee")
+    for page in ([opening, supplies, supplies.copy(), fee], [fee, supplies, supplies.copy(), opening]):
+        rows, warnings = transaction_rows("account-a", page)
+        assert warnings == 0
+        assert len([row for row in rows if row["description"] == "Supplies"]) == count
+        assert sum(float(row["amount"]) for row in rows) == (119 * count - 13) * sign
 
 
 @pytest.mark.parametrize("mode", ["initial", "singleton", "overlap"])

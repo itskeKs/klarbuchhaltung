@@ -52,6 +52,8 @@ For several versions, the statement can establish how many payments share a
 reported posting day even when their secondary dates remain unclear.
 Compatible bank facts can support that check when an optional reference is
 missing. Reported balances can also confirm two otherwise identical payments.
+The balance check considers related repeated movements together and preserves
+the bank's reported dates when other date fields are missing.
 If a later statement contradicts a payment already in the ledger, **Banking**
 flags it and keeps the posted payment and category.
 The ledger remembers account identifiers as fingerprints and learns missing evidence

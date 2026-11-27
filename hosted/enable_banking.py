@@ -130,6 +130,7 @@ def _statement_balance(balance):
 
 _FINANCIAL_BOOKING_FACTS = ("balance_key", "creditor_ref", "reference_schema")
 _SECONDARY_BANK_DATES = core._BANK_SECONDARY_DATES
+_STATEMENT_DATE_FIELDS = ("booked_day", *_SECONDARY_BANK_DATES)
 _FIXED_BOOKING_FACTS = (*_FINANCIAL_BOOKING_FACTS, "counterparty_iban")
 _OPTIONAL_BOOKING_FACTS = (*_FIXED_BOOKING_FACTS, *_SECONDARY_BANK_DATES)
 _REFERENCE_COPY_FACTS = ("balance_key", "creditor_ref")
@@ -502,15 +503,23 @@ def _statement_identity_conflict(first, second):
             or _conflicting_counterparties(first, second))
 
 
+def _statement_dates_compatible(versions):
+    return all(len({row[field] for row in versions if row[field]}) <= 1 for field in _STATEMENT_DATE_FIELDS)
+
+
 def _statement_corroborates(first, second):
     if _statement_identity_conflict(first, second):
         return False
     balance = _same_statement_fact(first, second, "balance_key")
     invoice = _same_statement_fact(first, second, "creditor_ref")
     payer = core._bank_account_match(first["counterparty_ids"], second["counterparty_ids"]) is True
+    # Use the same local evidence that could merge an unidentified copy.
+    # The balance proof can instead keep it as a separate observation.
+    compatible_copy = ((balance or invoice) and _statement_dates_compatible((first, second))
+                       and not first["bank_groups"].keys().isdisjoint(second["bank_groups"]))
     return ((_same_statement_fact(first, second, "provider_ref") and (balance or invoice))
             or (_same_statement_fact(first, second, "_transaction_id") and (balance or (invoice and payer)))
-            or (balance and invoice and payer and bool(first["provider_ref"] or second["provider_ref"])))
+            or (bool(first["provider_ref"] or second["provider_ref"]) and (compatible_copy or (balance and invoice and payer))))
 
 
 def _statement_identity_keys(row):
@@ -519,6 +528,8 @@ def _statement_identity_keys(row):
             yield field, row[field]
     if row["balance_key"] and row["creditor_ref"]:
         yield "financial", (row["balance_key"], row["creditor_ref"])
+    for evidence in _booking_evidence(row):
+        yield "dated_financial", evidence
 
 
 def _statement_distinct_versions(first, second, date_fields):
@@ -540,7 +551,7 @@ def _statement_other_versions(observations):
             buckets[row["currency"], row["_amount_key"], key].append(index)
     links = defaultdict(set)
     for (_, _, key), bucket in buckets.items():
-        if key[0] == "financial":
+        if key[0] in {"financial", "dated_financial"}:
             identified = [index for index in bucket if observations[index]["provider_ref"]]
             sparse = [index for index in bucket if not observations[index]["provider_ref"]]
             pairs = product(identified, sparse)
@@ -593,14 +604,14 @@ def _statement_search(currency, observed, candidates, other_versions, floating, 
                       entering=None, leaving=None, backwards=False, find_any=False):
     """Return proven boundary balances and whether every placement was checked."""
     budget = _STATEMENT_PLACEMENT_BUDGET
-    days = sorted(set(observed) | {day for day, _ in candidates}
+    days = sorted(set(observed) | {day for day, _ in candidates if day}
                   | {day for options in other_versions for version in options for day, _ in version if day})
     balances = set()
     complete = True
     for other in product(*other_versions):
-        conditional = [item for version in other for item in version]
-        fixed = (*candidates, *((day, row) for day, row in conditional if day))
-        undated = [*floating, *(row for day, row in conditional if not day)]
+        included = (*candidates, *(item for version in other for item in version))
+        fixed = tuple((day, row) for day, row in included if day)
+        undated = [*floating, *(row for day, row in included if not day)]
         for slots in product(days, repeat=len(undated)):
             if not budget:
                 return balances, False
@@ -637,7 +648,8 @@ def _statement_boundary(currency, observed, choices, other_versions, interval, *
 def _statement_outcomes(versions, account_rows, date_fields):
     """Return all supported subsets, an indeterminate empty tuple, or no evidence."""
     versions = tuple(_statement_evidence(row) for row in versions)
-    if len({row["balance_key"] for row in versions if row["balance_key"]}) != 1:
+    balances = {row["balance_key"] for row in versions if row["balance_key"]}
+    if len(balances) > 1 or (not balances and not all(row.get("_statement_occurrence") for row in versions)):
         return None
     first = versions[0]
     currency = first["currency"]
@@ -667,10 +679,11 @@ def _statement_outcomes(versions, account_rows, date_fields):
     inconsistent = False
     uncertain = False
     axes = (*date_fields, "booked_day") if "booked_day" not in date_fields else date_fields
-    same_dates = len({tuple(row[field] for field in ("booked_day", *_SECONDARY_BANK_DATES)) for row in versions}) == 1
+    compatible_dates = _statement_dates_compatible(versions)
     for field in axes:
         days = tuple(row[field] for row in versions)
-        if not all(days):
+        reported_days = [day for day in days if day]
+        if not reported_days:
             continue
         dated = defaultdict(list)
         floating = []
@@ -681,20 +694,32 @@ def _statement_outcomes(versions, account_rows, date_fields):
                 floating.append(row)
         others = [_statement_choices(tuple((row[field], row) for row in cohort), map(_statement_shape, cohort))
                   for cohort in cohorts]
-        alternate_days = [row[field] for cohort in cohorts for row in cohort if row[field]]
-        start, end = min(*days, *alternate_days), max(*days, *alternate_days)
+        other_days = [tuple(row[field] for row in cohort) for cohort in cohorts]
+        alternate_days = [day for dates in other_days if len(set(dates)) > 1 for day in dates if day]
+        dates = reported_days + alternate_days
+        start, end = min(dates), max(dates)
         candidates = tuple(zip(days, versions))
         candidate_sets = tuple(tuple(candidates[index] for index in subset) for subset in choices)
         inside = start, end
-        anchored_days = [day for day, rows in dated.items()
-                         if any(row["_statement_balance"] and row["_statement_balance"][0] == currency for row in rows)]
+        anchored_days = {day for day, rows in dated.items()
+                         if any(row["_statement_balance"] and row["_statement_balance"][0] == currency for row in rows)}
+        # Another cohort can vary in count while its date still provides a
+        # reported balance in every possible placement.
+        anchored_days.update(dates[0] for cohort, dates in zip(cohorts, other_days)
+                             if dates[0] and len(set(dates)) == 1 and all(
+                                 row["_statement_balance"] and row["_statement_balance"][0] == currency for row in cohort
+                             ))
         prior = any(day < start for day in anchored_days)
         following = any(day > end for day in anchored_days)
-        intraday = same_dates and start == end and sum(
-            bool(row["_statement_balance"] and row["_statement_balance"][0] == currency) for row in dated[start]
+        if not balances and not (prior and following):
+            continue
+        intraday = compatible_dates and start == end and start in anchored_days and sum(
+            bool(row["_statement_balance"] and row["_statement_balance"][0] == currency)
+            for row in (*dated[start], *floating)
         ) >= 2
-        undated = bool(floating) or any(row[field] is None for cohort in cohorts for row in cohort)
-        if undated and not (prior and following):
+        undated = (len(reported_days) != len(days) or bool(floating)
+                   or any(row[field] is None for cohort in cohorts for row in cohort))
+        if undated and not (intraday or (prior and following)):
             continue
         if start == end and not (intraday or (prior and following)):
             continue
@@ -728,7 +753,8 @@ def _statement_outcomes(versions, account_rows, date_fields):
                 continue
             leaving = end, local_closings
 
-        interval = min(start, min(dated)), max(end, max(dated))
+        considered_days = [start, end, *dated, *(day for dates in other_days for day in dates if day)]
+        interval = min(considered_days), max(considered_days)
         results = tuple(
             _statement_fit(_statement_search(currency, dated, candidate, others, floating, interval,
                                              entering=entering, leaving=leaving, find_any=True))
@@ -839,10 +865,17 @@ def _resolve_statement_cohorts(drafts):
             outcomes = _statement_outcomes(versions, drafts, dates)
             if outcomes is None:
                 continue
+            if (any(row.get("_statement_occurrence") for row in versions) and _statement_dates_compatible(versions)
+                    and len({len(outcome) for outcome in outcomes}) != 1):
+                warnings += int(bool(outcomes))
+                continue
             slots = _statement_slots(versions, outcomes)
             all_sources = frozenset().union(*(row["_statement_sources"] for row in versions))
-            supported = {index for subset in outcomes for index in subset}
-            rejected = [version for index, version in enumerate(versions) if outcomes and index not in supported]
+            supported = [versions[index] for index in {index for subset in outcomes for index in subset}]
+            rejected = [version for version in versions if outcomes and not any(
+                version["date"] == accepted["date"] and _statement_dates_compatible((version, accepted))
+                for accepted in supported
+            )]
             occurrences = Counter(index for _, alternatives in slots for index in set(alternatives))
             chosen = {index for index, _ in slots}
             kept = set()
@@ -864,7 +897,7 @@ def _resolve_statement_cohorts(drafts):
                         selected[source] = row
             omitted.update(all_sources - kept)
             ambiguous_dates = any(
-                len({tuple(versions[index][day] for day in dates) for index in alternatives}) > 1
+                not _statement_dates_compatible([versions[index] for index in alternatives])
                 for _, alternatives in slots
             )
             warnings += int({len(outcome) for outcome in outcomes} != {len(slots)} or ambiguous_dates)
@@ -1130,38 +1163,75 @@ def _link_repeated_statement_sources(rows):
                 row["_statement_evidence"] = evidence
 
 
+def _isolated_statement_gap(other_rows, field, day, currency):
+    """Check for an observation alone between two reported balances."""
+    if any(not row[field] or row[field] == day for row in other_rows):
+        return False
+    previous = max((row[field] for row in other_rows if row[field] < day), default=None)
+    following = min((row[field] for row in other_rows if row[field] > day), default=None)
+    if previous is None or following is None:
+        return False
+    for boundary in (previous, following):
+        movements = [row for row in other_rows if row[field] == boundary]
+        if (len({row["_statement_sources"] for row in movements}) != 1
+                or not any(row["_statement_balance"] and row["_statement_balance"][0] == currency for row in movements)):
+            return False
+    return True
+
+
+def _possible_statement_reset(amount, other_rows):
+    """Screen for the net change needed between two equal balance edges."""
+    target = -amount
+    changes = [Decimal(row["amount"]) for row in other_rows]
+    if not any(change * target > 0 for change in changes):
+        return False
+    totals = {Decimal(0)}
+    for change in changes:
+        totals.update({total + change for total in totals})
+        if target in totals or len(totals) > _STATEMENT_PLACEMENT_BUDGET:
+            return True
+    return False
+
+
 def _mark_statement_capacity(rows):
-    """Retain repeated observations for cash-flow proof with independent anchors."""
-    reported = defaultdict(list)
+    """Expose plausible repeat counts together before checking the cash flow."""
+    by_currency = defaultdict(list)
     for row in rows:
-        if row["_statement_balance"] and row["_statement_balance"][0] == row["currency"] and Decimal(row["amount"]):
-            reported[row["currency"]].append(row)
+        if Decimal(row["amount"]):
+            by_currency[row["currency"]].append(row)
     considered = set()
-    confirmed = set()
-    date_fields = ("booked_day", *_SECONDARY_BANK_DATES)
+    eligible = set()
     for row in rows:
         sources = row["_statement_sources"]
         if len(sources) < 2 or sources in considered or not row["provider_ref"]:
             continue
         considered.add(sources)
-        independent = [other for other in reported[row["currency"]] if other["_statement_sources"].isdisjoint(sources)
+        currency = row["currency"]
+        versions = [rows[index] for index in sources]
+        received = any(version["_statement_balance"] and version["_statement_balance"][0] == currency for version in versions)
+        other_rows = [other for other in by_currency[currency] if other["_statement_sources"].isdisjoint(sources)]
+        independent = [other for other in other_rows if other["_statement_balance"] and other["_statement_balance"][0] == currency
                        and (other["_amount_key"] != row["_amount_key"]
                             or (other["provider_ref"] and other["provider_ref"] != row["provider_ref"]))]
-        for field in date_fields:
+        reset = received and _possible_statement_reset(
+            Decimal(row["amount"]), (other for other in other_rows if _statement_dates_compatible((*versions, other))),
+        )
+        for field in _STATEMENT_DATE_FIELDS:
             day = next((rows[index][field] for index in sources if rows[index][field]), None)
             if day is None:
+                continue
+            if not received and _isolated_statement_gap(other_rows, field, day, currency):
+                eligible.update(sources)
+                break
+            if not reset:
                 continue
             dated = [(other[field], other["_statement_sources"]) for other in independent if other[field]]
             surrounding = any(other_day < day for other_day, _ in dated) and any(other_day > day for other_day, _ in dated)
             intraday = len({origins for other_day, origins in dated if other_day == day}) >= 2
             if surrounding or intraday:
-                versions = [rows[index] | {"_statement_sources": frozenset((index,)), "_statement_occurrence": True}
-                            for index in sorted(sources)]
-                outcomes = _statement_outcomes(versions, rows, date_fields)
-                if outcomes and len({len(outcome) for outcome in outcomes}) == 1 and len(outcomes[0]) > 1:
-                    confirmed.update(sources)
+                eligible.update(sources)
                 break
-    for index in confirmed:
+    for index in eligible:
         rows[index]["_statement_capacity"] = True
 
 
