@@ -16,4 +16,6 @@ Show a confirmed payment whose booking month remains open in the same notice
 area. Display its amount and whether the selected period includes it. Leave
 its booking date blank. Include it once when the range covers every possible
 booking month. Use the existing period selector for the all-years view.
+In the payments CSV, describe an undated confirmed movement as “Bestätigter
+Bankumsatz – Buchungsmonat noch offen” and leave its date blank.
 See the [bank import walkthrough](docs/acceptance/journeys.md).

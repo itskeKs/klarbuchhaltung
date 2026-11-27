@@ -32,4 +32,10 @@ totals and keeps the EUR 119.00 outside them. Sync again with the booking day
 provided. Only the identified month's totals change. The combined period
 still shows six payments and EUR 205.00 net.
 
+Download **Export CSV** before and after the bank supplies the date. Both files
+contain six movements totaling EUR 205.00. Before resolution, the confirmed
+receipt has a blank date and **Buchungsmonat noch offen** in its description.
+After resolution it appears once with its booking date. Blake's CSV has only
+the column headers.
+
 [Banking guide](../../hosted/README.md) · [Regression tests](../../tests/test_hosted.py)
