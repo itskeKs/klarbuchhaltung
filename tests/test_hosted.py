@@ -10,7 +10,7 @@ import re
 import sqlite3
 import subprocess
 import sys
-from threading import Barrier
+from threading import Barrier, BrokenBarrierError
 from time import monotonic, sleep
 from urllib.parse import parse_qs, urlencode, urlsplit
 from urllib.request import HTTPError, Request, urlopen
@@ -1429,6 +1429,137 @@ def test_statement_context_compares_both_payment_counts_without_dropping_sparse_
             assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (
                 expected_count, net * ledger_sign,
             )
+
+
+def ambiguous_reference_statement(sign=1):
+    def movement(day, change, balance, ref, description):
+        return bank_row(booking_date="2026-11-23", transaction_date=f"2026-11-{day:02}",
+                        value_date=f"2026-11-{day:02}", entry_reference=ref, reference_number=f"INV-{ref}",
+                        transaction_id=ref, remittance_information=[description], debtor_account={"iban": "DE00PAYER"},
+                        creditor_account={"iban": "DE00PAYEE"}, credit_debit_indicator="CRDT" if sign * change > 0 else "DBIT",
+                        transaction_amount={"amount": str(abs(change)), "currency": "EUR"},
+                        balance_after_transaction=None if balance is None else {"amount": str(balance * sign), "currency": "EUR"})
+
+    rent = movement(19, 119, 119, "rent", "Rent")
+    later_rent = movement(21, 119, 119, "rent", "Rent")
+    supplies = movement(22, 119, None, "supplies", "Supplies")
+    reversal = movement(20, -119, 0, "reversal", "Reversal")
+    fee = movement(22, -23, 96, "fee", "Fee")
+    closing_fee = movement(23, -10, 205, "closing", "Closing fee")
+    return [rent, reversal, later_rent, supplies, fee, closing_fee]
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+@pytest.mark.parametrize("seed", [None, "known", "unassigned", "assigned"])
+def test_statement_counts_proven_payment_without_guessing_its_reference(sandbox, sign, seed):
+    import core
+
+    whole = ambiguous_reference_statement(sign)
+    rent, reversal, later_rent, supplies, fee, _ = whole
+    neutral = "Kontoauszug prüfen"
+
+    with closing(core.db()) as ledger:
+        def sync(batch):
+            rows, skipped = transaction_rows("account-a", batch)
+            result = core.import_bank_rows(ledger, rows, auto_match=True, require_fx=True)
+            return result["imported"], skipped + result["ambiguous"]
+
+        saved_rent = saved_extra = None
+        if seed:
+            batch = [rent, reversal, supplies, fee] if seed == "known" else [rent, reversal, later_rent, supplies]
+            assert sync(batch)[0] == 4
+            saved_rent = ledger.execute(
+                "SELECT id, ref FROM transactions JOIN bank_import_facts USING (ref) "
+                "WHERE description = 'Rent' AND value_day = '2026-11-19'",
+            ).fetchone()
+            core.set_tx_category(ledger, saved_rent[0], "einnahme_sonstige")
+            if seed in {"unassigned", "assigned"}:
+                saved_extra = ledger.execute("SELECT id, ref FROM transactions WHERE description = 'Rent' AND id <> ?",
+                                             (saved_rent[0],)).fetchone()
+                if seed == "assigned":
+                    core.set_tx_category(ledger, saved_extra[0], "einnahme_sonstige")
+
+        assert sync(whole + whole) == ((2 if seed else 6), int(seed == "assigned"))
+        disputed = ledger.execute("SELECT * FROM transactions WHERE description = ?", (neutral,)).fetchone()
+        if seed == "assigned":
+            assert disputed is None
+            disputed = ledger.execute("SELECT * FROM transactions WHERE id = ?", (saved_extra[0],)).fetchone()
+            assert (disputed["ref"], disputed["description"], disputed["category"]) == (saved_extra[1], "Rent", "einnahme_sonstige")
+        else:
+            assert disputed is not None
+            if saved_extra:
+                assert disputed["id"] == saved_extra[0]
+            assert (disputed["amount"], disputed["date"], disputed["category"], disputed["invoice_id"]) == (
+                sign * 119, "2026-11-23", "offen", None,
+            )
+            assert tuple(ledger.execute(
+                "SELECT provider_ref, creditor_ref, reference_schema, counterparty_iban, counterparty_ids, value_day, transaction_day "
+                "FROM bank_import_facts WHERE ref = ?", (disputed["ref"],),
+            ).fetchone()) == (None,) * 7
+            assert sorted(row[0] for row in ledger.execute("SELECT description FROM transactions WHERE id <> ?", (disputed["id"],))) == [
+                "Closing fee", "Fee", "Rent", "Reversal", "Supplies",
+            ]
+            core.set_tx_category(ledger, disputed["id"], "einnahme_sonstige")
+
+        sparse_later = later_rent | {"transaction_id": "rotated", "reference_number": None, "balance_after_transaction": None}
+        reference_less = later_rent | {"transaction_id": "rotated-again", "entry_reference": None}
+        no_posting_day = later_rent | {"booking_date": None}
+        pages = ((whole + whole)[::-1], [later_rent, fee], [sparse_later], [reference_less], [no_posting_day],
+                 [supplies, fee], whole, whole + whole)
+        for page in pages:
+            assert sync(page)[0] == 0
+            assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (6, 205 * sign)
+            assert tuple(ledger.execute("SELECT ref, category FROM transactions WHERE id = ?", (disputed["id"],)).fetchone()) == (
+                disputed["ref"], "einnahme_sonstige",
+            )
+        if saved_rent:
+            assert tuple(ledger.execute("SELECT ref, category FROM transactions WHERE id = ?", (saved_rent[0],)).fetchone()) == (
+                saved_rent[1], "einnahme_sonstige",
+            )
+        rent_id, rent_ref = ledger.execute(
+            "SELECT id, ref FROM transactions JOIN bank_import_facts USING (ref) WHERE value_day = '2026-11-19'",
+        ).fetchone()
+        assert ledger.execute("SELECT count(*) FROM bank_import_date_aliases WHERE ref = ?", (rent_ref,)).fetchone()[0] == 2
+        if saved_rent:
+            assert rent_id == saved_rent[0]
+        rows, skipped = transaction_rows("different-account", [reference_less])
+        assert skipped == 0
+        assert core.import_bank_rows(ledger, rows, require_fx=True)["imported"] == 1
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_concurrent_statement_review_imports_one_neutral_payment(sandbox, legacy):
+    import core
+
+    statement = ambiguous_reference_statement()
+    rows, warnings = transaction_rows("account-a", statement * 2)
+    assert warnings == 0
+    with closing(core.db()) as ledger:
+        if legacy:
+            seed, _ = transaction_rows("account-a", statement[:4])
+            assert core.import_bank_rows(ledger, seed)["imported"] == 4
+    start = Barrier(2)
+    conversion = Barrier(2)
+
+    def import_statement():
+        with closing(core.db()) as ledger:
+            def overlap(sql):
+                if sql.startswith("UPDATE transactions SET description = "):
+                    try:
+                        conversion.wait(timeout=0.5)
+                    except BrokenBarrierError:
+                        pass
+
+            ledger.set_trace_callback(overlap)
+            start.wait(timeout=5)
+            return core.import_bank_rows(ledger, rows, require_fx=True)["imported"]
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        imported = list(pool.map(lambda _: import_statement(), range(2)))
+    assert sorted(imported) == [0, 2 if legacy else 6]
+    with closing(core.db()) as ledger:
+        assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (6, 205)
+        assert ledger.execute("SELECT count(*) FROM bank_statement_reviews").fetchone()[0] == 1
 
 
 @pytest.mark.parametrize("sign", [-1, 1])

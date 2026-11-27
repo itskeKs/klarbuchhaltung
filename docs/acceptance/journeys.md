@@ -14,4 +14,9 @@ second. It also returns a pending payment. All three carry synthetic description
 5. Categorize a payment as Alex and sync again. Its category stays assigned. Disconnect
    the account. Both payments remain under **Zahlungen**.
 
+For a statement totaling EUR 205.00 that proves one extra EUR 119.00 receipt
+with either of two references, find one **Kontoauszug prüfen** payment under
+**Zahlungen**. It stays open for statement review. Repeating the import leaves
+the total, the other payments and their assignments intact.
+
 [Banking guide](../../hosted/README.md) · [Regression tests](../../tests/test_hosted.py)

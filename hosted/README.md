@@ -54,6 +54,10 @@ Compatible bank facts can support that check when an optional reference is
 missing. Reported balances can also confirm two otherwise identical payments.
 The balance check considers related repeated movements together and preserves
 the bank's reported dates when other date fields are missing.
+If the statement proves an additional payment on a known booking date and
+leaves its bank reference unresolved, **Zahlungen** shows it once as an open
+payment. Check the statement before assigning it. The import leaves the
+reference, counterparty and category of that payment open.
 If a later statement contradicts a payment already in the ledger, **Banking**
 flags it and keeps the posted payment and category.
 The ledger remembers account identifiers as fingerprints and learns missing evidence

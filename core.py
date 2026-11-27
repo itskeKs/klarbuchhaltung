@@ -1134,6 +1134,11 @@ def init_schema(conn: sqlite3.Connection) -> None:
             value_day TEXT,
             transaction_day TEXT
         );
+        CREATE TABLE IF NOT EXISTS bank_statement_reviews (
+            review_key TEXT PRIMARY KEY,
+            ref TEXT NOT NULL UNIQUE REFERENCES transactions(ref) ON DELETE CASCADE,
+            alternatives TEXT NOT NULL
+        );
         CREATE INDEX IF NOT EXISTS idx_bank_provider_ref ON bank_import_facts(provider_ref);
         CREATE INDEX IF NOT EXISTS idx_bank_import_group ON bank_import_identity(booking_group);
         CREATE TABLE IF NOT EXISTS fx_rates (
@@ -2126,17 +2131,18 @@ def _bank_matches(conn, rows):
         )
     select = ("SELECT t.ref, t.description, " + ", ".join(f"f.{field}" for field in _BANK_IDENTITY_FIELDS)
               + ", f.counterparty_ids"
-              + " FROM transactions t LEFT JOIN bank_import_facts f USING (ref) ")
+              + " FROM transactions t LEFT JOIN bank_import_facts f USING (ref) "
+              + "WHERE t.ref NOT IN (SELECT ref FROM bank_statement_reviews) AND ")
     def lookup(clause, keys):
         return {key: [_bank_booking(r) for r in conn.execute(select + clause, (key,))]
                 for key in keys}
 
     by_day = lookup(
-        "WHERE t.ref IN (SELECT ref FROM bank_import_identity WHERE booking_group = ?1 "
+        "t.ref IN (SELECT ref FROM bank_import_identity WHERE booking_group = ?1 "
         "UNION ALL SELECT ref FROM bank_import_date_aliases WHERE booking_group = ?1)",
         {g for row in bank_rows for g in row["bank_groups"].values()},
     )
-    by_provider = lookup("WHERE f.provider_ref = ?", {r["provider_ref"] for r in bank_rows if r["provider_ref"]})
+    by_provider = lookup("f.provider_ref = ?", {r["provider_ref"] for r in bank_rows if r["provider_ref"]})
     options = {}
     posting_conflicts = set()
     unconfirmed_payers = defaultdict(list)
@@ -2152,7 +2158,7 @@ def _bank_matches(conn, rows):
             candidates.update(by_day[group])
         ref = row["ref"]
         # A legacy storage reference can be occupied by an incompatible booking.
-        while record := conn.execute(select + "WHERE t.ref = ?", (ref,)).fetchone():
+        while record := conn.execute(select + "t.ref = ?", (ref,)).fetchone():
             existing = _bank_booking(record)
             if not _bank_facts_conflict(row, existing):
                 candidates.add(existing)
@@ -2223,14 +2229,95 @@ def _bank_matches(conn, rows):
     return matched, ambiguous, storage_refs
 
 
+def _bank_statement_option(row):
+    return (tuple(sorted(row["bank_groups"].values())),
+            (row["ref"], None, *(row[field] for field in _BANK_IDENTITY_FIELDS), row["counterparty_ids"]))
+
+
+def _bank_statement_option_matches(row, option):
+    if row["ref"] == option.ref:
+        return True
+    if _stored_secondary_match(row, option) is not True or _bank_facts_conflict(row, option):
+        return False
+    return row["provider_ref"] == option.provider_ref or (
+        row["balance_key"] and row["balance_key"] == option.balance_key and row["creditor_ref"] == option.creditor_ref
+        and _bank_account_match(row["counterparty_ids"], option.counterparty_ids) is True
+    )
+
+
+def _record_bank_statement_review(conn, row, ref):
+    conn.execute("INSERT INTO bank_statement_reviews (review_key, ref, alternatives) VALUES (?, ?, ?)",
+                 (row["ref"], ref, json.dumps(row["_statement_review_options"])))
+
+
+def _prepare_bank_statement_reviews(conn, rows):
+    """Reserve independently confirmed payments before matching their disputed copies."""
+    if not any(row.get("bank_groups") for row in rows):
+        return rows, [], 0, 0
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    incoming = [row for row in rows if "_statement_review_options" in row]
+    pending = []
+    warnings = duplicates = 0
+    recorded = {}
+    disputed = defaultdict(list)
+    for key, ref, options in conn.execute("SELECT review_key, ref, alternatives FROM bank_statement_reviews"):
+        recorded[key] = ref
+        for groups, facts in json.loads(options):
+            option = _BankBooking(*facts)
+            for group in groups:
+                disputed[group].append(option)
+    for row in incoming:
+        alternatives = []
+        for groups, facts in row["_statement_review_options"]:
+            option = _BankBooking(*facts)
+            for group in groups:
+                disputed[group].append(option)
+            alternatives.append(option.ref)
+        prior = recorded.get(row["ref"])
+        if prior:
+            description = conn.execute("SELECT description FROM transactions WHERE ref = ?", (prior,)).fetchone()[0]
+            warnings += int(description != row["description"])
+            duplicates += 1
+            continue
+        candidates = [existing for alternative in alternatives if (existing := conn.execute(
+            "SELECT ref, category, invoice_id, expense_id, receipt_path, note FROM transactions "
+            "WHERE ref = ? AND date = ? AND amount = ? AND currency = ?",
+            (alternative, row["date"], float(row["amount"]), row["currency"]),
+        ).fetchone()) is not None]
+        if not candidates:
+            pending.append(row)
+            continue
+        if len(candidates) != 1:
+            warnings += 1
+            continue
+        ref, category, *assignments = candidates[0]
+        if category == "offen" and not any(assignments):
+            conn.execute("UPDATE transactions SET description = ? WHERE ref = ?", (row["description"], ref))
+            conn.execute("DELETE FROM bank_import_date_aliases WHERE ref = ?", (ref,))
+            conn.execute("DELETE FROM bank_import_facts WHERE ref = ?", (ref,))
+            _remember_bank_booking(conn, ref, row)
+        else:
+            warnings += 1
+        _record_bank_statement_review(conn, row, ref)
+        duplicates += 1
+    named = [row for row in rows if "_statement_review_options" not in row and (
+        not any(_bank_statement_option_matches(row, option) for group in row.get("bank_groups", {}).values()
+                for option in disputed.get(group, ()))
+    )]
+    duplicates += len(rows) - len(incoming) - len(named)
+    return named, pending, warnings, duplicates
+
+
 def import_bank_rows(conn, rows: list, *, auto_match: bool = True, require_fx: bool = False) -> dict:
     """Fertig normalisierte Zahlungen aufnehmen (z. B. aus dem Wirex-Konto).
 
     Auto-match is optional. Enable Banking rows are always left for review.
     'ref' ist UNIQUE, ein erneuter Abruf legt also nichts doppelt an."""
-    imported = dups = deferred = 0
-    seen, ambiguous, storage_refs = _bank_matches(conn, rows)
-    for r in rows:
+    imported = deferred = 0
+    named, pending_reviews, review_warnings, dups = _prepare_bank_statement_reviews(conn, rows)
+    seen, ambiguous, storage_refs = _bank_matches(conn, named)
+    for r in (*named, *pending_reviews):
         ref = (r.get("ref") or "").strip()
         date_ = (r.get("date") or "")[:10]
         if not ref or not date_:
@@ -2259,6 +2346,8 @@ def import_bank_rows(conn, rows: list, *, auto_match: bool = True, require_fx: b
         )
         if inserted.rowcount and r.get("bank_groups"):
             _remember_bank_booking(conn, ref, r)
+            if "_statement_review_options" in r:
+                _record_bank_statement_review(conn, r, ref)
         imported += inserted.rowcount
         dups += 1 - inserted.rowcount
     conn.commit()
@@ -2266,7 +2355,7 @@ def import_bank_rows(conn, rows: list, *, auto_match: bool = True, require_fx: b
     result = {"imported": imported, "duplicates": dups, "matched": matched}
     if require_fx:
         result["deferred"] = deferred
-        result["ambiguous"] = len(ambiguous)
+        result["ambiguous"] = len(ambiguous) + review_warnings
     return result
 
 

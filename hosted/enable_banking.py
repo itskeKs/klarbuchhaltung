@@ -1235,6 +1235,113 @@ def _mark_statement_capacity(rows):
         rows[index]["_statement_capacity"] = True
 
 
+def _statement_reference_dispute(versions, sparse, observations, currency):
+    """Prove one additional payment while keeping the two references unassigned."""
+    origins = frozenset().union(*(row["_statement_sources"] for row in (*versions, sparse)))
+    other = [row for row in observations if row["_statement_sources"].isdisjoint(origins)]
+    if _statement_other_versions(other) != ([], False):
+        return None
+    supported = set()
+    alternatives = {}
+    required = None
+    for field in _SECONDARY_BANK_DATES:
+        if any(not row[field] for row in (*versions, sparse, *other)):
+            continue
+        first_day = min(row[field] for row in versions)
+        first = [row for row in versions if row[field] == first_day]
+        if len(first) != 1:
+            continue
+        later = [row for row in versions if row[field] > first_day]
+        start = min(sparse[field], *(row[field] for row in later))
+        end = max(sparse[field], *(row[field] for row in later))
+        anchors = {row[field] for row in other if row["_statement_balance"] and row["_statement_balance"][0] == currency}
+        if not (any(first_day < day < start for day in anchors) and any(day > end for day in anchors)):
+            continue
+        if required is not None and required != first[0]["_statement_sources"]:
+            return None
+        required = first[0]["_statement_sources"]
+        fixed = defaultdict(list)
+        for row in (*first, *other):
+            fixed[row[field]].append(row)
+        interval = min(fixed), max(fixed)
+        options = ((), *_statement_choices(tuple(later), map(_statement_shape, later)))
+        counts = range(1, len(sparse["_statement_sources"]) + 1)
+        if len(options) * len(counts) > _STATEMENT_PLACEMENT_BUDGET:
+            return None
+        axis = set()
+        for selected, count in product(options, counts):
+            candidates = (*((row[field], row) for row in selected), *((sparse[field], sparse),) * count)
+            # Distinct possible occurrences of an identical observation need
+            # different provenance inside the trail, but no durable IDs.
+            candidates = [(day, row | {"_statement_sources": (index,)}) for index, (day, row) in enumerate(candidates)]
+            fits = _statement_fit(_statement_search(currency, fixed, candidates, (), (), interval, find_any=True))
+            if fits is None:
+                return None
+            if fits:
+                axis.add((len(selected), count))
+        if not axis:
+            return None
+        supported.update(axis)
+        alternatives.update((row["ref"], row) for row in later)
+    if supported == {(1, 1), (0, 2)}:
+        return origins, alternatives
+    return None
+
+
+def _separate_unresolved_references(account_key, drafts):
+    """Remove disputed copies only when the whole statement proves their net amount."""
+    excluded = set()
+    neutral = []
+    for currency in {row["currency"] for row in drafts}:
+        observations = _statement_observations(drafts, (), currency)
+        linked = defaultdict(lambda: defaultdict(list))
+        for row in observations:
+            if row["booked_day"] and row["provider_ref"]:
+                linked[row["booked_day"], row["_amount_key"]][row["provider_ref"]].append(row)
+        for (day, amount), references in linked.items():
+            if len(references) < 2:
+                continue
+            corrections = [(ref, versions) for ref, versions in references.items()
+                           if len(versions) > 1 and all(row["balance_key"] for row in versions) and not any(
+                               _statement_identity_conflict(first, second) for first, second in combinations(versions, 2)
+                           )]
+            for (sparse, *more), (provider_ref, versions) in product(references.values(), corrections):
+                if (more or sparse["balance_key"] or len(sparse["_statement_sources"]) < 2 or any(
+                    _statement_shape(drafts[index]) != _statement_shape(sparse) for index in sparse["_statement_sources"]
+                )):
+                    continue
+                result = _statement_reference_dispute(versions, sparse, observations, currency)
+                if result is None:
+                    continue
+                origins, alternatives = result
+                if not excluded.isdisjoint(origins):
+                    continue
+                key = fingerprint(account_key, "statement-review", day, amount, currency,
+                                  sorted((provider_ref, sparse["provider_ref"])))
+                group = sparse["bank_groups"][day]
+                neutral.append(dict.fromkeys(core._BANK_IDENTITY_FIELDS) | {
+                    "ref": core.ENABLE_BANKING_REF_PREFIX + key, "date": day, "booked_day": day, "amount": amount,
+                    "currency": currency, "description": "Kontoauszug prüfen",
+                    "tx_type": "Enable Banking", "counterparty_ids": (), "bank_group": group, "bank_groups": {day: group},
+                    "_statement_review_options": [core._bank_statement_option(alternatives[ref]) for ref in sorted(alternatives)],
+                })
+                excluded.update(index for index in origins if drafts[index]["ref"] in alternatives)
+                excluded.update(sorted(sparse["_statement_sources"])[1:])
+    if not neutral:
+        return drafts, neutral
+    retained = []
+    for index, row in enumerate(drafts):
+        if index in excluded:
+            continue
+        row["_statement_sources"] = frozenset((len(retained),))
+        row.pop("_statement_evidence", None)
+        row.pop("_statement_capacity", None)
+        retained.append(row)
+    _link_repeated_statement_sources(retained)
+    _mark_statement_capacity(retained)
+    return retained, neutral
+
+
 def _separate_statement_references(rows):
     """Number proven equal bookings without saving the response's lookup IDs."""
     by_ref = defaultdict(list)
@@ -1361,6 +1468,7 @@ def transaction_rows(account_key, transactions):
         drafts.append(row)
     _link_repeated_statement_sources(drafts)
     _mark_statement_capacity(drafts)
+    drafts, neutral = _separate_unresolved_references(account_key, drafts)
     selected, warnings = _resolve_statement_cohorts(drafts)
     skipped += warnings
     versions, warnings = _merge_fetch_copies(account_key, selected, drafts)
@@ -1398,4 +1506,4 @@ def transaction_rows(account_key, transactions):
         row.pop("_statement_capacity", None)
         row.pop("_statement_choice", None)
         row.pop("_statement_slot", None)
-    return [row for row in rows if row["ref"] not in rejected], skipped + warnings
+    return [*(row for row in rows if row["ref"] not in rejected), *neutral], skipped + warnings
