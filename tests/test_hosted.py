@@ -2313,6 +2313,61 @@ def test_unrelated_bank_review_keeps_recovered_evidence_on_first_sync(sandbox, s
             assert [tuple(row) for row in ledger.execute("SELECT * FROM bank_statement_assessments ORDER BY review_key")] == old_reviews
 
 
+@pytest.mark.parametrize("sign", [-1, 1])
+@pytest.mark.parametrize("delivery", ["chronological", "newest-first", "split"])
+@pytest.mark.parametrize("shared_boundary", [False, True])
+def test_combined_bank_statement_reconciles_an_independently_anchored_segment(sandbox, sign, delivery, shared_boundary):
+    import core
+
+    older = [row | {key: row[key].replace("2026-11", "2026-09")
+                    for key in ("booking_date", "value_date", "transaction_date") if row.get(key)}
+             | {key: f"older-{row[key]}" for key in ("entry_reference", "transaction_id", "reference_number")}
+             for row in ambiguous_reference_statement(sign)]
+    if shared_boundary:
+        older = [row | {"booking_date": "2026-11-17"} | {
+            key: (date.fromisoformat(row[key]) + timedelta(days=55)).isoformat()
+            for key in ("value_date", "transaction_date")
+        } for row in older]
+    bridge = _bank_motion("2026-11-18" if shared_boundary else "2026-10-05", -215 * sign, -10 * sign,
+                          "Bridge", entry_reference="bridge")
+    prior, complete = _bank_late_fee_history(sign)
+    partial = [row | dict.fromkeys({"Opening": ("booking_date",), "Service": ("balance_after_transaction",)}.get(
+        row["remittance_information"][0], (),
+    )) for row in complete]
+
+    def pages(reply, phase):
+        reports = [*older, bridge, *reply]
+        if delivery == "newest-first":
+            reports.reverse()
+        elif delivery == "split":
+            reports = [*reports[::2], *reports[1::2][::-1]]
+        reports = [row | {"transaction_id": f"fetch-{phase}-{index}"} for index, row in enumerate(reports)]
+        return [reports[index:index + 4] for index in range(0, len(reports), 4)]
+
+    with closing(core.db()) as ledger:
+        assert _sync_bank_pages(ledger, [older]) == 5
+        old_payments = [tuple(row) for row in ledger.execute("SELECT * FROM transactions ORDER BY id")]
+        assert _sync_bank_pages(ledger, [prior]) == 4
+        original = {row["id"]: tuple(row) for row in ledger.execute(
+            "SELECT id,ref,date,description FROM transactions WHERE date >= '2026-11-18' ORDER BY id",
+        )}
+        for ident in original:
+            core.set_tx_category(ledger, ident, "gebuehr", f"Assigned {ident}")
+        for phase, reply in enumerate((partial, partial, complete, complete[::-1], prior, complete)):
+            assert _sync_bank_pages(ledger, pages(reply, phase)) == (4 if phase == 0 else 0)
+            assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions "
+                                        "WHERE date >= '2026-11-18' AND description!='Bridge'").fetchone()) == (7, sign * 125)
+            assert {row["id"]: tuple(row) for row in ledger.execute(
+                "SELECT id,ref,date,description FROM transactions WHERE category='gebuehr' ORDER BY id",
+            )} == original
+            assert all(row["note"] == f"Assigned {row['id']}" for row in ledger.execute(
+                "SELECT id,note FROM transactions WHERE category='gebuehr'",
+            ))
+            assert [tuple(row) for row in ledger.execute("SELECT * FROM transactions WHERE date < '2026-11-18' "
+                                                        "AND description!='Bridge' ORDER BY id")] == old_payments
+            assert [(row["state"], row["amount"]) for row in core.pending_bank_statement_amounts(ledger)] == [("pending", 119 * sign)]
+
+
 @pytest.mark.parametrize("shape", ["undated tail", "dense days", "long trail", "unreferenced fee", "undated rent", "undated fee"])
 def test_bank_balance_revision_uses_the_evidenced_interval(sandbox, shape):
     import core

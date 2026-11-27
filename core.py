@@ -3555,6 +3555,54 @@ def _bank_revision_placements(dated, undated, previous, links):
         yield trial, earlier
 
 
+def _bank_aligned_revision_windows(conn, account, currency, current, prior, matches, unplaced):
+    """Keep independently anchored spans when another part of the fetch is unresolved."""
+    if not current:
+        return {}, None
+    first, last = min(current), max(current)
+
+    def crosses_unplaced(start, end):
+        return any(row.first <= end and start <= row.last for row in unplaced)
+
+    aligned, feasible = {}, None
+    if not crosses_unplaced(first, last):
+        aligned, feasible = _bank_aligned_balance_revisions(conn, account, currency, current, prior, matches)
+        required = {id(row) for entries in current.values() for row, _ in entries if matches[id(row)]}
+        if required <= aligned.keys():
+            return aligned, feasible
+    boundaries = {first, last}
+    for day, entries in current.items():
+        payments = [row for row, _ in entries]
+        previous = [(old, movement.amount, movement.balance_keys) for old, movement in prior.get(day, ())]
+        if (crosses_unplaced(day, day) or not all(row["booked_day"] == day for row in payments)
+                or not all(old.booked_day == day for old, _, _ in previous)):
+            continue
+        if _bank_shared_closing_balance(payments, previous, matches, currency, day) is not None:
+            boundaries.add(day)
+    if len(boundaries) < 3:
+        return aligned, feasible
+    ordered = sorted(boundaries)
+    disputed = set()
+    for start, end in zip(ordered, ordered[1:]):
+        if crosses_unplaced(start, end):
+            continue
+        incoming = {day: entries for day, entries in current.items() if start <= day <= end}
+        recorded = {day: entries for day, entries in prior.items() if start <= day <= end}
+        evidence, _ = _bank_aligned_balance_revisions(conn, account, currency, incoming, recorded, matches)
+        for source, answer in evidence.items():
+            if source in disputed:
+                continue
+            if source in aligned:
+                common = _bank_common_revision_matches({source: aligned[source]}, {source: answer})
+                if source not in common:
+                    del aligned[source]
+                    disputed.add(source)
+                    continue
+                answer = common[source]
+            aligned[source] = answer
+    return aligned, None
+
+
 def _reconcile_bank_balance_revisions(conn, rows, assessments):
     """Reconcile changed running balances against dated, signed histories."""
     accounts = defaultdict(list)
@@ -3642,22 +3690,24 @@ def _reconcile_bank_balance_revisions(conn, rows, assessments):
                 anchors[day] = ending
 
         aligned = None
-        if not any(entry.first != entry.last for entry in (*live, *recorded)):
-            links = _bank_undated_revision_links(undated_reports, undated_bookings, matches)
-            if links is not None:
-                shared = len(links) == len(undated_reports) and all(
-                    row["balance_key"] in links[id(row)][1].balance_keys
-                    or not row["balance_key"] and not links[id(row)][1].balance_keys
-                    for row in undated_reports
-                )
-                if shared:
-                    aligned, _ = _bank_aligned_balance_revisions(conn, account, currency, live_days, prior_days, matches)
-                if undated_reports and not aligned:
-                    aligned = None
-                    for placement, earlier in _bank_revision_placements(live_days, undated_reports, prior_days, links):
-                        answer, feasible = _bank_aligned_balance_revisions(conn, account, currency, placement, earlier, matches)
-                        if feasible is not False:
-                            aligned = _bank_common_revision_matches(aligned, answer)
+        unplaced = [entry for entry in (*live, *recorded) if entry.first != entry.last]
+        links = _bank_undated_revision_links(undated_reports, undated_bookings, matches)
+        if links is not None:
+            shared = len(links) == len(undated_reports) and all(
+                row["balance_key"] in links[id(row)][1].balance_keys
+                or not row["balance_key"] and not links[id(row)][1].balance_keys
+                for row in undated_reports
+            )
+            if shared:
+                aligned, _ = _bank_aligned_revision_windows(conn, account, currency, live_days, prior_days, matches, unplaced)
+            if undated_reports and not aligned and not unplaced:
+                aligned = None
+                # An undated addition can cross a checkpoint. Its possible
+                # placements still require the complete signed comparison.
+                for placement, earlier in _bank_revision_placements(live_days, undated_reports, prior_days, links):
+                    answer, feasible = _bank_aligned_balance_revisions(conn, account, currency, placement, earlier, matches)
+                    if feasible is not False:
+                        aligned = _bank_common_revision_matches(aligned, answer)
         aligned = aligned or {}
         aligned_rows.update(aligned)
         for row in reports:

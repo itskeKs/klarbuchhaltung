@@ -120,6 +120,9 @@ a missing balance without changing its assignment. A consumed matching candidate
 or missing evidence does not establish another payment. An additional occurrence
 needs independent evidence; unresolved replies can wait for a fuller statement
 without making the later reconciliation post the established payments again.
+An unresolved earlier statement does not block a later segment whose shared
+checkpoints independently establish its payments. The earlier amount remains
+in review until its own evidence is complete.
 After the bank establishes a payment's booking month, replays of its confirmed
 reports can use the same statement evidence even if the fetch only covers that month.
 Previously confirmed movements on that day can also help check a new report
