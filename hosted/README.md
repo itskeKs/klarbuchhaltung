@@ -135,6 +135,9 @@ possible, **Zahlungen** includes the proven amount and shows the possible
 remainder separately. Later balances that close the period can clear this
 notice. The established payment stays linked to the same ledger entry when
 the bank revises a reference or supplies a previously missing balance.
+Independent earlier and later balances can establish the payment count
+when each repeated report omits its own balance. A complete replay can
+reuse corroborated balances from the same account if the bank omits them.
 Receiving the same observations on one page or several pages leaves the booked
 amount unchanged. If the statement establishes both the amount and its purpose,
 **Zahlungen** shows the observed purpose.

@@ -2193,6 +2193,83 @@ def _matches_page_occurrence(row, options):
     return any(core._bank_has_shared_date(row, old) and not core._bank_facts_conflict(row, old) for old in options)
 
 
+def _joint_replay_rank(row, groups, old, booked, *, subject):
+    if core._joint_statement_source(row, groups, old):
+        if (old.ref and row["ref"] == old.ref) or (old.provider_ref and row["provider_ref"] == old.provider_ref):
+            return 0
+        return 1 if row["provider_ref"] else 2
+    if core._joint_proof_member_matches((groups, old), core._bank_statement_option(row), subject=subject):
+        return 1 if row["provider_ref"] else 2
+    # A checkpoint can lose both its balance and reference. Its posted
+    # description and typed dates still identify it in a complete replay.
+    if (not subject and not row["balance_key"] and (not row["provider_ref"] or row["provider_ref"] == old.provider_ref)
+            and row["booked_day"] and row["booked_day"] == old.booked_day
+            and all(row[field] and row[field] == getattr(old, field) for field in _SECONDARY_BANK_DATES)
+            and core._bank_description_matches(row, booked) and not core._bank_facts_conflict(row, old)):
+        return 2
+    return None
+
+
+def _joint_replay_evidence(conn, account, first, last, drafts):
+    """Use a complete matching witness before filling omissions on a replay."""
+    saved = conn.execute(
+        "SELECT currency, details FROM bank_statement_assessments WHERE account_key = :account "
+        "AND json_type(details, '$.joint') = 'object' AND state IN ('confirmed', 'unplaced') "
+        "AND json_extract(details, '$.joint.bounds[0]') <= :last AND json_extract(details, '$.joint.bounds[1]') >= :first "
+        "UNION SELECT currency, alternatives FROM bank_statement_reviews JOIN transactions USING (ref) "
+        "WHERE json_extract(alternatives, '$.joint.account_key') = :account "
+        "AND json_extract(alternatives, '$.joint.bounds[0]') <= :last "
+        "AND json_extract(alternatives, '$.joint.bounds[1]') >= :first",
+        {"account": account, "first": first, "last": last},
+    )
+    candidates, recorded = defaultdict(list), {}
+    for index, row in enumerate(drafts):
+        for group in row["bank_groups"].values():
+            candidates[row["currency"], group].append(index)
+    evidence, balances = defaultdict(set), defaultdict(dict)
+    checked = set()
+    for currency, encoded in saved:
+        for proof in core._joint_evidence_versions(json.loads(encoded)):
+            joint = proof["joint"]
+            members = joint["members"]
+            identity = currency, json.dumps(members)
+            if identity in checked:
+                continue
+            checked.add(identity)
+            subjects = {group for groups, _ in proof["observations"] for group in groups}
+            covered = {}
+            for groups, facts in members:
+                scope = tuple(groups)
+                if scope not in recorded:
+                    recorded[scope] = core._bank_statement_group_bookings(conn, scope)
+                old = _overlap_booking(facts)
+                subject = not subjects.isdisjoint(groups)
+                current = {index for group in groups for index in candidates[currency, group]}
+                prior = {booking for booking in recorded[scope] if core._joint_proof_member_matches(
+                    (groups, facts), (groups, booking), subject=subject,
+                )}
+                if len(prior) != 1:
+                    break
+                booking = next(iter(prior))
+                ranked = [(priority, index) for index in current if (priority := _joint_replay_rank(
+                    drafts[index], groups, old, booking, subject=subject,
+                )) is not None]
+                if not ranked:
+                    break
+                best = min(priority for priority, _ in ranked)
+                matches = [index for priority, index in ranked if priority == best]
+                if len(matches) != 1 or matches[0] in covered:
+                    break
+                covered[matches[0]] = booking.ref, old.balance_key
+            else:
+                if sum(bool(key) for _, key in covered.values()) < 2:
+                    continue
+                balances[currency].update((key, Decimal(value)) for key, value in joint.get("balances", ()))
+                for index, facts in covered.items():
+                    evidence[index].add(facts)
+    return {index: next(iter(matches)) for index, matches in evidence.items() if len(matches) == 1}, balances
+
+
 @dataclass(eq=False)
 class _StatementFetch:
     account_key: str
@@ -2214,9 +2291,10 @@ class _StatementFetch:
             "AND json_extract(details, '$.overlap.bounds[1]') >= :first))",
             {"account": self.account_key, "first": first, "last": last},
         )]
-        if not saved:
+        witnessed, known = _joint_replay_evidence(conn, self.account_key, first, last, self.drafts)
+        if not saved and not witnessed:
             return None
-        alternatives, known = defaultdict(list), defaultdict(dict)
+        alternatives = defaultdict(list)
         pending_pages = defaultdict(list)
         for index, (state, _, currency, details) in enumerate(saved):
             known[currency].update((key, Decimal(value)) for key, value in details.get("balances", ()))
@@ -2234,9 +2312,10 @@ class _StatementFetch:
                 for group in groups:
                     pending_pages[group].append((index, details["occurrences"][1], sparse_days, signed_edge, options))
         current_balances = defaultdict(list)
-        for row in self.drafts:
-            if row.get("_fetch_page") is not None and _reported_balance(row):
-                current_balances[row["currency"], row["_amount_key"], row["balance_key"]].append(row)
+        for index, row in enumerate(self.drafts):
+            key = row["balance_key"] if _reported_balance(row) else witnessed.get(index, (None, None))[1]
+            if key and (index in witnessed or row.get("_fetch_page") is not None):
+                current_balances[row["currency"], row["_amount_key"], key].append(row)
         sources = {}
         pending_counts = {}
         missing = defaultdict(set)
@@ -2252,27 +2331,31 @@ class _StatementFetch:
                 continue
             candidates = core._bank_statement_group_bookings(conn, groups)
             candidates.update(option for group in groups for option in alternatives[group])
-            if key := _verified_statement_balance(row, candidates):
+            if key := witnessed.get(index, (None, None))[1] or _verified_statement_balance(row, candidates):
                 currency = row["currency"]
-                # A balance already reported by a compatible current copy
-                # is one observation, even if a previous reply also saw it.
+                # A balance belongs to the corroborated observation. Do not
+                # also infer it for another copy whose balance is unknown.
                 page = row.get("_fetch_page")
-                if page is not None and any(other["_fetch_page"] != page and _sparse_reports_match(row, other)
-                                            for other in current_balances[currency, row["_amount_key"], key]):
+                if any(other is not row and (other["_report_index"] in witnessed
+                       or (page is not None and other["_fetch_page"] != page)) and _sparse_reports_match(row, other)
+                       for other in current_balances[currency, row["_amount_key"], key]):
                     continue
                 sources[index] = currency, key
                 if key not in known[currency]:
                     missing[currency].add(key)
         for currency, fingerprints in missing.items():
-            known[currency].update(_recover_legacy_statement_balances(currency, self.drafts, fingerprints))
+            amounts = {Decimal(self.drafts[index]["amount"]) for index in witnessed if self.drafts[index]["currency"] == currency}
+            known[currency].update(_recover_legacy_statement_balances(currency, self.drafts, fingerprints, witnessed_amounts=amounts))
         has_balances = any(key in known[currency] for currency, key in sources.values())
-        if not has_balances and not pending_counts and not any(state in {"unplaced", "confirmed"} for state, _, _, _ in saved):
+        if not has_balances and not witnessed and not pending_counts and not any(state in {"unplaced", "confirmed"} for state, _, _, _ in saved):
             return None
         drafts = []
         for index, row in enumerate(self.drafts):
             currency, key = sources.get(index, (row["currency"], None))
             if key in known[currency]:
                 row = row | {"_statement_balance": (currency, known[currency][key]), "balance_key": key}
+            if index in witnessed:
+                row = row | {"_confirmed_reference_aliases": {witnessed[index][0]}}
             if index in pending_counts:
                 count, sparse_days, signed_edge = pending_counts[index]
                 row = row | {"_pending_page_count": count, "_pending_sparse_days": sparse_days, "_pending_signed_edge": signed_edge}
@@ -2281,7 +2364,7 @@ class _StatementFetch:
                     and (overlap := _overlap_proof_rows(conn, self.account_key, amount, currency, details, drafts))]
         claims = Counter(index for overlap in overlaps for index in overlap.matched)
         independent = [overlap for overlap in overlaps if all(claims[index] == 1 for index in overlap.matched)]
-        return (drafts, independent) if has_balances or independent or pending_counts else None
+        return (drafts, independent) if has_balances or witnessed or independent or pending_counts else None
 
     def restore(self, conn, selected):
         correction = self.corrected_drafts(conn)
@@ -3041,11 +3124,19 @@ def _joint_balance_proofs(families, account_by_currency):
                 days = [day for index, day in dated.items() if index in window]
                 first, last = min(days), max(days)
                 window.update(index for index, day in dated.items() if first <= day <= last)
-            if len(connected) < 2 or not any(_reported_balance(row) for member in connected for row in member.reports):
+            if len(connected) < 2:
                 continue
             peers = [row for row in account_by_currency[currency] if row["_report_index"] in window - subjects]
             if not any(_reported_balance(row) for row in peers):
                 continue
+            subject_rows = [row for family in connected for row in family.reports]
+            if not any(_reported_balance(row) for row in subject_rows):
+                # The subjects can all lack their own balances. Independent
+                # dated checkpoints must still bracket the possible postings.
+                days = [row["booked_day"] for row in subject_rows]
+                checkpoints = [row["booked_day"] for row in peers if row["booked_day"] and _reported_balance(row)]
+                if not all(days) or not checkpoints or not min(checkpoints) < min(days) <= max(days) < max(checkpoints):
+                    continue
             witnesses = []
             decisions = None
             if len(window) <= _STATEMENT_PLACEMENT_BUDGET:
@@ -3081,13 +3172,14 @@ def _joint_statement_reviews(account_key, alternatives, members, minimum, maximu
     if not enclosing or (None in dates and len(enclosing) < 2):
         return
     bounds = (min(dates), max(dates)) if None not in dates else (enclosing[0], enclosing[-1])
+    balances = sorted({(row["balance_key"], str(balance[1])) for row in members if (balance := _reported_balance(row))})
     members = [core._bank_statement_option(row) for row in members]
     scope = core._joint_statement_scope(account_key, amount, currency, checkpoints, bounds, members)
     joint = {
         "scope": scope,
         "account_key": account_key,
         "bounds": (enclosing[0], enclosing[-1]),
-        "dates": bounds, "members": members, "minimum": minimum, "maximum": maximum,
+        "dates": bounds, "members": members, "balances": balances, "minimum": minimum, "maximum": maximum,
     }
     details = {
         "joint": joint, "proof": (scope, {}, (), (bounds[0], checkpoints)),

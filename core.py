@@ -2972,16 +2972,19 @@ def _joint_proof_member_matches(left, right, *, subject):
     row = after._asdict() | {"bank_groups": {group: group for group in groups}}
     if _joint_statement_source(row, groups, before):
         return True
-    # A reference revision on an independently attested checkpoint does
-    # not change the signed movement. Distinct named subjects still need
-    # the same economic party or remittance evidence.
-    same_edge = before.booked_day and before.booked_day == after.booked_day and before.balance_key and before.balance_key == after.balance_key
-    if not same_edge or (subject and not (
-        (before.creditor_ref and before.creditor_ref == after.creditor_ref)
-        or _bank_account_match(before.counterparty_ids, after.counterparty_ids) is True
-    )):
+    if (not before.booked_day or before.booked_day != after.booked_day
+            or _bank_facts_conflict(row | {"provider_ref": before.provider_ref}, before)):
         return False
-    return not _bank_facts_conflict(row | {"provider_ref": before.provider_ref}, before)
+    same_edge = before.balance_key and before.balance_key == after.balance_key
+    if not subject and same_edge:
+        return True
+    # A subject need not supply its own balance when its BOOK day and
+    # independent remittance or payer evidence identify it in both proofs.
+    same_invoice = before.creditor_ref and before.creditor_ref == after.creditor_ref
+    same_party = _bank_account_match(before.counterparty_ids, after.counterparty_ids) is True
+    return bool((same_edge and (same_invoice or same_party)) or (
+        (same_invoice or same_party) and _bank_economic_replay(row, before._asdict())
+    ))
 
 
 def _joint_proof_covers(first, second, *, subjects):
@@ -3021,8 +3024,8 @@ def _same_joint_statement(prior, current):
             or not _joint_proof_covers(old_subjects, new_subjects, subjects=True)):
         return False
     old, new = before["members"], after["members"]
-    # References are tolerated only with a matching dated balance edge.
     # The subject correspondence alone would confuse two separate windows.
+    # Require independent dated balance edges in the full statement too.
     def edges(members):
         return {(booking.booked_day, booking.balance_key, group) for groups, facts in members for group in groups
                 if (booking := _BankBooking(*facts)).booked_day and booking.balance_key}
@@ -3166,7 +3169,7 @@ def _store_joint_evidence(conn, slots, assessments, snapshot, details):
     """Remember corroborated evidence without changing the ledger slot key."""
     joint = details["joint"]
     evidence = {
-        "joint": {field: joint[field] for field in ("bounds", "dates", "members")},
+        "joint": {field: joint[field] for field in ("bounds", "dates", "members", "balances") if field in joint},
         "observations": details["observations"],
     }
     for key, ref, _, _, _, saved in slots:
