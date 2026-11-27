@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Validate the candidate tree using the index Git supplies for this commit.
+set -uo pipefail
+
+root=$(git rev-parse --show-toplevel) || exit 1
+git_dir=$(git -C "$root" rev-parse --absolute-git-dir) || exit 1
+index_file=$(git -C "$root" rev-parse --path-format=absolute --git-path index) || exit 1
+snapshot=$(mktemp -d "${TMPDIR:-/tmp}/klar-buha-hook.XXXXXXXX") || exit 1
+trap 'rm -rf -- "$snapshot"' EXIT
+trap 'exit 1' HUP INT TERM
+
+git -C "$root" checkout-index --all --prefix "$snapshot/" || exit 1
+
+if [[ -z ${PYTHON:-} && -x "$root/.venv/bin/python" ]]; then
+  export PYTHON="$root/.venv/bin/python"
+elif [[ ${PYTHON:-} == */* && $PYTHON != /* ]]; then
+  export PYTHON="$root/$PYTHON"
+fi
+
+cd "$snapshot" || exit 1
+GIT_DIR="$git_dir" GIT_INDEX_FILE="$index_file" GIT_WORK_TREE="$snapshot" ./scripts/checks.sh

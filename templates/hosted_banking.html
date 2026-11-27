@@ -1,0 +1,94 @@
+{% extends "base_klar.html" %}
+{% block title %}Banking · Klarbuchhaltung{% endblock %}
+{% block body %}
+<div class="pagehead">
+  <h1 class="disp">Banking</h1>
+  <p class="muted">Kontoumsätze über Enable Banking abrufen und unter Zahlungen zuordnen.</p>
+</div>
+
+{% if problem %}<p class="kl-flash error" role="alert">{{ problem }}</p>{% endif %}
+
+{% if consents %}
+<section class="card stack">
+  <div class="row" style="justify-content:space-between;flex-wrap:wrap">
+    <h2 class="disp" style="margin:0">Bankverbindungen</h2>
+    <form method="post" action="{{ url_for('bank_sync') }}">
+      <input type="hidden" name="_klar_csrf" value="{{ hosted_csrf }}">
+      <button type="submit" class="btn btn--primary">Jetzt synchronisieren</button>
+    </form>
+  </div>
+  <p class="muted">Der Umsatzabruf läuft täglich automatisch. <a href="{{ url_for('zahlungen') }}">Zahlungen ansehen</a></p>
+  {% for consent in consents %}
+  <div class="row" style="justify-content:space-between;flex-wrap:wrap;gap:12px;border-top:1px solid var(--line-3);padding-top:12px">
+    <div>
+      <strong>{{ consent.bank }}</strong> · {{ consent.country }} · {{ 'Geschäftlich' if consent.psu_type == 'business' else 'Privat' }}
+      <ul>
+        {% for account in consent.accounts %}
+        <li>{{ account.label }}{% if account.suffix %} · •••• {{ account.suffix }}{% endif %}</li>
+        {% endfor %}
+      </ul>
+      <div class="muted">Freigabe bis {{ consent.valid_until[:10] | de_date }}{% if consent.last_synced %} · Letzter vollständiger Abruf {{ consent.last_synced | de_date }}{% endif %}</div>
+      {% if consent.message %}<div>{{ consent.message }}</div>{% endif %}
+      {% if consent.skipped %}<div>{{ consent.skipped }} Umsätze konnten nicht eindeutig importiert werden. Prüfe den Kontoauszug.</div>{% endif %}
+    </div>
+    <form method="post" action="{{ url_for('bank_disconnect') }}">
+      <input type="hidden" name="_klar_csrf" value="{{ hosted_csrf }}">
+      <input type="hidden" name="session_id" value="{{ consent.id }}">
+      <button type="submit" class="btn btn--outline">Verbindung trennen</button>
+    </form>
+  </div>
+  {% endfor %}
+</section>
+{% endif %}
+
+{% if configured %}
+<section class="card stack" style="max-width:680px">
+  <h2 class="disp" style="margin:0">Bank verbinden</h2>
+  <form method="get" action="{{ url_for('banking') }}" class="row" style="align-items:end;gap:12px">
+    <label class="field">Ländercode
+      <input class="input" name="country" value="{{ country }}" maxlength="2" pattern="[A-Za-z]{2}" required>
+    </label>
+    <button type="submit" class="btn btn--outline">Banken anzeigen</button>
+  </form>
+  {% if banks %}
+  <form method="post" action="{{ url_for('bank_begin') }}" class="stack">
+    <input type="hidden" name="_klar_csrf" value="{{ hosted_csrf }}">
+    <input type="hidden" name="country" value="{{ country }}">
+    <label class="field">Bank
+      <select class="select" name="bank" required>
+        {% for bank in banks %}<option value="{{ bank.name }}">{{ bank.name }}</option>{% endfor %}
+      </select>
+    </label>
+    <label class="field">Kontoart
+      <select class="select" name="psu_type">
+        <option value="personal">Privat</option>
+        <option value="business">Geschäftlich</option>
+      </select>
+    </label>
+    <button type="submit" class="btn btn--primary">Weiter zur Bankfreigabe</button>
+  </form>
+  {% elif not problem %}
+  <p class="muted">Für dieses Land wurden keine Banken gefunden.</p>
+  {% endif %}
+</section>
+{% endif %}
+
+{% if not managed and not consents %}
+<section class="card stack" style="max-width:680px">
+  <h2 class="disp" style="margin:0">{{ 'Anwendungsdaten ersetzen' if configured else 'Enable Banking einrichten' }}</h2>
+  <p>Registriere deine eigene Anwendung im <a href="https://enablebanking.com/cp/" target="_blank" rel="noopener noreferrer">Enable Banking Control Panel</a> und hinterlege dort diese Rücksprungadresse.</p>
+  <code style="overflow-wrap:anywhere">{{ callback }}</code>
+  <p class="muted">Für echte Umsätze nutze eine aktive Produktionsanwendung mit freigegebenen Konten. Hinterlege anschließend die Anwendungs-ID und deinen privaten RSA-Schlüssel.</p>
+  <form method="post" action="{{ url_for('bank_credentials') }}" enctype="multipart/form-data" class="stack">
+    <input type="hidden" name="_klar_csrf" value="{{ hosted_csrf }}">
+    <label class="field">Anwendungs-ID
+      <input class="input" name="application_id" maxlength="36" required>
+    </label>
+    <label class="field">Privater RSA-Schlüssel (.pem)
+      <input class="input" name="private_key" type="file" accept=".pem" required>
+    </label>
+    <button type="submit" class="btn btn--primary">Anwendung speichern</button>
+  </form>
+</section>
+{% endif %}
+{% endblock %}

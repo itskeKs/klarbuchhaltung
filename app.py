@@ -63,6 +63,9 @@ _SETUP_FREI = _PROFIL_FREI | {"setup", "restart"}
 
 @app.before_request
 def _profil_binden():
+    hosted_guard = app.config.get("KLAR_HOSTED_GUARD")
+    if hosted_guard:
+        return hosted_guard()
     if request.path.startswith("/static/"):
         return None
     endpoint = request.endpoint or ""
@@ -119,7 +122,8 @@ def inject_globals():
             "accent": s.get("accent", "green"), "density": s.get("density", "airy"),
             "biz_name": biz.get("owner") or biz.get("name") or "",
             "biz_place": adr[-2] if len(adr) >= 2 else (adr[0] if adr else ""),
-            "terminal_moeglich": TERMINAL_MOEGLICH,
+            "hosted": app.config.get("KLAR_HOSTED", False),
+            "terminal_moeglich": TERMINAL_MOEGLICH and not app.config.get("KLAR_HOSTED"),
             "profil": profil,
             "profil_initialen": _initialen(profil["name"]) if profil else "",
             "profil_anzahl": len(core.list_profiles())}
@@ -159,6 +163,9 @@ def _handle_exc(e):
     from werkzeug.exceptions import HTTPException
     if isinstance(e, HTTPException) and (e.code or 500) < 500:
         return e  # 404/409 etc. normal behandeln
+    if app.config.get("KLAR_HOSTED"):
+        app.logger.error("Hosted application request failed", exc_info=True)
+        return "Interner Serverfehler", 500
     tb = traceback.format_exc()
     app.logger.error("Serverfehler:\n%s", tb)
     try:
@@ -415,6 +422,13 @@ def invoice_delete(iid):
     return redirect(url_for("invoices", dir="out", year=year) if year else url_for("invoices"))
 
 
+def _send_bookkeeping_file(path, **kwargs):
+    hosted_sender = app.config.get("KLAR_HOSTED_SEND_FILE")
+    if hosted_sender:
+        return hosted_sender(path, download_name=kwargs.get("download_name"))
+    return send_file(path, **kwargs)
+
+
 @app.route("/invoices/<int:iid>/pdf")
 def invoice_pdf(iid):
     conn = core.db()
@@ -422,7 +436,7 @@ def invoice_pdf(iid):
     pfad = core.abs_pfad(inv["pdf_path"]) if inv else None
     if not pfad or not pfad.exists():
         abort(404)
-    return send_file(pfad, mimetype="application/pdf",
+    return _send_bookkeeping_file(pfad, mimetype="application/pdf",
                      download_name=f"Invoice-{inv['number']}.pdf")
 
 
@@ -552,7 +566,7 @@ def expense_receipt(eid):
     pfad = core.abs_pfad(row["receipt_path"]) if row else None
     if not pfad or not pfad.exists():
         abort(404)
-    return send_file(pfad)
+    return _send_bookkeeping_file(pfad)
 
 
 # ── Berichte ─────────────────────────────────────────────────────────────
@@ -701,7 +715,11 @@ def _day_label(iso):
 def zahlungen():
     conn = core.db()
     p = request.args.get("p") or str(date.today().year)
-    lo, hi, plabel, py, _pq = _period_from_token(p)
+    hosted = app.config.get("KLAR_HOSTED")
+    if hosted and p == "all":
+        lo, hi, plabel, py = "0000-01-01", "9999-12-31", "Alle Jahre", None
+    else:
+        lo, hi, plabel, py, _pq = _period_from_token(p)
     entries = core.list_ledger(conn, lo, hi)          # Ausgaben + Rechnungen + Bank-Bewegungen
     inv_list = core.list_invoices(conn)
     linked = {t["invoice_id"] for t in core.list_transactions(conn) if t["invoice_id"]}
@@ -774,12 +792,30 @@ def zahlungen():
         cur_rows.append(row)
     for g in groups:
         g["total"] = sum(x["amount"] for x in g["rows"] if not x.get("derived"))
+    count = len(entries)
+    periods = _period_list(py)
+    statement_reviews = []
+    if hosted:
+        periods.insert(0, ("all", "Alle Jahre"))
+        home = core._fx_norm(core.home_currency())
+        open_count = sum(r["kind"] == "bank" and r["category"] == "offen" for r in entries)
+        for row in core.pending_bank_statement_amounts(conn, lo, hi):
+            amount, currency = row["amount"], row["currency"]
+            included = bool(row["covered"] and core._fx_norm(currency) == home)
+            count += int(row["covered"])
+            open_count += int(row["covered"])
+            if included:
+                money_in += max(0.0, amount)
+                money_out += min(0.0, amount)
+            display = core.eur(amount) if currency == "EUR" else f"{core.fmt(amount)} {currency}"
+            statement_reviews.append(dict(row) | {"display": display, "included": included})
+    else:
+        open_count = core.transactions_open_count(conn)
     summary = {"money_in": money_in, "money_out": money_out, "net": money_in + money_out}
     return render_template("zahlungen.html", active="zahlungen", groups=groups,
                            inv_options=inv_options, cats=core.TX_CATEGORIES,
-                           summary=summary, count=len(entries), p=p, plabel=plabel,
-                           periods=_period_list(py),
-                           open_count=core.transactions_open_count(conn))
+                           summary=summary, count=count, p=p, plabel=plabel, periods=periods,
+                           open_count=open_count, statement_reviews=statement_reviews)
 
 
 @app.route("/zahlungen/export")
@@ -792,9 +828,15 @@ def zahlungen_export():
     w = csv.writer(out)
     w.writerow(["Datum", "Beschreibung", "Betrag", "Währung", "Betrag_EUR",
                 "Kategorie", "Typ"])
+    def sheet_text(text):
+        if (app.config.get("KLAR_HOSTED") and text
+                and (text.startswith(("\t", "\r", "\n")) or text.lstrip().startswith(("=", "+", "-", "@")))):
+            return "'" + text
+        return text
+
     for t in core.list_transactions(conn):
-        w.writerow([t["date"], t["description"], t["amount"], t["currency"],
-                    t["amount_home"], t["category"], t["tx_type"]])
+        w.writerow([t["date"], sheet_text(t["description"]), t["amount"], sheet_text(t["currency"]),
+                    t["amount_home"], sheet_text(t["category"]), sheet_text(t["tx_type"])])
     return Response(out.getvalue(), mimetype="text/csv",
                     headers={"Content-Disposition": "attachment; filename=zahlungen.csv"})
 
@@ -946,7 +988,7 @@ def zahlungen_receipt(tid):
     pfad = core.abs_pfad(t["receipt_path"]) if t else None
     if not pfad or not pfad.exists():
         abort(404)
-    return send_file(pfad)
+    return _send_bookkeeping_file(pfad)
 
 
 # ── Import ───────────────────────────────────────────────────────────────
@@ -1039,7 +1081,7 @@ def files():
     doc_rules = {d["id"]: _vendor_rule(d["vendor"]) for d in docs if d["vendor"]}
     return render_template("files.html", active="files", docs=docs, counts=counts,
                            open_txs=open_txs, tx_map=tx_map, doc_rules=doc_rules,
-                           llm_ok=assistant.is_configured())
+                           llm_ok=not app.config.get("KLAR_HOSTED") and assistant.is_configured())
 
 
 @app.route("/documents/upload", methods=["POST"])
@@ -1051,7 +1093,7 @@ def documents_upload():
         if not file or not file.filename:
             continue
         data = file.read()
-        ex = assistant.extract_document(data, file.filename)   # {} wenn kein LLM/Text
+        ex = {} if app.config.get("KLAR_HOSTED") else assistant.extract_document(data, file.filename)
         did = core.add_document(conn, data, file.filename, vendor=ex.get("vendor"),
                                 amount=ex.get("amount"), doc_date=ex.get("date"), status="to_review")
         stx = core.suggest_tx_for_document(conn, ex.get("amount"), ex.get("date"), ex.get("vendor"))
@@ -1070,7 +1112,7 @@ def document_file(did):
     pfad = core.abs_pfad(d["file_path"]) if d else None
     if not pfad or not pfad.exists():
         abort(404)
-    return send_file(pfad)
+    return _send_bookkeeping_file(pfad)
 
 
 def _wants_json():
@@ -1710,6 +1752,8 @@ def settings():
     if request.method == "POST":
         f = request.form
         section = f.get("section", "llm")
+        if app.config.get("KLAR_HOSTED") and section not in {"appearance", "preferences", "steuer", "bank"}:
+            abort(404)
         if section == "llm":
             s["base_url"] = f.get("base_url", "").strip()
             s["model"] = f.get("model", "").strip()
@@ -1765,10 +1809,13 @@ def settings():
         va_period = cfg.get("tax", {}).get("va_period", "quarter")
     except Exception:
         pass
+    tab = request.args.get("tab", "appearance")
+    if app.config.get("KLAR_HOSTED") and tab not in {"appearance", "preferences", "steuer", "profile"}:
+        tab = "appearance"
     return render_template("settings.html", active="settings", s=s,
                            has_key=bool(s.get("api_key")), has_pw=bool(s.get("smtp_pass")),
                            biz=biz, bank=bank, cfg_va_period=va_period,
-                           tab=request.args.get("tab", "appearance"))
+                           tab=tab)
 
 
 @app.route("/tax/ack", methods=["POST"])

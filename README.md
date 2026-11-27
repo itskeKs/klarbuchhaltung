@@ -54,6 +54,8 @@ laufenden Kosten — eine SQLite-Datei und deine Belege als PDF.
 
 ---
 
+[Hosted bank import guide](hosted/README.md)
+
 ## Installieren
 
 Fertige Pakete liegen unter [Releases](https://github.com/itskeKs/klarbuchhaltung/releases).
