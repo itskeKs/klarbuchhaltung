@@ -1709,6 +1709,161 @@ def test_statement_review_distinguishes_later_payments_with_reused_references(sa
 
 
 @pytest.mark.parametrize("sign", [-1, 1])
+@pytest.mark.parametrize("changed", [(0,), (1,), (2,), (3,), (4,), (5,), (0, 2), tuple(range(6)), "absent", "booking"])
+def test_statement_replay_keeps_each_movement_when_references_change(sandbox, sign, changed):
+    import core
+
+    whole = ambiguous_reference_statement(sign)
+    corrected = [row.copy() for row in whole]
+    if changed in {"absent", "booking"}:
+        affected = range(6) if changed == "absent" else (1,)
+        for index in affected:
+            corrected[index]["entry_reference"] = None
+        if changed == "booking":
+            for row in corrected:
+                row["booking_date"] = "2026-11-24"
+    else:
+        affected = changed
+        for index in affected:
+            corrected[index]["entry_reference"] += "-corrected"
+
+    with closing(core.db()) as ledger:
+        def sync(page):
+            rows, skipped = transaction_rows("account-a", page)
+            result = core.import_bank_rows(ledger, rows, require_fx=True)
+            return result["imported"], skipped + result["ambiguous"]
+
+        assert sync(whole * 2) == (6, 0)
+        for (booking_id,) in ledger.execute("SELECT id FROM transactions").fetchall():
+            core.set_tx_category(ledger, booking_id, "einnahme_sonstige")
+        saved = [tuple(row) for row in ledger.execute(
+            "SELECT id, ref, date, amount, description, category FROM transactions ORDER BY id",
+        )]
+        pages = ([corrected[index] for index in affected], corrected * 2, (corrected * 2)[::-1], whole * 2)
+        if changed not in {"booking", "absent"}:
+            pages += (whole + corrected, (whole + corrected)[::-1])
+        for page in pages:
+            imported, warnings = sync(page)
+            assert imported == 0
+            if len(page) >= len(whole) * 2 and changed != "booking":
+                assert warnings == 0
+            assert [tuple(row) for row in ledger.execute(
+                "SELECT id, ref, date, amount, description, category FROM transactions ORDER BY id",
+            )] == saved
+
+
+@pytest.mark.parametrize("split", [False, True])
+@pytest.mark.parametrize("changed", [0, 1])
+def test_normal_bank_overlap_uses_confirmed_facts_after_reference_correction(sandbox, split, changed):
+    import core
+
+    source = ambiguous_reference_statement()
+    whole = [source[0], source[4]]
+    corrected = [row.copy() for row in whole]
+    corrected[changed]["entry_reference"] += "-corrected"
+    with closing(core.db()) as ledger:
+        initial, _ = transaction_rows("account-a", whole)
+        assert core.import_bank_rows(ledger, initial, require_fx=True)["imported"] == 2
+        saved = [tuple(row) for row in ledger.execute("SELECT id, ref, date, amount FROM transactions ORDER BY id")]
+        for page in ([corrected[changed]] if split else corrected, corrected[::-1], whole):
+            rows, _ = transaction_rows("account-a", page)
+            assert core.import_bank_rows(ledger, rows, require_fx=True)["imported"] == 0
+            assert [tuple(row) for row in ledger.execute("SELECT id, ref, date, amount FROM transactions ORDER BY id")] == saved
+        independent = corrected[changed] | {"reference_number": "distinct-invoice", "entry_reference": "independent"}
+        rows, _ = transaction_rows("account-a", [*whole, independent])
+        assert core.import_bank_rows(ledger, rows, require_fx=True)["imported"] == 1
+
+
+@pytest.mark.parametrize("seed", [False, True])
+@pytest.mark.parametrize("reset", [False, True])
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_reference_versions_share_statement_balance_unless_it_can_recur(sandbox, seed, reset, sign):
+    import core
+
+    whole = ambiguous_reference_statement(sign)
+    credit, reversal, debit = (whole[index] | {"value_date": "2026-11-23", "transaction_date": "2026-11-23"}
+                                for index in (0, 1, 4))
+    other = credit | {"entry_reference": "changed-reference", "transaction_id": "another-lookup"}
+    page = [credit, debit, other, debit]
+    if reset:
+        page.append(reversal)
+    with closing(core.db()) as ledger:
+        if seed:
+            initial, _ = transaction_rows("account-a", [credit, debit])
+            assert core.import_bank_rows(ledger, initial, require_fx=True)["imported"] == 2
+        for response in (page, page[::-1]):
+            rows, skipped = transaction_rows("account-a", response)
+            result = core.import_bank_rows(ledger, rows, require_fx=True)
+            assert skipped + result["ambiguous"] == 0
+            assert tuple(ledger.execute("SELECT count(*), sum(amount), sum(abs(amount)) FROM transactions").fetchone()) == (
+                (4, sign * 96, 380) if reset else (2, sign * 96, 142)
+            )
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_statement_proof_intersects_two_partly_dated_anchor_timelines(sign):
+    whole = ambiguous_reference_statement(sign)
+    whole[1]["value_date"] = None
+    whole[5]["transaction_date"] = None
+    for page in (whole * 2, (whole * 2)[::-1]):
+        rows, warnings = transaction_rows("account-a", page)
+        assert warnings == 0
+        assert len(rows) == 6
+        assert sum(float(row["amount"]) for row in rows) == 205 * sign
+        assert sum(row["description"] == "Kontoauszug prüfen" for row in rows) == 1
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_proven_statement_keeps_movement_counts_without_provider_ids(sandbox, sign):
+    import core
+
+    whole = ambiguous_reference_statement(sign)
+    bare = [row | {"entry_reference": None, "transaction_id": None} for row in whole]
+    with closing(core.db()) as ledger:
+        for page in (bare * 2, (bare * 2)[::-1], whole * 2):
+            rows, skipped = transaction_rows("account-a", page)
+            result = core.import_bank_rows(ledger, rows, require_fx=True)
+            assert skipped + result["ambiguous"] == 0
+            assert tuple(ledger.execute("SELECT count(*), sum(amount), sum(abs(amount)) FROM transactions").fetchone()) == (
+                6, sign * 205, 509,
+            )
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_legacy_statement_replay_keeps_categories_and_imports_independent_future_payment(sandbox, sign):
+    import core
+
+    whole = ambiguous_reference_statement(sign)
+    with closing(core.db()) as ledger:
+        rows, _ = transaction_rows("account-a", whole * 2)
+        assert core.import_bank_rows(ledger, rows, require_fx=True)["imported"] == 6
+        # A historical review stores a reference-based proof without the
+        # economic identity used by the current importer.
+        ref, encoded = ledger.execute("SELECT review_key, alternatives FROM bank_statement_reviews").fetchone()
+        historical = json.loads(encoded)
+        historical.pop("economic")
+        historical["proof"][0] = "reference-based-review-key"
+        ledger.execute("UPDATE bank_statement_reviews SET review_key = ?, alternatives = ? WHERE review_key = ?",
+                       ("legacy-review", json.dumps(historical), ref))
+        for (booking_id,) in ledger.execute("SELECT id FROM transactions").fetchall():
+            core.set_tx_category(ledger, booking_id, "einnahme_sonstige")
+        saved = [tuple(row) for row in ledger.execute("SELECT id, ref, date, amount, category FROM transactions ORDER BY id")]
+        later = whole[0] | {"booking_date": "2026-11-25", "transaction_date": "2026-11-25", "value_date": "2026-11-25",
+                            "entry_reference": "new-payment", "transaction_id": "new", "reference_number": "INV-new",
+                            "remittance_information": ["New payment"], "transaction_amount": {"amount": "7", "currency": "EUR"},
+                            "balance_after_transaction": {"amount": str(212 * sign), "currency": "EUR"}}
+        corrected = [row | {"entry_reference": row["entry_reference"] + "-corrected"} for row in whole]
+        for index, page in enumerate((corrected * 2, (corrected * 2)[::-1])):
+            rows, skipped = transaction_rows("account-a", [*page, later])
+            result = core.import_bank_rows(ledger, rows, require_fx=True)
+            assert (result["imported"], skipped + result["ambiguous"]) == (1 - index, 0)
+            assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (7, 212 * sign)
+        assert [tuple(row) for row in ledger.execute(
+            "SELECT id, ref, date, amount, category FROM transactions WHERE description <> 'New payment' ORDER BY id",
+        )] == saved
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
 @pytest.mark.parametrize("variant", ["missing-secondary", "missing-primary", "unanchored", "parallel", "one-witness"])
 @pytest.mark.parametrize("seed", [True, False])
 def test_reported_balance_order_resolves_missing_dates_and_coupled_versions(sandbox, sign, variant, seed):

@@ -1996,6 +1996,23 @@ def _stored_secondary_match(row, old):
                                  (getattr(old, field) for field in _BANK_SECONDARY_DATES))
 
 
+def _bank_economic_replay(first, second):
+    """Positive account-local evidence of the same movement after a provider correction."""
+    dates = _bank_secondary_match((first[field] for field in _BANK_SECONDARY_DATES),
+                                 (second[field] for field in _BANK_SECONDARY_DATES))
+    if dates is False:
+        return False
+    same_payer = _bank_account_match(first["counterparty_ids"], second["counterparty_ids"])
+    fields = ("balance_key", "creditor_ref", "reference_schema", "counterparty_iban")
+    if same_payer is False or any(first[field] and second[field] and first[field] != second[field] for field in fields):
+        return False
+    corroboration = sum(bool(first[field] and first[field] == second[field])
+                        for field in ("balance_key", "creditor_ref"))
+    corroboration += same_payer is True
+    return ((dates is True and corroboration >= 2)
+            or (first["booked_day"] and first["booked_day"] == second["booked_day"] and corroboration == 3))
+
+
 def _bank_rejected_statement_booking(row, matched_ref, recorded, *, posting_date=False):
     for old in recorded:
         if old.ref == matched_ref:
@@ -2145,6 +2162,7 @@ def _bank_matches(conn, rows):
     by_provider = lookup("f.provider_ref = ?", {r["provider_ref"] for r in bank_rows if r["provider_ref"]})
     options = {}
     posting_conflicts = set()
+    corrections = {}
     unconfirmed_payers = defaultdict(list)
     cohorts = defaultdict(list)
     for row in bank_rows:
@@ -2166,8 +2184,11 @@ def _bank_matches(conn, rows):
             ref = _occupied_bank_reference(ref, row)
         source_refs = _bank_source_refs(row, candidates)
         observed_refs = _bank_observed_secondary_refs(row, by_day)
+        corrections[row["ref"]] = {old.ref for old in candidates
+                                   if _bank_facts_conflict(row, old) and _bank_economic_replay(row, old._asdict())}
+        confirmed = corrections[row["ref"]] & row.get("_confirmed_reference_aliases", set())
         ranked = [(old, rank) for old in candidates
-                  if (rank := _bank_match_rank(row, old, ref, source_refs)) is not None]
+                  if (rank := 1 if old.ref in confirmed else _bank_match_rank(row, old, ref, source_refs)) is not None]
         options[row["ref"]] = {old.ref: _bank_candidate_priority(row, old, rank, source_refs, observed_refs)
                                for old, rank in ranked}
         if row["_dated_ref"]:
@@ -2209,6 +2230,9 @@ def _bank_matches(conn, rows):
                 used.add(old)
                 del options[ref]
     ambiguous = posting_conflicts | {ref for ref, candidates in options.items() if candidates.keys() - used}
+    # An independently matched original can coexist with a different reference.
+    # Without it, a correction and an additional payment may look identical.
+    ambiguous.update(ref for ref, candidates in corrections.items() if ref not in matched and candidates - used)
     storage_refs = {}
     reserved = set()
     for row in bank_rows:
@@ -2236,19 +2260,14 @@ def _bank_statement_option(row):
 
 def _bank_statement_option_match(row, option):
     """Distinguish an observed alternative from a likely correction needing review."""
-    if row["ref"] == option.ref:
+    if option.ref and row["ref"] == option.ref:
         return 1
     if _stored_secondary_match(row, option) is not True:
         return 0
-    corroborated = (
-        row["balance_key"] and row["balance_key"] == option.balance_key
-        and row["creditor_ref"] and row["creditor_ref"] == option.creditor_ref
-        and _bank_account_match(row["counterparty_ids"], option.counterparty_ids) is True
-    )
+    corroborated = _bank_economic_replay(row, option._asdict())
     if not _bank_facts_conflict(row, option):
         return int(row["provider_ref"] == option.provider_ref or corroborated)
-    same_movement = row | {"provider_ref": option.provider_ref, "booked_day": option.booked_day}
-    return 2 if corroborated and not _bank_facts_conflict(same_movement, option) else 0
+    return 2 if corroborated else 0
 
 
 def _bank_statement_compatible_proof(first, second):
@@ -2289,10 +2308,40 @@ def _bank_statement_matches_legacy_review(key, row, stored):
     return False
 
 
+def _bank_statement_members(conn, row):
+    """Identify every named movement in the witness using scoped ledger facts."""
+    select = ("SELECT t.ref, t.description, " + ", ".join(f"f.{field}" for field in _BANK_IDENTITY_FIELDS)
+              + ", f.counterparty_ids FROM transactions t JOIN bank_import_facts f USING (ref) "
+              + "WHERE t.ref NOT IN (SELECT ref FROM bank_statement_reviews) AND t.ref IN ("
+              + "SELECT ref FROM bank_import_identity WHERE booking_group = ?1 "
+              + "UNION ALL SELECT ref FROM bank_import_date_aliases WHERE booking_group = ?1)")
+    identified = set()
+    matches = []
+    for groups, facts in row.get("_statement_review_members", ()):
+        observed = _BankBooking(*facts)
+        snapshot = observed._asdict()
+        candidates = {_bank_booking(record) for group in groups for record in conn.execute(select, (group,))}
+        matching = {candidate.ref for candidate in candidates if candidate.ref == observed.ref
+                    or _bank_economic_replay(snapshot, candidate._asdict())}
+        if len(matching) != 1 or not identified.isdisjoint(matching):
+            return []
+        identified.update(matching)
+        matches.append((set(groups), snapshot, next(iter(matching))))
+    return matches
+
+
+def _bank_statement_replays_legacy_witness(row, stored):
+    return not stored.get("economic") and any(
+        not set(groups).isdisjoint(current_groups)
+        and _bank_statement_option_match(_BankBooking(*current)._asdict(), _BankBooking(*old))
+        for groups, old in stored["observations"] for current_groups, current in row["_statement_review_options"]
+    )
+
+
 def _record_bank_statement_review(conn, row, ref):
     conn.execute("INSERT INTO bank_statement_reviews (review_key, ref, alternatives) VALUES (?, ?, ?)",
                  (row["ref"], ref, json.dumps({"observations": row["_statement_review_options"],
-                                               "proof": row.get("_statement_review_proof")})))
+                                               "proof": row.get("_statement_review_proof"), "economic": True})))
 
 
 def _prepare_bank_statement_reviews(conn, rows):
@@ -2306,6 +2355,7 @@ def _prepare_bank_statement_reviews(conn, rows):
     warnings = duplicates = 0
     recorded = {}
     disputed = defaultdict(list)
+    verified_members = []
     for key, ref, options, day, description in conn.execute(
         "SELECT review_key, ref, alternatives, date, description FROM bank_statement_reviews JOIN transactions USING (ref)",
     ):
@@ -2325,9 +2375,11 @@ def _prepare_bank_statement_reviews(conn, rows):
                 disputed[group].append(option)
             alternatives.append(option.ref)
         proof = row.get("_statement_review_proof")
+        members = _bank_statement_members(conn, row)
         prior = [key for key, (_, stored, _, _) in recorded.items() if (
             key == row["ref"] or _bank_statement_matches_legacy_review(key, row, stored)
             or _bank_statement_same_proof(proof, stored["proof"])
+            or (members and _bank_statement_replays_legacy_witness(row, stored))
         )]
         if prior:
             if len(prior) > 1:
@@ -2336,12 +2388,14 @@ def _prepare_bank_statement_reviews(conn, rows):
             key = prior[0]
             _, stored, _, description = recorded[key]
             warnings += int(description != row["description"])
+            verified_members.extend(members)
             saved = {json.dumps(option) for option in stored["observations"]}
             updated = saved | {json.dumps(option) for option in row["_statement_review_options"]}
-            if updated != saved or not stored["proof"]:
+            if updated != saved or not stored.get("economic"):
                 stored["observations"] = [json.loads(option) for option in sorted(updated)]
-                if not stored["proof"]:
+                if not stored.get("economic"):
                     stored["proof"] = proof
+                    stored["economic"] = True
                 conn.execute("UPDATE bank_statement_reviews SET alternatives = ? WHERE review_key = ?", (json.dumps(stored), key))
             duplicates += 1
             continue
@@ -2382,6 +2436,11 @@ def _prepare_bank_statement_reviews(conn, rows):
             duplicates += 1
             warnings += int(1 not in matches)
         else:
+            confirmed = {ref for groups, snapshot, ref in verified_members
+                         if not groups.isdisjoint(row.get("bank_groups", {}).values())
+                         and (row["ref"] == snapshot["ref"] or _bank_economic_replay(row, snapshot))}
+            if len(confirmed) == 1:
+                row = row | {"_confirmed_reference_aliases": confirmed | row.get("_confirmed_reference_aliases", set())}
             named.append(row)
     return named, pending, warnings, duplicates
 

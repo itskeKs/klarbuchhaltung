@@ -1238,13 +1238,15 @@ def _mark_statement_capacity(rows):
 def _statement_review_copy_conflict(first, second):
     if first is second:
         return False
-    if _conflicting_facts(first, second, _FETCH_COPY_FACTS) or _conflicting_counterparties(first, second):
+    corrected_ref = core._bank_economic_replay(first, second)
+    fields = ("booked_day", *_OPTIONAL_BOOKING_FACTS) if corrected_ref else _FETCH_COPY_FACTS
+    if _conflicting_facts(first, second, fields) or _conflicting_counterparties(first, second):
         return True
     matching_payment = ((not first["provider_ref"] or not second["provider_ref"])
                         and all(_same_statement_fact(first, second, field) for field in _SECONDARY_BANK_DATES)
                         and core._bank_account_match(first["counterparty_ids"], second["counterparty_ids"]) is True
                         and _same_statement_fact(first, second, "_remittance"))
-    return not (_same_statement_fact(first, second, "provider_ref") or _statement_corroborates(first, second)
+    return not (corrected_ref or _same_statement_fact(first, second, "provider_ref") or _statement_corroborates(first, second)
                 or matching_payment
                 or (_same_statement_fact(first, second, "_transaction_id") and any(
                     _same_statement_fact(first, second, field) for field in _STATEMENT_DATE_FIELDS
@@ -1267,7 +1269,8 @@ def _statement_review_observations(drafts, currency):
         if unresolved:
             continue
         for versions in groups:
-            if not any(row["provider_ref"] and row["booked_day"] for row in versions):
+            if not any(row["booked_day"] and (row["provider_ref"] or (row["creditor_ref"] and row["counterparty_ids"]))
+                       for row in versions):
                 continue
             versions = [copy for row in versions for copy in by_origin[row["_statement_sources"]]]
             representative = min(versions, key=lambda row: (
@@ -1302,10 +1305,13 @@ def _review_statement_placements(versions, field, limit=None):
 
 
 def _review_version_conflict(first, second):
+    if first is second:
+        return False
     if _conflicting_facts(first, second, _FIXED_BOOKING_FACTS) or _conflicting_counterparties(first, second):
         return True
-    known_alias = (all(_same_statement_fact(first, second, field)
-                       for field in ("_transaction_id", "creditor_ref"))
+    known_alias = (_same_statement_fact(first, second, "creditor_ref")
+                   and (_same_statement_fact(first, second, "_transaction_id")
+                        or not (first["provider_ref"] and second["provider_ref"]))
                    and core._bank_account_match(first["counterparty_ids"], second["counterparty_ids"]) is True)
     return not (_same_statement_fact(first, second, "provider_ref") or known_alias)
 
@@ -1361,8 +1367,9 @@ def _statement_reference_dispute(versions, sparse, observations, single_edges, c
         return None
     required = None
     proof = {}
+    witnesses = {}
     supported = None
-    sparse_row, sparse_copies, _ = sparse
+    sparse_row, _, _ = sparse
     for field in _SECONDARY_BANK_DATES:
         if not sparse_row[field] or any(not row[field] for row, _, _ in versions):
             continue
@@ -1374,9 +1381,10 @@ def _statement_reference_dispute(versions, sparse, observations, single_edges, c
         start = min(sparse_row[field], *(row[field] for row, _, _ in later))
         end = max(sparse_row[field], *(row[field] for row, _, _ in later))
         anchors = [row for row in other if row["_statement_balance"] and row["_statement_balance"][0] == currency]
-        prior = [row for row in anchors if row[field] and earliest < row[field] < start]
-        following = [row for row in anchors if not row[field] or row[field] > end]
-        if not prior or not following:
+        unplaced = [row for row in anchors if not row[field]]
+        prior = [row for row in anchors if row[field] and earliest < row[field] < start] or unplaced
+        following = [row for row in anchors if row[field] and row[field] > end] or unplaced
+        if not any(left is not right for left, right in product(prior, following)):
             continue
         if required is not None and required != first[0][2]:
             return None
@@ -1423,20 +1431,22 @@ def _statement_reference_dispute(versions, sparse, observations, single_edges, c
         if not axis:
             return None
         supported = axis if supported is None else supported & axis
-        # Use the preceding anchor and dated movements as the stable proof.
-        # The closing anchor may lack a date on this axis.
-        anchor_facts = sorted({(row["provider_ref"] or "", row["_amount_key"], row["balance_key"])
-                               for row in prior})
-        proof[field] = fingerprint(earliest, sparse_row[field], sorted({row[field] for row, _, _ in later}), anchor_facts)
+        proof[field] = fingerprint(earliest, sparse_row[field], sorted({row[field] for row, _, _ in later}))
+        last = min((row[field] for row in following if row[field]), default=end)
+        for row in other:
+            day = row[field]
+            if (day and earliest <= day <= last) or (not day and (row in prior or row in following)):
+                witnesses[row["_statement_sources"]] = row
     disputed = {(1, 1, 1), (1, 0, 2)}
     if supported and disputed <= supported:
-        return required, proof if supported == disputed else None
+        return required, proof if supported == disputed else None, list(witnesses.values())
     return None
 
 
 def _separate_unresolved_references(account_key, drafts):
     """Keep proven bookings and reserve one neutral payment for the disputed surplus."""
     excluded = set()
+    aliases = {}
     neutral = []
     warnings = 0
     for currency in {row["currency"] for row in drafts}:
@@ -1444,8 +1454,12 @@ def _separate_unresolved_references(account_key, drafts):
         observations = list(_statement_review_observations(drafts, currency))
         fixed, single_edges = _review_fixed_observations(drafts, observations, currency)
         for group in observations:
-            row, _, _ = group
+            row, copies, origins = group
             by_day[row["booked_day"], row["_amount_key"]].append(group)
+            if (origins in single_edges and len({copy["provider_ref"] for copy in copies}) > 1
+                    and any(other["_statement_balance"] and other["_statement_balance"][0] == currency
+                            and other["_statement_sources"].isdisjoint(origins) for other in fixed)):
+                aliases[origins] = next(iter(row["_statement_sources"])), {copy["ref"] for copy in copies if copy["ref"]}
         for (day, amount), groups in by_day.items():
             sparse_groups = [group for group in groups if len(group[1]) > 1 and any(
                 not row["_statement_balance"] for row in group[1]
@@ -1457,13 +1471,14 @@ def _separate_unresolved_references(account_key, drafts):
             indexed = {id(group[0]): group for group in groups}
             for candidates, sparse in product(correction_groups, sparse_groups):
                 sparse_row, sparse_copies, sparse_sources = sparse
-                if len(candidates) < 2 or any(row["provider_ref"] == sparse_row["provider_ref"] for row in candidates):
+                if len(candidates) < 2 or any(row["_statement_sources"] == sparse_row["_statement_sources"]
+                                              or _same_statement_fact(row, sparse_row, "provider_ref") for row in candidates):
                     continue
                 versions = [indexed[id(row)] for row in candidates]
                 result = _statement_reference_dispute(versions, sparse, fixed, single_edges, currency)
                 if result is None:
                     continue
-                required, proof = result
+                required, proof, witnesses = result
                 later = [group for group in versions if group[2] != required]
                 origins = frozenset().union(sparse_sources, *(sources for _, _, sources in later))
                 if not excluded.isdisjoint(origins):
@@ -1476,8 +1491,13 @@ def _separate_unresolved_references(account_key, drafts):
                 if proof is None:
                     continue
                 original = next(row for row, _, sources in versions if sources == required)
-                references = sorted((original["provider_ref"], sparse_row["provider_ref"]))
-                scope = fingerprint(account_key, "statement-review", amount, currency, references)
+                proven_single = single_edges & {required, *(row["_statement_sources"] for row in witnesses)}
+                for row, copies, sources in observations:
+                    if sources in proven_single:
+                        aliases[sources] = (next(iter(row["_statement_sources"])),
+                                            {copy["ref"] for copy in copies if copy["ref"]})
+                references = sorted(ref for ref in (original["provider_ref"], sparse_row["provider_ref"]) if ref)
+                scope = fingerprint(account_key, "statement-review", amount, currency)
                 facts = [(row["balance_key"], row["creditor_ref"], row["counterparty_ids"]) for row in (original, sparse_row)]
                 group = sparse_row["bank_groups"][day]
                 alternatives = [core._bank_statement_option(row) for row, _, _ in later]
@@ -1488,7 +1508,12 @@ def _separate_unresolved_references(account_key, drafts):
                     "counterparty_ids": (), "bank_group": group, "bank_groups": {day: group}, "prior_refs": [],
                     "_statement_review_options": alternatives, "_statement_review_proof": (scope, proof, facts),
                     "_statement_review_legacy_scope": (account_key, references),
+                    "_statement_review_members": [core._bank_statement_option(row) for row in (*witnesses, original, sparse_row)],
                 })
+    for origins, (index, refs) in aliases.items():
+        if excluded.isdisjoint(origins):
+            excluded.update(origins - {index})
+            drafts[index]["_confirmed_reference_aliases"] = refs
     if not excluded:
         return drafts, neutral, warnings
     retained = []

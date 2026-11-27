@@ -62,6 +62,9 @@ Compatible versions, including copies with missing dates or a changed lookup
 ID, contribute to the balance check without deciding the reference. A proven
 correction keeps the existing payment and its posting date. If the balances
 support different totals, check the statement before adding another payment.
+An entry reference can also change on a later page or fetch. Matching dates,
+amounts and independent statement facts can identify the existing payment.
+Where the statement leaves a repeat possible, check it before posting again.
 If a later statement contradicts a payment already in the ledger, **Banking**
 flags it and keeps the posted payment and category.
 The ledger remembers account identifiers as fingerprints and learns missing evidence
