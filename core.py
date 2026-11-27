@@ -2353,9 +2353,10 @@ def _bank_statement_replays_legacy_witness(row, stored):
 
 
 def _record_bank_statement_review(conn, row, ref):
+    details = {"observations": row["_statement_review_options"], "proof": row.get("_statement_review_proof"),
+               "economic": True, "purpose": row.get("_statement_purpose")}
     conn.execute("INSERT INTO bank_statement_reviews (review_key, ref, alternatives) VALUES (?, ?, ?)",
-                 (row["ref"], ref, json.dumps({"observations": row["_statement_review_options"],
-                                               "proof": row.get("_statement_review_proof"), "economic": True})))
+                 (row["ref"], ref, json.dumps(details)))
 
 
 def pending_bank_statement_amounts(conn, start="0000-01-01", end="9999-12-31"):
@@ -2364,16 +2365,23 @@ def pending_bank_statement_amounts(conn, start="0000-01-01", end="9999-12-31"):
                         (start, end)).fetchall()
 
 
-def _withdraw_unassigned_statement_payment(conn, ref):
+def _unassigned_statement_payment(conn, ref):
     tx = conn.execute("SELECT id, date, description, category, invoice_id, expense_id, receipt_path, note "
                       "FROM transactions WHERE ref = ?", (ref,)).fetchone()
-    if (tx["description"] != "Kontoauszug prüfen" or tx["category"] != "offen"
+    if (not tx or tx["category"] != "offen"
             or any(tx[field] is not None and tx[field] != "" for field in ("invoice_id", "expense_id", "receipt_path", "note"))
             or conn.execute("SELECT 1 FROM documents WHERE suggest_tx = ?", (tx["id"],)).fetchone()):
-        return False
+        return None
     try:
         _guard_open_period(tx["date"], "Bankumsatz prüfen")
     except ValueError:
+        return None
+    return tx
+
+
+def _withdraw_unassigned_statement_payment(conn, ref, *, identified_named=False):
+    tx = _unassigned_statement_payment(conn, ref)
+    if not tx or (not identified_named and tx["description"] != "Kontoauszug prüfen"):
         return False
     conn.execute("DELETE FROM bank_statement_reviews WHERE ref = ?", (ref,))
     conn.execute("DELETE FROM bank_import_date_aliases WHERE ref = ?", (ref,))
@@ -2381,6 +2389,18 @@ def _withdraw_unassigned_statement_payment(conn, ref):
     conn.execute("DELETE FROM bank_import_facts WHERE ref = ?", (ref,))
     conn.execute("DELETE FROM transactions WHERE ref = ?", (ref,))
     return True
+
+
+def _legacy_unestablished_bank_bookings(conn, row):
+    """Find an old named surplus only when the other movements are identified."""
+    candidates = {facts[0] for _, facts in row.get("_statement_unestablished_options", ()) if facts[0]}
+    posted = {ref for ref in candidates if conn.execute(
+        "SELECT 1 FROM transactions WHERE ref = ? AND amount = ? AND currency = ?", (ref, row["amount"], row["currency"]),
+    ).fetchone()}
+    if not posted:
+        return set()
+    witnesses = _bank_statement_members(conn, row)
+    return posted - {ref for _, _, ref in witnesses} if witnesses else set()
 
 
 def _record_bank_statement_assessments(conn, observations):
@@ -2407,15 +2427,19 @@ def _record_bank_statement_assessments(conn, observations):
             blocked.add(row["ref"])
             state = "protected"
         elif state in {"pending", "ruled_out"}:
-            prior = []
+            prior = set()
             for old_key, ref, encoded in conn.execute("SELECT review_key, ref, alternatives FROM bank_statement_reviews"):
                 saved = json.loads(encoded)
                 if isinstance(saved, list):
                     saved = {"observations": saved, "proof": None}
                 if (_bank_statement_same_proof(proof, saved["proof"]) or _bank_statement_matches_legacy_review(old_key, row, saved)
                         or (_bank_statement_replays_legacy_witness(row, saved) and _bank_statement_members(conn, row))):
-                    prior.append(ref)
-            if prior and (len(prior) != 1 or not _withdraw_unassigned_statement_payment(conn, prior[0])):
+                    prior.add(ref)
+            named = _legacy_unestablished_bank_bookings(conn, row) if not prior else set()
+            prior.update(named)
+            if prior and (len(prior) != 1 or not _withdraw_unassigned_statement_payment(
+                conn, next(iter(prior)), identified_named=bool(named),
+            )):
                 state = "protected"
         details = {"proof": proof, "observations": row["_statement_review_options"]}
         conn.execute("INSERT INTO bank_statement_assessments VALUES (?, ?, ?, ?, ?, ?, ?) "
@@ -2472,12 +2496,19 @@ def _prepare_bank_statement_reviews(conn, rows):
                 warnings += 1
                 continue
             key = prior[0]
-            _, stored, _, description = recorded[key]
-            warnings += int(description != row["description"])
+            ref, stored, _, description = recorded[key]
+            purpose = row.get("_statement_purpose")
+            qualified = bool(purpose and not stored.get("purpose") and description == "Kontoauszug prüfen"
+                             and _unassigned_statement_payment(conn, ref))
+            if qualified:
+                conn.execute("UPDATE transactions SET description = ? WHERE ref = ?", (purpose, ref))
+                stored["purpose"] = purpose
+            elif (purpose or not stored.get("purpose")) and description != row["description"]:
+                warnings += 1
             verified_members.extend(members)
             saved = {json.dumps(option) for option in stored["observations"]}
             updated = saved | {json.dumps(option) for option in row["_statement_review_options"]}
-            if updated != saved or not stored.get("economic"):
+            if updated != saved or not stored.get("economic") or qualified:
                 stored["observations"] = [json.loads(option) for option in sorted(updated)]
                 if not stored.get("economic"):
                     stored["proof"] = proof

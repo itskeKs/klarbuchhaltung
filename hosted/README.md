@@ -66,6 +66,9 @@ support different totals, check the statement before adding another payment.
 cannot establish its existence. It contributes to neither the booked count nor
 the gross or net totals. A later verified opening balance can confirm or clear
 the review without reposting the existing payments.
+Receiving the same observations on one page or several pages leaves the booked
+amount unchanged. If the statement establishes both the amount and its purpose,
+**Zahlungen** shows the observed purpose.
 An entry reference can also change on a later page or fetch. Matching dates,
 amounts and independent statement facts can identify the existing payment.
 Where the statement leaves a repeat possible, check it before posting again.

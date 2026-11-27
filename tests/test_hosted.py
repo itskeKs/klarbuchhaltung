@@ -1957,7 +1957,7 @@ def test_uncertain_statement_amount_is_never_booked_until_opening_established(sa
                      "balance_after_transaction": {"amount": str(sign * amount), "currency": "EUR"}}
               for row, day, amount in ((bare[0], 17, opening + 10), (bare[1], 18, opening))]
     with closing(core.db()) as ledger:
-        for page in (bare * 2, (bare * 2)[::-1], [bare[2], bare[4]]):
+        for page in (bare, bare[::-1], bare * 2, (bare * 2)[::-1], [bare[2], bare[4]]):
             assessments = []
             rows, _ = transaction_rows("account-a", page, assessments=assessments)
             core.import_bank_rows(ledger, rows, require_fx=True, assessments=assessments)
@@ -1968,7 +1968,7 @@ def test_uncertain_statement_amount_is_never_booked_until_opening_established(sa
             assert [(entry["amount"], entry["currency"], entry["date"]) for entry in pending] == [
                 (sign * 119, "EUR", "2026-11-23"),
             ]
-        for page in ((before + bare) * 2, ((before + bare) * 2)[::-1], bare * 2):
+        for page in (before + bare, (before + bare)[::-1], (before + bare) * 2, bare, bare * 2):
             assessments = []
             rows, _ = transaction_rows("account-a", page, assessments=assessments)
             core.import_bank_rows(ledger, rows, require_fx=True, assessments=assessments)
@@ -2005,7 +2005,7 @@ def test_service_retries_pending_statement_and_books_only_after_proven_opening(s
     from hosted.bank_service import BankingService
 
     bare = ambiguous_reference_statement()
-    source = bare * 2
+    source = bare
     monkeypatch.setattr(StubProvider, "transactions", lambda *_: source)
     service = BankingService(sandbox, sandbox, SITE + "/api/bank/callback", client_factory=StubProvider)
     service.save_credentials(APP_ID, b"fixture-key")
@@ -2014,6 +2014,7 @@ def test_service_retries_pending_statement_and_books_only_after_proven_opening(s
     service.finish("login-a", state, "fixture-code", "")
     now = datetime.now(timezone.utc)
     assert service.sync(now=now) == 5
+    source = (bare * 2)[::-1]
     assert service.sync(force=True, now=now) == 0
     assert service.consents()[0]["last_synced"] is None
     source = [*bare[:2]]
@@ -2024,7 +2025,7 @@ def test_service_retries_pending_statement_and_books_only_after_proven_opening(s
                         "entry_reference": "opening", "reference_number": "opening", "transaction_id": "opening",
                         "transaction_amount": {"amount": "0.01", "currency": "EUR"},
                         "balance_after_transaction": {"amount": "0", "currency": "EUR"}}
-    source = [opening, *bare] * 2
+    source = [opening, *bare]
     assert service.sync(force=True, now=now) == 2
     assert service.sync(force=True, now=now) == 0
     assert service.consents()[0]["last_synced"] == now.date().isoformat()
@@ -2052,6 +2053,93 @@ def test_payments_shows_unbooked_amount_separately_in_hosted_period(sandbox, mon
     assert "Möglicher Bankumsatz" not in client.get("/zahlungen?p=2026-10").get_data(as_text=True)
     monkeypatch.setitem(app.config, "KLAR_HOSTED", False)
     assert "Möglicher Bankumsatz" not in client.get("/zahlungen?p=2026-11").get_data(as_text=True)
+
+
+@pytest.mark.parametrize("missing_primary", [0, 2, 3])
+@pytest.mark.parametrize("opening", [None, 0, 119])
+def test_full_statement_uses_known_primary_period_when_one_report_omits_it(missing_primary, opening):
+    bare = ambiguous_reference_statement()
+    bare[missing_primary]["booking_date"] = None
+    prior = [bare[1] | {"booking_date": "2026-11-18", "value_date": "2026-11-18", "transaction_date": "2026-11-18",
+                       "entry_reference": "opening", "reference_number": "opening", "transaction_id": "opening",
+                       "remittance_information": ["Opening"], "transaction_amount": {"amount": "10", "currency": "EUR"},
+                       "balance_after_transaction": {"amount": str(opening), "currency": "EUR"}}] if opening is not None else []
+    for page in (prior + bare, (prior + bare)[::-1], (prior + bare) * 2):
+        assessments = []
+        rows, _ = transaction_rows("account-a", page, assessments=assessments)
+        disputed_period = [row for row in rows if row["description"] != "Opening"]
+        assert (len(disputed_period), sum(float(row["amount"]) for row in disputed_period)) == ((6, 205) if opening == 0 else (5, 86))
+        expected = "pending" if opening is None else "confirmed" if opening == 0 else "ruled_out"
+        assert [assessment["state"] for assessment in assessments] == [expected]
+        assert assessments[0]["date"] == "2026-11-23"
+        if missing_primary == 3:
+            supplies = next(row for row in disputed_period if row["description"] == "Supplies")
+            assert (supplies["booked_day"], supplies["date"]) == (None, "2026-11-22")
+
+
+@pytest.mark.parametrize("protection", [None, "assigned", "closed"])
+def test_one_page_replay_corrects_only_an_untouched_legacy_named_extra(sandbox, protection):
+    import core
+
+    bare = ambiguous_reference_statement()
+    with closing(core.db()) as ledger:
+        legacy = [transaction_rows("account-a", [tx])[0][0] for tx in bare]
+        assert core.import_bank_rows(ledger, legacy, require_fx=True)["imported"] == 6
+        id_ = ledger.execute("SELECT id FROM transactions JOIN bank_import_facts USING (ref) "
+                             "WHERE description = 'Rent' AND value_day = '2026-11-21'").fetchone()[0]
+        if protection == "assigned":
+            core.set_tx_category(ledger, id_, "einnahme_sonstige", "Checked manually")
+        if protection == "closed":
+            core.close_period("2026-11")
+        figures = core.figures_for_period(ledger, core.load_config(), "2026-11")
+        for page in (bare, (bare * 2)[::-1]):
+            assessments = []
+            rows, _ = transaction_rows("account-a", page, assessments=assessments)
+            assert core.import_bank_rows(ledger, rows, require_fx=True, assessments=assessments)["imported"] == 0
+            assert tuple(ledger.execute("SELECT count(*), sum(amount), sum(abs(amount)) FROM transactions").fetchone()) == (
+                (6, 205, 509) if protection else (5, 86, 390)
+            )
+            assert [row["state"] for row in core.pending_bank_statement_amounts(ledger)] == ["protected" if protection else "pending"]
+            assert core.figures_for_period(ledger, core.load_config(), "2026-11") == figures
+        if protection == "assigned":
+            assert tuple(ledger.execute("SELECT category, note FROM transactions WHERE id = ?", (id_,)).fetchone()) == (
+                "einnahme_sonstige", "Checked manually",
+            )
+
+
+@pytest.mark.parametrize("purpose", ["Rent", "Supplies"])
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_new_independent_checkpoint_confirms_the_named_source_of_a_pending_receipt(sandbox, purpose, sign):
+    import core
+
+    bare = ambiguous_reference_statement(sign)
+
+    def anchor(day, change, balance, label):
+        iso = f"2026-11-{day}"
+        return bank_row(booking_date="2026-11-18" if day == 18 else "2026-11-23", value_date=iso, transaction_date=iso,
+                        entry_reference=label, reference_number=label, transaction_id=label, remittance_information=[label],
+                        credit_debit_indicator="CRDT" if sign * change > 0 else "DBIT",
+                        transaction_amount={"amount": str(abs(change)), "currency": "EUR"},
+                        balance_after_transaction={"amount": str(sign * balance), "currency": "EUR"})
+
+    with closing(core.db()) as ledger:
+        def sync(page):
+            assessments = []
+            rows, _ = transaction_rows("account-a", page, assessments=assessments)
+            return core.import_bank_rows(ledger, rows, require_fx=True, assessments=assessments)["imported"]
+
+        assert sync(bare) == 5
+        assert len(core.pending_bank_statement_amounts(ledger)) == 1
+        baseline = 119 if purpose == "Rent" else 0
+        proven = [anchor(18, -10, 0, "Opening"), *bare, anchor(21, -1, baseline - 1, "Checkpoint"),
+                  anchor(22, 1, baseline, "Return")]
+        assert sync(proven) == 4
+        assert sync((proven * 2)[::-1]) == 0
+        assert sync(bare) == 0
+        assert core.pending_bank_statement_amounts(ledger) == []
+        named = [row[0] for row in ledger.execute("SELECT description FROM transactions WHERE amount = ?", (119 * sign,))]
+        assert sorted(named) == sorted(("Rent", "Supplies", purpose))
+        assert tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions").fetchone()) == (9, 195 * sign)
 
 
 @pytest.mark.parametrize("sign", [-1, 1])
