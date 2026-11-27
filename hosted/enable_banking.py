@@ -590,6 +590,13 @@ def _statement_shape(row):
     return tuple(row[field] for field in _STATEMENT_OBSERVATION_FACTS if field != "_transaction_id") + (row["_remittance"],)
 
 
+def _statement_report_key(row):
+    """Identify copies in a statement proof through known bank facts."""
+    identified = row["provider_ref"] or (row["creditor_ref"] and row["counterparty_ids"]
+                                         and any(row[field] for field in _STATEMENT_DATE_FIELDS))
+    return _statement_shape(row), None if identified else row["_transaction_id"]
+
+
 def _statement_choices(versions, shapes):
     repeated = defaultdict(list)
     for version, shape in zip(versions, shapes):
@@ -1135,10 +1142,12 @@ def _compare_posting_dates(rows, account_rows):
 def _statement_source_conflict(first, second):
     if first is second:
         return False
-    if first["_transaction_id"] and second["_transaction_id"] and first["_transaction_id"] != second["_transaction_id"]:
+    same_ref = _same_statement_fact(first, second, "provider_ref")
+    corroborated = (same_ref and _statement_shape(first) == _statement_shape(second)) or _statement_corroborates(first, second)
+    lookup_changed = first["_transaction_id"] and second["_transaction_id"] and first["_transaction_id"] != second["_transaction_id"]
+    if lookup_changed and not corroborated:
         return True
-    matching_id = any(first[field] and first[field] == second[field] for field in ("provider_ref", "_transaction_id"))
-    return (not (matching_id or _statement_corroborates(first, second))
+    return (not (same_ref or _same_statement_fact(first, second, "_transaction_id") or corroborated)
             or _conflicting_facts(first, second, _FETCH_COPY_FACTS) or _conflicting_counterparties(first, second))
 
 
@@ -1260,7 +1269,7 @@ def _statement_review_observations(drafts, currency):
     buckets = defaultdict(lambda: defaultdict(list))
     for index, row in enumerate(drafts):
         if row["currency"] == currency and Decimal(row["amount"]):
-            signature = _statement_shape(row), row["_transaction_id"]
+            signature = _statement_report_key(row)
             buckets[row["_amount_key"]][signature].append(row | {"_statement_sources": frozenset((index,))})
     for reports in buckets.values():
         if len(reports) > _STATEMENT_PLACEMENT_BUDGET:
@@ -1355,6 +1364,14 @@ def _review_dated_versions(groups):
             yield representative | dates | {"_statement_sources": reports[0]["_statement_sources"]}, reports, origins
 
 
+def _single_balance_edge(row, copies, peers, field):
+    day = row[field]
+    if not day or not all(copy[field] == day for copy in copies):
+        return False
+    compatible = (other for other in peers if other["currency"] == row["currency"] and other[field] in {day, None})
+    return not _possible_statement_reset(Decimal(row["amount"]), compatible)
+
+
 def _review_fixed_observations(drafts, groups, currency):
     observations = _statement_observations(drafts, (), currency)
     single_edges = set()
@@ -1364,12 +1381,8 @@ def _review_fixed_observations(drafts, groups, currency):
         # Repeating an equal balance edge requires a return to its starting
         # balance. A fully dated same-day group cannot recur without that reset.
         for field in _SECONDARY_BANK_DATES:
-            day = row[field]
-            if not day or not all(copy[field] == day for copy in copies):
-                continue
-            peers = (other for index, other in enumerate(drafts) if index not in origins
-                     and other["currency"] == currency and other[field] in {day, None})
-            if not _possible_statement_reset(Decimal(row["amount"]), peers):
+            peers = (other for index, other in enumerate(drafts) if index not in origins)
+            if _single_balance_edge(row, copies, peers, field):
                 observations = [other for other in observations if other["_statement_sources"].isdisjoint(origins)]
                 observations.append(row | {"_statement_sources": origins})
                 single_edges.add(origins)
@@ -1602,8 +1615,10 @@ def _statement_reference_dispute(versions, sparse, observations, groups, single_
                                             force_joint=True)
 
     origins = frozenset().union(*(sources for _, _, sources in (*versions, sparse)))
+    movements = {source: index for index, row in enumerate(observations) for source in row["_statement_sources"]}
     peers = [group for group in groups if group[2].isdisjoint(origins) and group[2] not in single_edges
-             and len(group[1]) > 1 and len({row["provider_ref"] for row in group[1]}) > 1]
+             and len(group[1]) > 1 and (len({movements[source] for source in group[2] if source in movements}) > 1
+                                       or len({row["provider_ref"] for row in group[1]}) > 1)]
     variable_origins = frozenset().union(origins, *(sources for _, _, sources in peers))
     other = [row for row in observations if row["_statement_sources"].isdisjoint(variable_origins)]
     if _statement_other_versions(other) != ([], False):
@@ -1707,50 +1722,58 @@ def _statement_reference_dispute(versions, sparse, observations, groups, single_
             def reported_dates(row):
                 return tuple(row[field] for field in _STATEMENT_DATE_FIELDS)
 
-            options = _review_occurrence_options(cases, reported_dates if joint else position,
-                                                 single_edges, peer_start, limit, joint)
-            if options is None:
-                if not joint:
-                    return None
-                return _ReferenceDispute(required, {}, [], set(), set(), None, (), None, False, False, None, None)
             capacity = tuple(len({reported_dates(copy) for copy in copies}) for _, copies, _ in cases[:peer_start])
-            axis = set()
-            hypotheses = []
             fixed_dates = [(reported_dates(row), row) for row in other] if joint else None
-            for selected in product(*options):
-                # Date variants can represent another occurrence or another
-                # report of the same movement. At least one occurrence remains.
-                if not selected[0] and not any(selected[2:peer_start]):
-                    continue
-                counts = tuple(map(len, selected))
-                # A sparse alternate reuses a reported occurrence from the
-                # disputed reference. It cannot also count as an extra report
-                # alongside every observed version of that reference.
-                if fully_booked and counts[1] > capacity[1] and sum(counts[:peer_start]) > sum(capacity):
-                    continue
-                if previous and not before_booked and sum(counts[:peer_start]) not in previous:
-                    continue
-                candidates = []
-                for (row, _, _), placements in zip(cases, selected):
-                    for day, balance in placements:
-                        candidates.append((day, row | {"_statement_balance": balance,
-                                                       "_statement_sources": (len(candidates),)}))
-                if joint:
-                    hypotheses.append((counts, [*candidates, *fixed_dates]))
-                    continue
-                else:
+
+            def support(reports):
+                options = _review_occurrence_options(reports, reported_dates if joint else position,
+                                                     single_edges, peer_start, limit, joint)
+                if options is None:
+                    return None
+                outcomes = set()
+                hypotheses = []
+                for selected in product(*options):
+                    # At least one dated occurrence belongs to the statement.
+                    if not selected[0] and not any(selected[2:peer_start]):
+                        continue
+                    counts = tuple(map(len, selected))
+                    # A sparse alternate reuses a reported occurrence from the
+                    # disputed reference; it cannot also count that report twice.
+                    if fully_booked and counts[1] > capacity[1] and sum(counts[:peer_start]) > sum(capacity):
+                        continue
+                    if previous and not before_booked and sum(counts[:peer_start]) not in previous:
+                        continue
+                    candidates = []
+                    for (row, _, _), placements in zip(reports, selected):
+                        for day, balance in placements:
+                            candidates.append((day, row | {"_statement_balance": balance,
+                                                           "_statement_sources": (len(candidates),)}))
+                    if joint:
+                        hypotheses.append((counts, [*candidates, *fixed_dates]))
+                        continue
                     fits = _statement_fit(_statement_search(currency, fixed, candidates, (), floating, (min(days), max(days)),
                                                             find_any=True, slots_by_booking=slots))
-                if fits is None:
-                    return None
-                if fits:
-                    axis.add(counts)
-            if joint:
-                axis = _review_joint_support(currency, hypotheses, peer_start, posting_order, retain_equal,
-                                             capacity if fully_booked else None)
-                if not axis:
-                    return _ReferenceDispute(required, {}, [], set(), set(), None, (), None, False, False, None, None)
+                    if fits is None:
+                        return None
+                    if fits:
+                        outcomes.add(counts)
+                return (_review_joint_support(currency, hypotheses, peer_start, posting_order, retain_equal,
+                                              capacity if fully_booked else None) if joint else outcomes)
+
+            # Copies from repeated pages must not widen a statement that
+            # already fits. Restore their occurrence capacity if it cannot fit.
+            distinct = tuple((row, list({_statement_report_key(copy): copy
+                                         for copy in copies}.values()), origins)
+                             for row, copies, origins in cases)
+            axis = support(distinct)
+            if axis is not None and not axis and any(len(copies) < len(original[1])
+                                                     for (_, copies, _), original in zip(distinct, cases)):
+                axis = support(cases)
             if not axis:
+                if joint:
+                    return _ReferenceDispute(required, {}, [], set(), set(), None, (), None, False, False, None, None)
+                if axis is None:
+                    return None
                 return with_booking_order() if bracketed else None
             supported = axis if supported is None else supported & axis
         if not unplaced_report and sparse_row[field] and all(row[field] for row, _, _ in later):
@@ -1773,6 +1796,8 @@ def _statement_reference_dispute(versions, sparse, observations, groups, single_
     secure = (0, 1, 1)
     peer_counts = {sources: {outcome[index] for outcome in supported} for index, (_, _, sources) in enumerate(peers, peer_start)}
     proven_peers = {sources for sources, possible in peer_counts.items() if possible == {1}}
+    if all(outcome[0] < 2 for outcome in supported):
+        proven_peers.add(required)
     uncertain_peers = {sources for sources, possible in peer_counts.items() if 1 in possible and len(possible) > 1}
     peers_settled = all(len(possible) == 1 for possible in peer_counts.values())
     # This dispute can establish one surplus while an additional occurrence
@@ -1838,6 +1863,8 @@ def _separate_unresolved_references(account_key, drafts, trace=False):
         by_day = defaultdict(list)
         observations = list(_statement_review_observations(drafts, currency))
         fixed, single_edges = _review_fixed_observations(drafts, observations, currency)
+        exact_edges = {sources for _, copies, sources in observations if sources in single_edges
+                       and len({_statement_report_key(copy) for copy in copies}) == 1}
         for group in observations:
             row, copies, origins = group
             day, amount = row["booked_day"], row["_amount_key"]
@@ -1901,6 +1928,8 @@ def _separate_unresolved_references(account_key, drafts, trace=False):
                 excluded.update(origins - {index})
                 warnings += int(state is None or len({row["_remittance"] for row in sparse_copies}) > 1)
                 proven_single = result.proven_peers | single_edges & {required, *(row["_statement_sources"] for row in witnesses)}
+                if state is not None:
+                    proven_single |= exact_edges
                 for row, copies, sources in observations:
                     if sources in proven_single or sources in result.uncertain_peers:
                         refs = {copy["ref"] for copy in copies if copy["ref"]} if sources in proven_single else set()
@@ -2035,9 +2064,8 @@ def _overlap_same_report(current, previous):
 
 @dataclass
 class _StatementOverlap:
-    members: frozenset
     matched: frozenset
-    checkpoints: frozenset
+    linked: frozenset
     context: list
     counts: tuple
     proof: dict
@@ -2096,19 +2124,18 @@ def _overlap_proof_rows(conn, account_key, amount, currency, details, drafts):
     if len(booked) != 1:
         return None
     matched = frozenset(row["_report_index"] for row in matching)
-    members = matched | {row["_report_index"] for row in current if lower <= row["date"] <= upper}
     known_reports = [(report, _overlap_booking(report[1])) for report in reports]
 
-    def checkpoint(row):
-        # Outside the period, only a report linked to a saved witness can
-        # inform this proof. A different payment on that day is independent.
+    def linked_report(row):
+        # Include a conflicting current report with the same known identity
+        # so its explicit facts can veto reusing the saved observation.
         return any(_overlap_same_report(row, report) or (
             row["_amount_key"] == report[0] and row["provider_ref"] and row["provider_ref"] == old.provider_ref
             and core._stored_secondary_match(row, old) is True
         ) for report, old in known_reports)
 
-    checkpoints = frozenset(row["_report_index"] for row in current if row["_report_index"] not in members and checkpoint(row))
-    current = [row for row in current if row["_report_index"] in members or row["_report_index"] in checkpoints]
+    linked = frozenset(row["_report_index"] for row in current if linked_report(row))
+    current = [row for row in current if row["_report_index"] in matched or row["_report_index"] in linked]
     known = {key: Decimal(value) for key, value in details.get("balances", ())}
     missing = {key for _, facts in reports if (key := _overlap_booking(facts).balance_key)} - known.keys()
     if missing:
@@ -2138,7 +2165,7 @@ def _overlap_proof_rows(conn, account_key, amount, currency, details, drafts):
             "_remittance": (), "_statement_balance": (currency, known[old.balance_key]) if old.balance_key else None,
             "_statement_context": True,
         })
-    return _StatementOverlap(members, matched, checkpoints, anchored,
+    return _StatementOverlap(matched, linked, anchored,
                              (3, 4) if details.get("remainder") else (3,),
                              {"bounds": bounds, "sparse": sparse, "reports": reports})
 
@@ -2237,10 +2264,8 @@ class _StatementFetch:
             drafts.append(row | {"bank_groups": row["bank_groups"].copy(), "prior_refs": row["prior_refs"].copy()})
         overlaps = [overlap for state, amount, currency, details in saved if state in {"unplaced", "confirmed"}
                     and (overlap := _overlap_proof_rows(conn, self.account_key, amount, currency, details, drafts))]
-        # A real correction must belong to one statement. A checkpoint
-        # outside its period can witness more than one independently.
-        claims = Counter(index for overlap in overlaps for index in overlap.members)
-        independent = [overlap for overlap in overlaps if all(claims[index] == 1 for index in overlap.members)]
+        claims = Counter(index for overlap in overlaps for index in overlap.matched)
+        independent = [overlap for overlap in overlaps if all(claims[index] == 1 for index in overlap.matched)]
         return (drafts, independent) if has_balances or independent else None
 
     def restore(self, conn, selected):
@@ -2425,20 +2450,48 @@ def _prepare_statement_sources(drafts):
     _mark_statement_capacity(drafts)
 
 
+def _coalesce_single_booked_reports(drafts, account_rows):
+    """Keep a corroborated reference-less balance edge once when it cannot recur."""
+    groups = defaultdict(list)
+    dated = defaultdict(list)
+    for row in account_rows:
+        dated[row["currency"], row["booked_day"]].append(row)
+    for row in drafts:
+        if (not row["provider_ref"] and row["booked_day"] and row["_statement_balance"]
+                and row["creditor_ref"] and row["counterparty_ids"]):
+            groups[row["currency"], row["_amount_key"], _statement_report_key(row)].append(row)
+    omitted = set()
+    for copies in groups.values():
+        if len(copies) < 2:
+            continue
+        first = copies[0]
+        origins = {row["_report_index"] for row in copies}
+        currency, day = first["currency"], first["booked_day"]
+        peers = (row for group in (dated[currency, day], dated[currency, None]) for row in group
+                 if row["_report_index"] not in origins)
+        if _single_balance_edge(first, copies, peers, "booked_day"):
+            omitted.update(row["_report_index"] for row in copies[1:])
+    return [row for row in drafts if row["_report_index"] not in omitted] if omitted else drafts
+
+
 def _separate_overlapping_statements(account_key, drafts, overlaps, trace):
     """Evaluate retained proofs independently, then return one set of live reports."""
     by_index = {row["_report_index"]: row for row in drafts}
+    corrections = set().union(*(overlap.matched for overlap in overlaps))
+    witness_claims = Counter(index for overlap in overlaps for index in overlap.linked)
     batches = []
     claimed = set()
     for overlap in overlaps:
-        witnesses = [by_index[index] | {"_statement_context": True} for index in sorted(overlap.checkpoints)]
+        # A correction belongs to its proven subject. A report linked to
+        # another proof can support it read-only; unlinked rows import normally.
+        members = overlap.matched | {index for index in overlap.linked - corrections if witness_claims[index] == 1}
+        witnesses = [by_index[index] | {"_statement_context": True} for index in sorted(overlap.linked - members)]
         for index, row in enumerate((*witnesses, *overlap.context), 1):
             row["_report_index"] = -index
         marker = {"_statement_overlap_floor": overlap.counts, "_statement_replay_overlap": overlap.proof}
-        members = [by_index[index] | marker if index in overlap.matched else by_index[index]
-                   for index in sorted(overlap.members)]
-        batches.append([*members, *witnesses, *overlap.context])
-        claimed.update(overlap.members)
+        live = [by_index[index] | marker if index in overlap.matched else by_index[index] for index in sorted(members)]
+        batches.append([*live, *witnesses, *overlap.context])
+        claimed.update(members)
     batches.append([row for row in drafts if row["_report_index"] not in claimed])
     retained, neutral, assessments = [], [], []
     warnings = 0
@@ -2455,11 +2508,16 @@ def _separate_overlapping_statements(account_key, drafts, overlaps, trace):
 
 
 def _map_statement_drafts(account_key, drafts, skipped, assessments, trace=False, overlaps=()):
+    account_rows = drafts
     if overlaps:
         drafts, neutral, review_warnings, statement_assessments = _separate_overlapping_statements(account_key, drafts, overlaps, trace)
     else:
         _prepare_statement_sources(drafts)
         drafts, neutral, review_warnings, statement_assessments = _separate_unresolved_references(account_key, drafts, trace)
+    retained = _coalesce_single_booked_reports(drafts, account_rows)
+    if retained is not drafts:
+        drafts = retained
+        _prepare_statement_sources(drafts)
     if assessments is not None:
         assessments.extend(statement_assessments)
     else:
