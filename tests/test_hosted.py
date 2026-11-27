@@ -1305,14 +1305,20 @@ def test_joint_statement_unsigned_receipts_can_be_proven_before_a_same_day_fee(s
             )
 
 
-@pytest.mark.parametrize("seeded", [False, True])
-def test_joint_statement_later_checkpoints_bound_unsigned_receipts(sandbox, seeded):
+@pytest.mark.parametrize("seeded, opening", [(False, "reported"), (True, "reported"), (True, "partial"), (True, "absent")])
+def test_joint_statement_later_checkpoints_bound_unsigned_receipts(sandbox, seeded, opening):
     import core
 
     reports, echoes = _joint_receipt_count_fixture(close_same_day=True)
     reports[1]["balance_after_transaction"] = None
     later = _bank_motion("2026-11-21", -10, 324, "Later checkpoint", entry_reference="later-checkpoint")
-    full = [[*reports, later], echoes]
+    current = [row.copy() for row in reports]
+    if opening == "partial":
+        for field in ("booking_date", "entry_reference", "balance_after_transaction"):
+            del current[0][field]
+    elif opening == "absent":
+        del current[0]
+    full = [[*current, later], echoes]
     with closing(core.db()) as ledger:
         if seeded:
             assert _sync_bank_pages(ledger, [reports, echoes]) == 5
@@ -1327,6 +1333,31 @@ def test_joint_statement_later_checkpoints_bound_unsigned_receipts(sandbox, seed
 
 
 @pytest.mark.parametrize("cross_month", [False, True])
+@pytest.mark.parametrize("missing_checkpoint", ["opening", "closing"])
+def test_joint_statement_shortened_reply_keeps_known_movements_and_imports_a_new_fee(sandbox, cross_month, missing_checkpoint):
+    import core
+
+    reports, echoes = _joint_receipt_count_fixture(cross_month=cross_month)
+    weaker = [row.copy() for row in reports]
+    for field in ("entry_reference", "reference_number", "transaction_date", "value_date"):
+        del weaker[1][field]
+    del weaker[0 if missing_checkpoint == "opening" else -1]
+    fee = _bank_motion("2026-12-03" if cross_month else "2026-11-22", -20, 314, "New fee", entry_reference="new-fee")
+    with closing(core.db()) as ledger:
+        assert _sync_bank_pages(ledger, [reports, echoes]) == (4 if cross_month else 5)
+        assert _sync_bank_pages(ledger, [[*weaker, fee], echoes]) == 1
+        for reply in ([echoes, [*weaker, fee]], [[*weaker, *echoes, fee]], [[*reports, fee], echoes]):
+            assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (
+                (5, 205) if cross_month else (6, 324)
+            )
+            assert [(row["state"], row["amount"]) for row in core.pending_bank_statement_amounts(ledger)] == (
+                [("unplaced", 119)] if cross_month else []
+            )
+            assert _sync_bank_pages(ledger, reply) == 0
+
+
+@pytest.mark.parametrize("cross_month", [False, True])
+@pytest.mark.parametrize("additional_amount", [None, -20, 119])
 @pytest.mark.parametrize("index, omitted", [
     (0, ("booking_date", "entry_reference", "balance_after_transaction")),
     (0, ("booking_date", "transaction_date", "entry_reference", "balance_after_transaction", "remittance_information")),
@@ -1335,7 +1366,7 @@ def test_joint_statement_later_checkpoints_bound_unsigned_receipts(sandbox, seed
     (3, ("booking_date", "entry_reference", "balance_after_transaction")),
     (3, ("booking_date", "value_date", "entry_reference", "balance_after_transaction", "remittance_information")),
 ])
-def test_joint_statement_weaker_reports_preserve_booked_and_possible_amounts(sandbox, cross_month, index, omitted):
+def test_joint_statement_weaker_reports_preserve_booked_and_possible_amounts(sandbox, cross_month, index, omitted, additional_amount):
     import core
 
     reports, echoes = _joint_receipt_count_fixture(cross_month=cross_month)
@@ -1343,15 +1374,24 @@ def test_joint_statement_weaker_reports_preserve_booked_and_possible_amounts(san
     for field in omitted:
         del weaker[index][field]
     expected = (4, 225) if cross_month else (5, 344)
+    addition = [] if additional_amount is None else [_bank_motion(
+        "2026-12-03" if cross_month else "2026-11-22", additional_amount, 344 + additional_amount,
+        "New movement", entry_reference="separate",
+    )]
     with closing(core.db()) as ledger:
         assert _sync_bank_pages(ledger, [reports, echoes]) == expected[0]
         opening_id = ledger.execute("SELECT id FROM transactions WHERE description='Opening'").fetchone()[0]
         core.set_tx_category(ledger, opening_id, "einnahme_sonstige", "Opening checked")
         before = [tuple(row) for row in ledger.execute("SELECT id,ref,date,category,note FROM transactions ORDER BY id")]
-        for reply in ([weaker, echoes], [[*weaker, *echoes]], [weaker], [echoes, reports]):
-            assert _sync_bank_pages(ledger, reply) == 0
-            assert [tuple(row) for row in ledger.execute("SELECT id,ref,date,category,note FROM transactions ORDER BY id")] == before
-            assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == expected
+        for delivery, reply in enumerate(([[*weaker, *addition], echoes], [[*weaker, *echoes, *addition]],
+                                          [weaker], [echoes, [*reports, *addition]])):
+            assert _sync_bank_pages(ledger, reply) == (len(addition) if delivery == 0 else 0)
+            assert [tuple(row) for row in ledger.execute(
+                "SELECT id,ref,date,category,note FROM transactions WHERE id<=? ORDER BY id", (before[-1][0],),
+            )] == before
+            assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (
+                expected[0] + len(addition), expected[1] + (additional_amount or 0),
+            )
             assert [(row["state"], row["amount"], row["covered"]) for row in core.pending_bank_statement_amounts(ledger)] == (
                 [("unplaced", 119, 1)] if cross_month else []
             )

@@ -3347,8 +3347,9 @@ def _restore_joint_bank_reviews(conn, rows, assessments):
         ) if "closed_upper" in entry["joint"]]
         current_bound = joint.get("minimum") if incoming else verified
         complete_count = current_bound and (not incoming or current_bound == joint["maximum"])
+        context = template.get("_statement_closing_context", ()) if incoming else ()
         closed = complete_count and _joint_statement_has_closing_bound(
-            named, joint["account_key"], currency, dates,
+            [*named, *context] if context else named, joint["account_key"], currency, dates,
             surplus=Decimal(str(amount)) * current_bound if incoming else Decimal(0),
         )
         if closed:

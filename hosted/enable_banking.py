@@ -2210,7 +2210,8 @@ def _joint_replay_rank(row, groups, old, booked, *, subject):
     return None
 
 
-def _joint_replay_assignment(choices, omitted=None):
+def _joint_replay_assignment(choices, omitted=None, *, required=None):
+    required = len(choices) if required is None else required
     matched = {}
 
     def place(member, seen):
@@ -2223,23 +2224,26 @@ def _joint_replay_assignment(choices, omitted=None):
                 return True
         return False
 
-    return matched if all(place(member, set()) for member in range(len(choices))) else {}
+    for member in range(len(choices)):
+        if not place(member, set()) and member < required:
+            return {}
+    return matched
 
 
-def _joint_replay_matches(choices):
-    """Return assignments that every complete matching must contain."""
-    return {index: member for index, member in _joint_replay_assignment(choices).items()
-            if len(choices[member]) == 1 or not _joint_replay_assignment(choices, (member, index))}
+def _joint_replay_matches(choices, *, required=None):
+    """Return assignments shared by every largest matching of the required rows."""
+    required = len(choices) if required is None else required
+    assigned = _joint_replay_assignment(choices, required=required)
+    return {index: member for index, member in assigned.items()
+            if (member < required and len(choices[member]) == 1)
+            or len(_joint_replay_assignment(choices, (member, index), required=required)) < len(assigned)}
 
 
-def _joint_replay_has_no_new_evidence(drafts, currency, candidates, members, bookings, observations):
-    """Recognize a complete replay whose reports only omit established facts."""
-    total = len(members) + len(observations)
-    if not len(members) <= len(drafts) <= total or any(row["currency"] != currency for row in drafts):
-        return False
-    # Every stored named movement must have a report. The previously seen
-    # alternatives may be absent, but none can be matched more than once.
-    absent = list(range(len(drafts), total))
+def _joint_replay_subset(drafts, currency, candidates, members, bookings, observations):
+    """Identify the established part of a reply, leaving new reports in the trail."""
+    required = len(members)
+    subject_groups = {group for groups, _ in observations for group in groups}
+    provider_refs = {row["provider_ref"] for row in drafts if row["currency"] == currency}
 
     def matching(groups, old):
         description = set((old.description or "").split(" · "))
@@ -2250,7 +2254,16 @@ def _joint_replay_has_no_new_evidence(drafts, currency, candidates, members, boo
 
         return [index for index in {i for group in groups for i in candidates[currency, group]} if covered(drafts[index])]
 
-    choices = [matching(groups, old) for (groups, _), old in zip(members, bookings)]
+    choices = []
+    for member, ((groups, _), old) in enumerate(zip(members, bookings)):
+        options = matching(groups, old)
+        # A previously established checkpoint can fall outside a shorter
+        # response. Keep it as context only if no live report could replace
+        # or contradict it, and still require the named subjects themselves.
+        if (not options and old.booked_day and old.balance_key and old.provider_ref not in provider_refs
+                and subject_groups.isdisjoint(groups) and not any(candidates[currency, group] for group in groups)):
+            options = [-member - 1]
+        choices.append(options)
     previous = list(bookings)
     for groups, facts in observations:
         option = _overlap_booking(facts)
@@ -2258,16 +2271,42 @@ def _joint_replay_has_no_new_evidence(drafts, currency, candidates, members, boo
                  if core._joint_proof_member_matches((groups, option), (other_groups, old), subject=True)}
         if len(names) == 1:
             option = option._replace(description=next(iter(names)))
-        choices.append([*matching(groups, option), *absent])
+        choices.append(matching(groups, option))
         previous.append(option)
 
-    assigned = _joint_replay_assignment(choices)
-    return bool(assigned) and (bool(absent) or any(
+    assigned = _joint_replay_assignment(choices, required=required)
+    live = {index: member for index, member in assigned.items() if index >= 0}
+    replay = len(live) == len(drafts) and (len(live) < len(choices) or any(
         any(getattr(previous[member], field) and not drafts[index][field] for field in core._BANK_IDENTITY_FIELDS)
         or (previous[member].description and previous[member].description != drafts[index]["description"])
         or set(previous[member].counterparty_ids) != set(drafts[index]["counterparty_ids"])
-        for index, member in assigned.items() if index < len(drafts)
+        for index, member in live.items()
     ))
+    if replay:
+        return True, {}
+    # A report is an established movement only when every maximal matching
+    # that covers the named movements assigns it to the same one.
+    matched = _joint_replay_matches(choices, required=required)
+    return False, {index: member for index, member in matched.items() if member < required}
+
+
+def _joint_checkpoint_context(conn, account, currency, groups, old, balances):
+    """Represent an established payment as a witness, without importing it."""
+    stored = conn.execute("SELECT amount FROM transactions WHERE ref=? AND currency=?", (old.ref, currency)).fetchone()
+    if not stored or old.balance_key not in balances:
+        return None
+    amount = str(Decimal(str(stored[0])).normalize())
+    dates = {getattr(old, field) for field in _STATEMENT_DATE_FIELDS if getattr(old, field)}
+    bank_groups = {day: fingerprint(account, day, amount, currency) for day in dates}
+    if bank_groups[old.booked_day] not in groups:
+        return None
+    balance = (currency, balances[old.balance_key])
+    return old._asdict() | {
+        "date": old.booked_day, "amount": amount, "currency": currency, "bank_groups": bank_groups,
+        "bank_group": bank_groups[old.booked_day], "_amount_key": amount, "_statement_balance": balance,
+        "_bank_observed_balance": balance, "_bank_account_key": account, "_statement_context": True,
+        "_counterparty_names": frozenset(), "_remittance": (), "_transaction_id": None,
+    }
 
 
 def _joint_replay_evidence(conn, account, first, last, drafts):
@@ -2287,6 +2326,7 @@ def _joint_replay_evidence(conn, account, first, last, drafts):
         for group in row["bank_groups"].values():
             candidates[row["currency"], group].append(index)
     evidence, balances = defaultdict(list), defaultdict(dict)
+    context = defaultdict(list)
     checked = set()
     for currency, encoded in saved:
         for proof in core._joint_evidence_versions(json.loads(encoded)):
@@ -2312,43 +2352,63 @@ def _joint_replay_evidence(conn, account, first, last, drafts):
                 bookings.append(_overlap_booking(facts)._replace(ref=booking.ref, description=booking.description))
             if len(bookings) != len(members):
                 continue
-            if _joint_replay_has_no_new_evidence(drafts, currency, candidates, members, bookings, proof["observations"]):
-                return {}, balances, True
+            replay, covered = _joint_replay_subset(drafts, currency, candidates, members, bookings, proof["observations"])
+            if replay:
+                return {}, balances, (), True
 
-            choices = []
-            for (groups, facts), booked in zip(members, bookings):
-                old = _overlap_booking(facts)
-                subject = not subjects.isdisjoint(groups)
-                current = {index for group in groups for index in candidates[currency, group]}
-                ranked = [(priority, index) for index in current if (priority := _joint_replay_rank(
-                    drafts[index], groups, old, booked, subject=subject,
-                )) is not None]
-                if not ranked:
-                    break
-                best = min(priority for priority, _ in ranked)
-                choices.append([index for priority, index in ranked if priority == best])
-            else:
-                covered = _joint_replay_matches(choices)
-                if sum(bool(bookings[member].balance_key) for member in covered.values()) < 2:
+            if not covered:
+                choices = []
+                for (groups, facts), booked in zip(members, bookings):
+                    old = _overlap_booking(facts)
+                    subject = not subjects.isdisjoint(groups)
+                    current = {index for group in groups for index in candidates[currency, group]}
+                    ranked = [(priority, index) for index in current if (priority := _joint_replay_rank(
+                        drafts[index], groups, old, booked, subject=subject,
+                    )) is not None]
+                    if not ranked:
+                        break
+                    best = min(priority for priority, _ in ranked)
+                    choices.append([index for priority, index in ranked if priority == best])
+                if len(choices) != len(bookings):
                     continue
-                balances[currency].update((key, Decimal(value)) for key, value in joint.get("balances", ()))
-                for index, member in covered.items():
-                    previous = bookings[member]
-                    row = drafts[index]
-                    if core._stored_secondary_match(row, previous) is not False:
-                        evidence[index].append(previous)
+                covered = _joint_replay_matches(choices)
+            if sum(bool(bookings[member].balance_key) for member in covered.values()) < 2:
+                continue
+            confirmed_balances = {key: Decimal(value) for key, value in joint.get("balances", ())}
+            missing = [member for index, member in covered.items() if index < 0]
+            if missing:
+                unknown = {bookings[member].balance_key for member in missing} - confirmed_balances.keys()
+                if unknown:
+                    confirmed_balances.update(_recover_legacy_statement_balances(currency, drafts, unknown))
+                restored = [_joint_checkpoint_context(conn, account, currency, members[member][0], bookings[member], confirmed_balances)
+                            for member in missing]
+                if not all(restored):
+                    continue
+                for row in restored:
+                    context[row["ref"]].append(row)
+            balances[currency].update(confirmed_balances)
+            for index, member in covered.items():
+                if index < 0:
+                    continue
+                previous = bookings[member]
+                row = drafts[index]
+                if core._stored_secondary_match(row, previous) is not False:
+                    evidence[index].append(previous)
 
     witnessed = {}
     for index, versions in evidence.items():
         if len({old.ref for old in versions}) != 1:
             continue
-        fields = ("balance_key", *_STATEMENT_DATE_FIELDS)
+        fields = (*_FIXED_BOOKING_FACTS, *_STATEMENT_DATE_FIELDS, "counterparty_ids", "description")
         # Different saved versions can be complementary. A conflict on a
         # typed field supplies no replacement for an omitted observation.
         available = {field: next(iter(values)) for field in fields
                      if len(values := {getattr(old, field) for old in versions if getattr(old, field)}) == 1}
         witnessed[index] = versions[0].ref, available
-    return witnessed, balances, False
+    agreed = [rows[0] for rows in context.values()
+              if len({(row["booked_day"], row["amount"], row["balance_key"]) for row in rows}) == 1]
+    checkpoints = tuple(row | {"_report_index": -index} for index, row in enumerate(agreed, 1))
+    return witnessed, balances, checkpoints, False
 
 
 @dataclass(eq=False)
@@ -2372,9 +2432,9 @@ class _StatementFetch:
             "AND json_extract(details, '$.overlap.bounds[1]') >= :first))",
             {"account": self.account_key, "first": first, "last": last},
         )]
-        witnessed, known, replay = _joint_replay_evidence(conn, self.account_key, first, last, self.drafts)
+        witnessed, known, checkpoints, replay = _joint_replay_evidence(conn, self.account_key, first, last, self.drafts)
         if replay:
-            return [], ()
+            return [], (), ()
         if not saved and not witnessed:
             return None
         alternatives = defaultdict(list)
@@ -2441,7 +2501,11 @@ class _StatementFetch:
                 ref, fields = witnessed[index]
                 dated = {field: fields[field] for field in _STATEMENT_DATE_FIELDS if field in fields and not row[field]}
                 groups = {day: fingerprint(self.account_key, day, row["_amount_key"], row["currency"]) for day in dated.values()}
-                row = row | dated | {"_confirmed_reference_aliases": {ref}, "bank_groups": row["bank_groups"] | groups}
+                facts = {field: fields[field] for field in ("creditor_ref", "reference_schema", "counterparty_iban", "counterparty_ids")
+                         if field in fields and not row[field]}
+                row = row | dated | facts | {"_confirmed_reference_aliases": {ref}, "bank_groups": row["bank_groups"] | groups}
+                if row["description"] == "Bankumsatz" and "description" in fields:
+                    row["description"] = fields["description"]
                 if day := dated.get("booked_day"):
                     row |= {"date": day, "bank_group": groups[day]}
             if index in pending_counts:
@@ -2452,18 +2516,18 @@ class _StatementFetch:
                     and (overlap := _overlap_proof_rows(conn, self.account_key, amount, currency, details, drafts))]
         claims = Counter(index for overlap in overlaps for index in overlap.matched)
         independent = [overlap for overlap in overlaps if all(claims[index] == 1 for index in overlap.matched)]
-        return (drafts, independent) if has_balances or witnessed or independent or pending_counts else None
+        return (drafts, independent, checkpoints) if has_balances or witnessed or independent or pending_counts else None
 
     def restore(self, conn, selected):
         correction = self.corrected_drafts(conn)
         if correction is None:
             return None
-        drafts, overlaps = correction
+        drafts, overlaps, checkpoints = correction
         if not drafts:
             return [], []
         assessments = []
         rows, _ = _map_statement_drafts(self.account_key, drafts, self.skipped, assessments, trace=True,
-                                        overlaps=overlaps)
+                                        overlaps=overlaps, checkpoints=checkpoints)
         if self.original.keys() <= selected:
             return rows, assessments
 
@@ -2610,17 +2674,17 @@ def transaction_rows(account_key, transactions, *, assessments=None, ledger=None
         row["prior_refs"] = list(dict.fromkeys(prior_refs))
         drafts.append(row)
     source = None
-    overlaps = ()
+    overlaps, checkpoints = (), ()
     if drafts:
         if ledger is not None:
             if correction := _StatementFetch(account_key, drafts, skipped).corrected_drafts(ledger):
-                drafts, overlaps = correction
+                drafts, overlaps, checkpoints = correction
         elif assessments is not None:
             snapshot = [row | {"bank_groups": row["bank_groups"].copy(), "prior_refs": row["prior_refs"].copy()} for row in drafts]
             source = _StatementFetch(account_key, snapshot, skipped)
     assessment_start = len(assessments) if source is not None else 0
     rows, skipped = _map_statement_drafts(account_key, drafts, skipped, assessments,
-                                         trace=source is not None, overlaps=overlaps)
+                                         trace=source is not None, overlaps=overlaps, checkpoints=checkpoints)
     if source is not None:
         for assessment in assessments[assessment_start:]:
             assessment["_statement_fetch"] = source
@@ -3262,6 +3326,7 @@ def _joint_statement_reviews(account_key, alternatives, members, minimum, maximu
     if not enclosing or (None in dates and len(enclosing) < 2):
         return
     bounds = (min(dates), max(dates)) if None not in dates else (enclosing[0], enclosing[-1])
+    context = tuple(row for row in members if row.get("_statement_context"))
     balances = sorted({(row["balance_key"], str(balance[1])) for row in members if (balance := _reported_balance(row))})
     members = [core._bank_statement_option(row) for row in members]
     scope = core._joint_statement_scope(account_key, amount, currency, checkpoints, bounds, members)
@@ -3278,6 +3343,8 @@ def _joint_statement_reviews(account_key, alternatives, members, minimum, maximu
     for slot in range(minimum):
         review = core._joint_statement_template(scope, slot, details, bounds, currency, amount, known=known)
         review["_statement_remainder"] = maximum - minimum if slot == 0 else 0
+        if context:
+            review["_statement_closing_context"] = context
         if trace:
             review["_statement_subject_reports"] = (frozenset(row["_report_index"] for row in alternatives),)
         yield review
@@ -3515,8 +3582,8 @@ def _separate_overlapping_statements(account_key, drafts, overlaps, trace):
     return retained, neutral, warnings, assessments, proven.values()
 
 
-def _map_statement_drafts(account_key, drafts, skipped, assessments, trace=False, overlaps=()):
-    account_rows = drafts
+def _map_statement_drafts(account_key, drafts, skipped, assessments, trace=False, overlaps=(), checkpoints=()):
+    account_rows = [*drafts, *checkpoints] if checkpoints else drafts
     overlap_witnesses = ()
     if overlaps:
         drafts, neutral, review_warnings, statement_assessments, overlap_witnesses = _separate_overlapping_statements(
