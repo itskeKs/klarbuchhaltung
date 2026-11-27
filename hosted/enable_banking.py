@@ -2285,9 +2285,11 @@ class _StatementFetch:
             if state == "pending" and details.get("page_family"):
                 options = [core._BankBooking(*facts[:-1], tuple(map(tuple, facts[-1]))) for _, facts in details["observations"]]
                 sparse_days = frozenset(booking.booked_day for booking in options if not booking.balance_key)
+                signed_edges = {(booking.booked_day, booking.balance_key) for booking in options}
+                signed_edge = next(iter(signed_edges)) if len(signed_edges) == 1 and not sparse_days else None
                 groups = {group for group_ids, _ in details["observations"] for group in group_ids}
                 for group in groups:
-                    pending_pages[group].append((index, details["occurrences"][1], sparse_days, options))
+                    pending_pages[group].append((index, details["occurrences"][1], sparse_days, signed_edge, options))
         current_balances = defaultdict(list)
         for row in self.drafts:
             if row.get("_fetch_page") is not None and _reported_balance(row):
@@ -2298,8 +2300,8 @@ class _StatementFetch:
         for index, row in enumerate(self.drafts):
             groups = row["bank_groups"].values()
             if row.get("_fetch_page") is not None:
-                matches = {(key, upper, sparse_days) for group in groups
-                           for key, upper, sparse_days, options in pending_pages[group]
+                matches = {(key, upper, sparse_days, signed_edge) for group in groups
+                           for key, upper, sparse_days, signed_edge, options in pending_pages[group]
                            if _matches_page_occurrence(row, options)}
                 if len(matches) == 1:
                     pending_counts[index] = next(iter(matches))[1:]
@@ -2329,8 +2331,8 @@ class _StatementFetch:
             if key in known[currency]:
                 row = row | {"_statement_balance": (currency, known[currency][key]), "balance_key": key}
             if index in pending_counts:
-                count, sparse_days = pending_counts[index]
-                row = row | {"_pending_page_count": count, "_pending_sparse_days": sparse_days}
+                count, sparse_days, signed_edge = pending_counts[index]
+                row = row | {"_pending_page_count": count, "_pending_sparse_days": sparse_days, "_pending_signed_edge": signed_edge}
             drafts.append(row | {"bank_groups": row["bank_groups"].copy(), "prior_refs": row["prior_refs"].copy()})
         overlaps = [overlap for state, amount, currency, details in saved if state in {"unplaced", "confirmed"}
                     and (overlap := _overlap_proof_rows(conn, self.account_key, amount, currency, details, drafts))]
@@ -2969,6 +2971,140 @@ def _unbalanced_page_support(versions, peers, minimum, related):
     return supported, evidence
 
 
+@dataclass
+class _BalanceFamily:
+    groups: list
+    contested: list
+
+    @property
+    def reports(self):
+        return [*(row for group in self.groups for row in group), *self.contested]
+
+    def representatives(self):
+        return [min(group, key=lambda row: (not _reported_balance(row), _balance_report_preference(row)))
+                for group in self.groups]
+
+    def has_optional_reports(self):
+        reports = self.reports
+        if any(row.get("_pending_page_count", 0) > len(self.groups) for row in reports):
+            return True
+        return len(reports) > len(self.groups) and any(
+            not _reported_balance(row) or not row["provider_ref"] for row in reports
+        )
+
+    def choices(self):
+        """Keep one observation of each distinct payment in every hypothesis."""
+        fixed = self.representatives()
+        fixed_indices = {row["_report_index"] for row in fixed}
+        reports = self.reports
+        extras = defaultdict(list)
+        for row in reports:
+            if row["_report_index"] not in fixed_indices:
+                extras[row["booked_day"], _reported_balance(row)].append(row)
+        previous = max(row.get("_pending_page_count", 0) for row in reports)
+        saved_days = set().union(*(row.get("_pending_sparse_days", ()) for row in reports))
+        if previous > len(reports):
+            # Retain a previously observed option on a shorter replay. A
+            # probe can constrain the proof, but can never become a booking.
+            anchor = fixed[0]
+            signed_edge = anchor["booked_day"], anchor["balance_key"]
+            saved_edges = {row["_pending_signed_edge"] for row in reports if row.get("_pending_signed_edge")}
+            if len(saved_days) == 1:
+                placement = next(iter(saved_days)), None
+            elif not saved_days and len(fixed) == 1 and saved_edges == {signed_edge} and (balance := _reported_balance(anchor)):
+                placement = anchor["booked_day"], balance
+            else:
+                placement = None
+            if placement is not None:
+                day, balance = placement
+                extras[placement].extend([{"booked_day": day, "_statement_balance": balance, "amount": anchor["amount"]}]
+                                         * min(previous - len(reports), _STATEMENT_PLACEMENT_BUDGET + 1))
+        buckets = tuple(extras.values())
+        for counts in product(*(range(len(rows) + 1) for rows in buckets)):
+            yield (*fixed, *(row for rows, count in zip(buckets, counts) for row in rows[:count]))
+
+
+def _joint_balance_window(families, witnesses, currency):
+    """Project one set of feasible account histories onto every subject."""
+    choices = [list(islice(family.choices(), _STATEMENT_PLACEMENT_BUDGET + 1)) for family in families]
+    peers = [((row["booked_day"], None, None), row) for row in witnesses]
+    histories = {}
+    for trial, selection in enumerate(product(*choices)):
+        if trial >= _STATEMENT_PLACEMENT_BUDGET:
+            return None
+        subjects = [((row["booked_day"], None, None), row) for rows in selection for row in rows]
+        if len(peers) + len(subjects) > _STATEMENT_PLACEMENT_BUDGET:
+            return None
+        constrained = [len(peers) + i for i, (days, row) in enumerate(subjects) if not days[0] and not row["_statement_balance"]]
+        fits = _review_joint_trail(currency, [*peers, *subjects], (), sparse_occurrences=constrained)
+        if fits is None:
+            return None
+        if fits:
+            counts = tuple(map(len, selection))
+            if all("_report_index" in row for rows in selection for row in rows):
+                histories[counts] = selection
+            else:
+                histories.setdefault(counts, None)
+    if not histories:
+        return None
+    supported = [set(counts) for counts in zip(*histories)]
+    # Book only a combination supported by the same statement. An optional
+    # receipt and its possible reversal cannot prove one another separately.
+    minimum = tuple(map(min, supported))
+    if selection := histories.get(minimum):
+        return list(zip(families, supported, selection))
+    # The search completed, but the separate minima have no common
+    # allocation. The prior statement-level decisions still apply.
+    return []
+
+
+def _joint_balance_proofs(families, account_by_currency):
+    """Group occurrence decisions whose dated windows share bank observations."""
+    by_currency = defaultdict(list)
+    for family in families:
+        reports = family.reports
+        currency = reports[0]["currency"]
+        days = {row["booked_day"] for row in reports if row["booked_day"]}
+        if len(days) != 1 or not all(row.get("_fetch_page") is not None for row in reports):
+            continue
+        window = _booked_balance_window(account_by_currency[currency], next(iter(days)))
+        by_currency[currency].append((family, {row["_report_index"] for row in reports},
+                                      {row["_report_index"] for row in window}))
+    for currency, pending in by_currency.items():
+        if len(pending) < 2:
+            continue
+        while pending:
+            family, subjects, window = pending.pop()
+            connected = [family]
+            while related := [(other, origins, bounds) for other, origins, bounds in pending
+                              if not origins.isdisjoint(window) or not subjects.isdisjoint(bounds)]:
+                for other, origins, bounds in related:
+                    pending.remove((other, origins, bounds))
+                    connected.append(other)
+                    subjects = subjects | origins
+                    window = window | bounds
+            if len(connected) < 2 or not any(_reported_balance(row) for member in connected for row in member.reports):
+                continue
+            peers = [row for row in account_by_currency[currency] if row["_report_index"] in window - subjects]
+            if not any(_reported_balance(row) for row in peers):
+                continue
+            witnesses = []
+            decisions = None
+            if len(window) <= _STATEMENT_PLACEMENT_BUDGET:
+                witnesses = [copies[0] for copies in _balance_witness_groups(peers, currency)]
+                decisions = _joint_balance_window(connected, witnesses, currency)
+            if decisions:
+                for subject, supported, selection in decisions:
+                    peers = [row for other in connected if other is not subject for row in other.representatives()]
+                    yield subject, supported, selection, [*witnesses, *peers]
+            else:
+                # Keep independently identified movements and earlier
+                # monetary decisions. Review the unresolved reports without
+                # letting separate proofs turn either echo into a booking.
+                for subject in connected:
+                    yield subject, None, subject.representatives(), ()
+
+
 def _reconcile_balance_reports(account_key, drafts, account_rows, assessments, trace, overlap_witnesses=()):
     """Reconcile compatible reports to the number supported by the balance trail."""
     reviewed = defaultdict(set)
@@ -2993,11 +3129,43 @@ def _reconcile_balance_reports(account_key, drafts, account_rows, assessments, t
     shared = []
     unbalanced = []
     groups = list(_signed_observation_groups(drafts, shared, unbalanced))
+    shared_members = {id(group) for family, _ in shared for group in family}
+    joint_families = [_BalanceFamily(family, sparse) for family, sparse in shared]
+    joint_families.extend(_BalanceFamily([group], []) for group in groups if id(group) not in shared_members)
     page_families = []
     for families, contested in unbalanced:
-        versions = [*(row for group in families for row in group), *contested]
+        family = _BalanceFamily(families, contested)
+        versions = family.reports
         if (len(versions) > 1 or any(row.get("_pending_page_count") for row in versions)) and not independently_reviewed(versions):
             page_families.append((versions, families))
+            joint_families.append(family)
+    joint_families = [family for family in joint_families if (
+        family.has_optional_reports()
+        and not independently_reviewed(family.reports)
+    )]
+    joint = set()
+    for family, supported, selection, peers in _joint_balance_proofs(joint_families, account_by_currency):
+        versions = family.reports
+        origins = {row["_report_index"] for row in versions}
+        joint.update(origins)
+        if supported is not None:
+            if assessment := _balance_occurrence_assessment(account_key, versions, supported, peers, trace, paginated=True):
+                assessments.append(assessment)
+        if len(selection) == 1 and supported is not None:
+            index, merged = _merge_balance_reports(account_key, versions, 1, len(supported) > 1, supported, peers)
+            replacements[index] = merged
+            omitted.update(origins - {index})
+        else:
+            kept = {row["_report_index"] for row in selection}
+            omitted.update(origins - kept)
+            if len(selection) > 1:
+                for slot, row in enumerate(selection):
+                    replacements[row["_report_index"]] = row | {"_statement_slot": (("balance", frozenset(kept)), slot),
+                                                                 "_statement_edge_occurrence": True}
+        memos = {row["_remittance"] for row in selection}
+        warnings += int(supported is None or any(row["_remittance"] and row["_remittance"] not in memos for row in versions))
+    page_families = [(versions, families) for versions, families in page_families
+                     if versions[0]["_report_index"] not in joint]
     for versions, families in page_families:
         origins = {row["_report_index"] for row in versions}
         observed = [row for row in account_by_currency[versions[0]["currency"]] if row["_report_index"] not in origins]
@@ -3035,6 +3203,8 @@ def _reconcile_balance_reports(account_key, drafts, account_rows, assessments, t
             warnings += int(any(row["_remittance"] and row["_remittance"] not in memos for row in versions))
     retained_sparse = set()
     for family, sparse in shared:
+        if sparse[0]["_report_index"] in joint:
+            continue
         assess = not independently_reviewed([*sparse, *(row for group in family for row in group)])
         dropped, live, unidentified, assessment = _shared_sparse_occurrences(account_key, family, sparse, account_rows, trace, assess)
         if assessment:
@@ -3048,6 +3218,8 @@ def _reconcile_balance_reports(account_key, drafts, account_rows, assessments, t
         account_by_currency = {currency: [row for row in rows if row["_report_index"] not in omitted]
                                for currency, rows in account_by_currency.items()}
     for group in groups:
+        if group[0]["_report_index"] in joint:
+            continue
         versions = [row for row in group if row["_report_index"] not in omitted | retained_sparse]
         sparse = [row for row in versions if not _reported_balance(row)]
         if not sparse and all(row["provider_ref"] and not row.get("_pending_page_count") for row in versions):

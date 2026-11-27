@@ -868,9 +868,7 @@ def test_paginated_unbalanced_payments_keep_a_proven_second_payment(sandbox, sep
             ).fetchone()[0] == 2
 
 
-def _sync_bank_pages(ledger, pages):
-    import core
-
+def _bank_page_reports(pages):
     class PaginatedBank(StubProvider):
         def request(self, method, path, *, query=None, data=None):
             index = int(query.get("continuation_key", "0"))
@@ -880,9 +878,14 @@ def _sync_bank_pages(ledger, pages):
             return response
 
     provider = PaginatedBank(APP_ID, b"fixture-key")
+    return provider.transactions(ACCOUNT, None, "2026-11-23")
+
+
+def _sync_bank_pages(ledger, pages):
+    import core
+
     assessments = []
-    rows, _ = transaction_rows("account-a", provider.transactions(ACCOUNT, None, "2026-11-23"),
-                               assessments=assessments, ledger=ledger)
+    rows, _ = transaction_rows("account-a", _bank_page_reports(pages), assessments=assessments, ledger=ledger)
     return core.import_bank_rows(ledger, rows, require_fx=True, auto_match=False, assessments=assessments)["imported"]
 
 
@@ -894,6 +897,146 @@ def _bank_motion(day, amount, balance, label, **fields):
         balance_after_transaction={"amount": str(balance), "currency": "EUR"} if balance is not None else None,
         transaction_id=label, remittance_information=[label], **fields,
     )
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+@pytest.mark.parametrize("seed", [False, True])
+@pytest.mark.parametrize("shape, has_balance", [
+    ("shared receipt", True), ("impossible pair", True), ("possible pair", True), ("proven pair", True),
+    ("impossible pair", False), ("possible pair", False),
+])
+def test_related_bank_echoes_share_the_same_balance_history(sandbox, sign, seed, shape, has_balance):
+    import core
+
+    if shape == "shared receipt":
+        motions = [
+            (18, 10, 0, "Opening"), (19, 119, 119, "Receipt A"), (19, -119, 0, "Reversal"),
+            (19, 119, 119, "Receipt B"), (19, -23, 96, "Fee"), (23, -10, 86, "Closing"),
+        ]
+        targets, expected, possible = (1, 2), (6, 96, 248, 152), [-119, 119]
+    elif shape == "impossible pair":
+        motions = [
+            (19, 10, 0, "Opening"), (20, 119, 119, "Receipt"),
+            (21, -23, 96, "Debit"), (22, -10, 86, "Closing"),
+        ]
+        targets, expected, possible = (1, 2), (4, 96, 129, 33), []
+    elif shape == "possible pair":
+        motions = [
+            (19, 10, 0, "Opening"), (20, 119, 119, "Receipt"), (20, -119, 0, "Reversal"),
+            (22, -5, -5, "Fee A"), (23, -13, -18, "Fee B"),
+        ]
+        targets, expected, possible = (1, 2), (5, -8, 129, 137), [-119, 119]
+    else:
+        motions = [
+            (19, 10, 0, "Opening"), (20, 119, 119, "Receipt"), (21, 3, 241, "Checkpoint"),
+            (22, -119, 122, "Debit"), (23, -5, -2, "Closing"),
+        ]
+        targets, expected, possible = (1, 3), (7, 8, 251, 243), []
+    reports = [_bank_motion(f"2026-11-{day}", amount * sign, balance * sign, name, entry_reference=name)
+               for day, amount, balance, name in motions]
+    if not has_balance:
+        reports[1]["balance_after_transaction"] = None
+    echoes = [reports[index] | {"entry_reference": None, "transaction_id": f"rotated-{index}", "balance_after_transaction": None}
+              for index in targets]
+    if shape == "shared receipt":
+        echoes[1]["entry_reference"] = reports[targets[1]]["entry_reference"]
+    count, net, received, paid = expected
+    if sign < 0:
+        received, paid = paid, received
+    pending = sorted(("pending", amount * sign) for amount in possible)
+
+    with closing(core.db()) as ledger:
+        def payment():
+            return tuple(ledger.execute("SELECT id,ref,date FROM transactions WHERE description=? ORDER BY id",
+                                        (motions[1][3],)).fetchone())
+
+        def totals():
+            return tuple(ledger.execute("SELECT count(*),sum(amount),sum(max(amount,0)),sum(max(-amount,0)) FROM transactions").fetchone())
+
+        def notices():
+            return sorted((row["state"], row["amount"]) for row in core.pending_bank_statement_amounts(ledger))
+
+        initial = reports[:1] if shape == "proven pair" else reports
+        if seed:
+            assert _sync_bank_pages(ledger, [initial]) == len(initial)
+            if shape != "proven pair":
+                saved = payment()
+                core.set_tx_category(ledger, saved[0], "einnahme_sonstige", "Checked")
+        assert _sync_bank_pages(ledger, [reports, echoes]) == count - (len(initial) if seed else 0)
+        assert totals() == (count, net * sign, received, paid)
+        assert notices() == pending
+        if not seed or shape == "proven pair":
+            saved = payment()
+            core.set_tx_category(ledger, saved[0], "einnahme_sonstige", "Checked")
+        for reply in ([echoes, reports], [reports[1:], echoes], [reports], [reports, echoes]):
+            assert _sync_bank_pages(ledger, reply) == 0
+            assert totals() == (count, net * sign, received, paid)
+            assert notices() == pending
+        assert payment() == saved
+        assert tuple(ledger.execute("SELECT category,note FROM transactions WHERE id=?", (saved[0],)).fetchone()) == (
+            "einnahme_sonstige", "Checked",
+        )
+
+
+def test_coupled_bank_echoes_above_the_search_limit_need_review(sandbox):
+    import core
+
+    motions = [
+        (19, 10, 0, "Opening"), (20, 119, 119, "Receipt"), (20, -119, 0, "Reversal"),
+        (22, -5, -5, "Fee A"), (23, -13, -18, "Fee B"),
+    ]
+    reports = [_bank_motion(f"2026-11-{day}", amount, balance, name, entry_reference=name)
+               for day, amount, balance, name in motions]
+    # There are 13 possible counts on each side, including the signed
+    # payment. Exhausting the joint search cannot prove extra bookings.
+    echo = [row | {"entry_reference": None, "transaction_id": f"{row['transaction_id']}-{n}", "balance_after_transaction": None}
+            for row in reports[1:3] for n in range(12)]
+    with closing(core.db()) as ledger:
+        assert _sync_bank_pages(ledger, [reports]) == 5
+        receipt = ledger.execute("SELECT id FROM transactions WHERE amount=119").fetchone()[0]
+        core.set_tx_category(ledger, receipt, "einnahme_sonstige", "Checked")
+        for pages in ([reports, echo], [echo, reports]):
+            assessments = []
+            rows, needs_review = transaction_rows("account-a", _bank_page_reports(pages), assessments=assessments, ledger=ledger)
+            result = core.import_bank_rows(ledger, rows, require_fx=True, auto_match=False, assessments=assessments)
+            assert result["imported"] == 0
+            assert needs_review > 0
+            assert core.pending_bank_statement_amounts(ledger) == []
+            assert tuple(ledger.execute("SELECT count(*),sum(amount),sum(max(amount,0)) FROM transactions").fetchone()) == (5, -8, 129)
+        assert tuple(ledger.execute("SELECT category,note FROM transactions WHERE id=?", (receipt,)).fetchone()) == (
+            "einnahme_sonstige", "Checked",
+        )
+
+
+@pytest.mark.parametrize("balance_mask, canonical", [(1, False), (2, False), (3, False), (3, True)])
+def test_reported_balances_leave_a_repeatable_offsetting_cycle_in_review(sandbox, balance_mask, canonical):
+    import core
+
+    motions = [
+        (19, 10, 0, "Opening"), (20, 119, 119, "Receipt"), (20, -119, 0, "Reversal"),
+        (22, -5, -5, "Fee A"), (23, -13, -18, "Fee B"),
+    ]
+    reports = [_bank_motion(f"2026-11-{day}", amount, balance, name, entry_reference=name)
+               for day, amount, balance, name in motions]
+    copies = [row | {"entry_reference": row["entry_reference"] if canonical else None,
+                     "transaction_id": f"renewed-{index}",
+                     "balance_after_transaction": row["balance_after_transaction"] if balance_mask & (1 << index) else None}
+              for index, row in enumerate(reports[1:3])]
+    expected = [] if canonical else [("pending", -119), ("pending", 119)]
+    with closing(core.db()) as ledger:
+        assert _sync_bank_pages(ledger, [reports, copies]) == 5
+        source = tuple(ledger.execute("SELECT id,ref FROM transactions WHERE amount=119").fetchone())
+        core.set_tx_category(ledger, source[0], "einnahme_sonstige", "Checked")
+        for reply in ([copies, reports], [reports], [reports, copies]):
+            assert sorted((row["state"], row["amount"]) for row in core.pending_bank_statement_amounts(ledger)) == expected
+            assert _sync_bank_pages(ledger, reply) == 0
+            assert tuple(ledger.execute(
+                "SELECT count(*),sum(amount),sum(max(amount,0)),sum(max(-amount,0)) FROM transactions",
+            ).fetchone()) == (5, -8, 129, 137)
+        assert sorted((row["state"], row["amount"]) for row in core.pending_bank_statement_amounts(ledger)) == expected
+        assert tuple(ledger.execute("SELECT id,ref,category,note FROM transactions WHERE amount=119").fetchone()) == (
+            *source, "einnahme_sonstige", "Checked",
+        )
 
 
 @pytest.mark.parametrize("sign", [-1, 1])

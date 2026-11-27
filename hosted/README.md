@@ -124,6 +124,9 @@ with the reported balances. A balance on that day can establish the number
 of payments even when those payments have no individual balances. When the
 possible counts still differ, the extra amount stays in review until a
 reported balance resolves it.
+Related repeated reports are checked against the same balance history.
+A possible receipt or reversal stays outside the gross amounts and net
+total until the statement establishes it.
 When the statement proves one additional payment and leaves a further payment
 possible, **Zahlungen** includes the proven amount and shows the possible
 remainder separately.
