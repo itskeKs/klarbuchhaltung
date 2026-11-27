@@ -150,7 +150,7 @@ _FETCH_FIXED_FACTS = ("provider_ref", "booked_day", *_FIXED_BOOKING_FACTS)
 _STATEMENT_IDENTITY_FACTS = ("provider_ref", "creditor_ref", "reference_schema")
 _STATEMENT_OBSERVATION_FACTS = (*_FETCH_COPY_FACTS, "counterparty_ids", "_counterparty_names",
                                 "_transaction_id", "_statement_balance")
-_STATEMENT_PLACEMENT_BUDGET = 128
+_STATEMENT_PLACEMENT_BUDGET = core._BANK_BALANCE_TRAIL_LIMIT
 
 
 def _optional_bank_day(value):
@@ -1452,28 +1452,16 @@ def _review_axis(records, field, bracketed):
     return position, slots
 
 
-def _date_predecessors(dates):
-    before = [0] * len(dates)
-    earlier = 0
-    for _, same_day in groupby(sorted((day, i) for i, day in enumerate(dates) if day), key=lambda pair: pair[0]):
-        today = 0
-        for _, index in same_day:
-            before[index] = earlier
-            today |= 1 << index
-        earlier |= today
-    return before
-
-
 def _review_predecessors(dates, axes):
     booked = [days[0] for days in dates]
-    primary = _date_predecessors(booked)
+    primary = core._bank_date_predecessors(booked)
     before = primary.copy()
     same_day = defaultdict(int)
     for index, day in enumerate(booked):
         same_day[day] |= 1 << index
     booked_mask = ((1 << len(booked)) - 1) ^ same_day[None]
     for axis in axes:
-        secondary = _date_predecessors([days[axis] for days in dates])
+        secondary = core._bank_date_predecessors([days[axis] for days in dates])
         reversed_bookings = 0
         for index, day in enumerate(booked):
             if day and (reversed_order := secondary[index] & booked_mask & ~(primary[index] | same_day[day])):
@@ -1499,52 +1487,7 @@ def _review_joint_trail(currency, movements, axes, *, sparse_occurrences=()):
     amounts = [Decimal(row["amount"]) for _, row in movements]
     balances = [balance[1] if (balance := row["_statement_balance"]) and balance[0] == currency else None
                 for _, row in movements]
-    order = sorted(range(len(movements)), key=lambda index: balances[index] is None)
-    known = sum(1 << index for index, balance in enumerate(balances) if balance is not None) if sparse_occurrences else 0
-    effect = [(days, amount, balance, index in sparse_occurrences)
-              for index, (days, amount, balance) in enumerate(zip(dates, amounts, balances))]
-
-    def successors(remaining, running):
-        choices = set()
-        for index in order:
-            bit = 1 << index
-            if not remaining & bit or before[index] & remaining:
-                continue
-            # An optional copy only adds an occurrence when it can connect
-            # reported balances. An open end can absorb any signed amount.
-            if index in sparse_occurrences and (running is None or not remaining & known):
-                continue
-            balance = balances[index]
-            ending = None if running is None else running + amounts[index]
-            if balance is not None and ending is not None and balance != ending:
-                continue
-            # Equal movements on the same timeline are interchangeable
-            # here. Keep their multiplicity without exploring permutations.
-            if effect[index] in choices:
-                continue
-            choices.add(effect[index])
-            yield remaining ^ bit, balance if balance is not None else ending
-
-    # Traverse lazily so the bound also limits retained states. Extra states
-    # proportional to the number of movements allow a long ordered trail.
-    budget = _STATEMENT_PLACEMENT_BUDGET + len(movements)
-    stack = [iter((((1 << len(movements)) - 1, None),))]
-    seen = set()
-    while stack:
-        state = next(stack[-1], None)
-        if state is None:
-            stack.pop()
-            continue
-        if state in seen:
-            continue
-        remaining, running = state
-        if not remaining:
-            return True
-        if len(seen) >= budget:
-            return None
-        seen.add(state)
-        stack.append(successors(remaining, running))
-    return False
+    return core._bank_balance_trail(dates, amounts, balances, before, sparse_occurrences)
 
 
 def _review_joint_support(currency, hypotheses, subject_end, posting_order, retain_equal, capacity):
@@ -3029,6 +2972,8 @@ def _joint_balance_window(families, witnesses, currency):
     choices = [list(islice(family.choices(), _STATEMENT_PLACEMENT_BUDGET + 1)) for family in families]
     peers = [((row["booked_day"], None, None), row) for row in witnesses]
     histories = {}
+    baseline = tuple(len(family.groups) for family in families)
+    alternatives = {}
     for trial, selection in enumerate(product(*choices)):
         if trial >= _STATEMENT_PLACEMENT_BUDGET:
             return None
@@ -3043,6 +2988,8 @@ def _joint_balance_window(families, witnesses, currency):
             counts = tuple(map(len, selection))
             if all("_report_index" in row for rows in selection for row in rows):
                 histories[counts] = selection
+                for rows, count in zip(selection, baseline):
+                    alternatives.update((row["_report_index"], row) for row in rows[count:])
             else:
                 histories.setdefault(counts, None)
     if not histories:
@@ -3052,10 +2999,14 @@ def _joint_balance_window(families, witnesses, currency):
     # receipt and its possible reversal cannot prove one another separately.
     minimum = tuple(map(min, supported))
     if selection := histories.get(minimum):
-        return list(zip(families, supported, selection))
-    # The search completed, but the separate minima have no common
-    # allocation. The prior statement-level decisions still apply.
-    return []
+        return list(zip(families, supported, selection)), ()
+    # Different named allocations can still establish one distinct
+    # movement. Use its signed amount, leaving its source unspecified.
+    surplus_counts = {sum(counts) - sum(baseline) for counts in histories}
+    if (min(surplus_counts) == 1 and all(rows is not None for rows in histories.values())
+            and len({row["_amount_key"] for row in alternatives.values()}) == 1):
+        return [], (list(alternatives.values()), max(surplus_counts) > 1)
+    return [], ()
 
 
 def _joint_balance_proofs(families, account_by_currency):
@@ -3073,6 +3024,7 @@ def _joint_balance_proofs(families, account_by_currency):
     for currency, pending in by_currency.items():
         if len(pending) < 2:
             continue
+        dated = {row["_report_index"]: row["booked_day"] for row in account_by_currency[currency] if row["booked_day"]}
         while pending:
             family, subjects, window = pending.pop()
             connected = [family]
@@ -3083,6 +3035,12 @@ def _joint_balance_proofs(families, account_by_currency):
                     connected.append(other)
                     subjects = subjects | origins
                     window = window | bounds
+                # A report without BOOK can connect noncontiguous local
+                # windows. The combined trail still covers every booked
+                # movement between its enclosing checkpoints.
+                days = [day for index, day in dated.items() if index in window]
+                first, last = min(days), max(days)
+                window.update(index for index, day in dated.items() if first <= day <= last)
             if len(connected) < 2 or not any(_reported_balance(row) for member in connected for row in member.reports):
                 continue
             peers = [row for row in account_by_currency[currency] if row["_report_index"] in window - subjects]
@@ -3093,19 +3051,61 @@ def _joint_balance_proofs(families, account_by_currency):
             if len(window) <= _STATEMENT_PLACEMENT_BUDGET:
                 witnesses = [copies[0] for copies in _balance_witness_groups(peers, currency)]
                 decisions = _joint_balance_window(connected, witnesses, currency)
-            if decisions:
-                for subject, supported, selection in decisions:
+            if decisions and decisions[0]:
+                for subject, supported, selection in decisions[0]:
                     peers = [row for other in connected if other is not subject for row in other.representatives()]
-                    yield subject, supported, selection, [*witnesses, *peers]
+                    yield subject, supported, selection, [*witnesses, *peers], None
             else:
                 # Keep independently identified movements and earlier
                 # monetary decisions. Review the unresolved reports without
                 # letting separate proofs turn either echo into a booking.
+                surplus = None
+                if decisions and decisions[1]:
+                    members = [*witnesses, *(row for subject in connected for row in subject.representatives())]
+                    alternatives, remainder = decisions[1]
+                    surplus = alternatives, members, remainder
                 for subject in connected:
-                    yield subject, None, subject.representatives(), ()
+                    yield subject, None, subject.representatives(), (), surplus
+                    surplus = None
 
 
-def _reconcile_balance_reports(account_key, drafts, account_rows, assessments, trace, overlap_witnesses=()):
+def _joint_statement_review(account_key, alternatives, members, remainder, trace):
+    first = alternatives[0]
+    amount, currency = first["_amount_key"], first["currency"]
+    checkpoints = sorted({(row["booked_day"] or "", *(row[field] or "" for field in _SECONDARY_BANK_DATES),
+                           row["_amount_key"], row["balance_key"])
+                          for row in members if _reported_balance(row)})
+    dates = {row["booked_day"] for row in alternatives}
+    known = None not in dates and len(dates) == 1
+    enclosing = sorted({row["booked_day"] for row in members if _reported_balance(row) and row["booked_day"]})
+    if not enclosing or (None in dates and len(enclosing) < 2):
+        return None
+    bounds = (min(dates), max(dates)) if None not in dates else (enclosing[0], enclosing[-1])
+    day = bounds[0]
+    group = fingerprint(account_key, day, amount, currency)
+    scope = fingerprint(account_key, "joint-statement-review", amount, currency, checkpoints, bounds)
+    proof = (scope, {"booked_day": group} if known else {}, (), (day, checkpoints))
+    joint = {
+        "account_key": account_key,
+        "bounds": (enclosing[0], enclosing[-1]),
+        "members": [core._bank_statement_option(row) for row in members],
+    }
+    review = dict.fromkeys(core._BANK_IDENTITY_FIELDS) | {
+        "ref": core.ENABLE_BANKING_REF_PREFIX + scope, "date": day, "booked_day": day if known else None,
+        "amount": amount, "currency": currency, "account_key": account_key, "description": "Kontoauszug prüfen",
+        "tx_type": "Enable Banking", "counterparty_ids": (), "bank_group": group, "bank_groups": {day: group},
+        "prior_refs": [], "_statement_review_options": [core._bank_statement_option(row) for row in alternatives],
+        "_statement_review_members": joint["members"], "_statement_review_proof": proof, "_statement_joint": joint,
+        "_statement_remainder": remainder,
+    }
+    if trace:
+        review["_statement_subject_reports"] = (frozenset(row["_report_index"] for row in alternatives),)
+    if known:
+        return "confirmed", review
+    return "unplaced", review | {"_statement_fiscal_bounds": bounds}
+
+
+def _reconcile_balance_reports(account_key, drafts, account_rows, assessments, neutral, trace, overlap_witnesses=()):
     """Reconcile compatible reports to the number supported by the balance trail."""
     reviewed = defaultdict(set)
     for assessment in assessments:
@@ -3144,7 +3144,13 @@ def _reconcile_balance_reports(account_key, drafts, account_rows, assessments, t
         and not independently_reviewed(family.reports)
     )]
     joint = set()
-    for family, supported, selection, peers in _joint_balance_proofs(joint_families, account_by_currency):
+    for family, supported, selection, peers, surplus in _joint_balance_proofs(joint_families, account_by_currency):
+        if surplus and (decision := _joint_statement_review(account_key, *surplus, trace)):
+            state, review = decision
+            if state == "confirmed":
+                neutral.append(review)
+            if state == "unplaced" or review["_statement_remainder"]:
+                assessments.append(review | {"state": state})
         versions = family.reports
         origins = {row["_report_index"] for row in versions}
         joint.update(origins)
@@ -3341,7 +3347,7 @@ def _map_statement_drafts(account_key, drafts, skipped, assessments, trace=False
     else:
         _prepare_statement_sources(drafts)
         drafts, neutral, review_warnings, statement_assessments = _separate_unresolved_references(account_key, drafts, trace)
-    retained, balance_warnings = _reconcile_balance_reports(account_key, drafts, account_rows, statement_assessments, trace,
+    retained, balance_warnings = _reconcile_balance_reports(account_key, drafts, account_rows, statement_assessments, neutral, trace,
                                                            overlap_witnesses)
     if retained is not drafts:
         drafts = retained
@@ -3384,10 +3390,12 @@ def _map_statement_drafts(account_key, drafts, skipped, assessments, trace=False
     rejected = _compare_posting_dates(rows, drafts)
     report_indices = [row["_report_index"] for row in drafts] if trace else ()
     for row in rows:
+        row["_bank_account_key"] = account_key
         row["bank_groups"].update(row.pop("_statement_booking_aliases", {}))
         if statement_day := row.get("_statement_booking_day"):
             row["date"] = statement_day
             row["bank_groups"][statement_day] = fingerprint(account_key, statement_day, row["_amount_key"], row["currency"])
+        row["_bank_observed_balance"] = _reported_balance(row)
         del row["_statement_balance"]
         if trace:
             row["_statement_report_origins"] = frozenset(report_indices[i] for i in row["_statement_sources"])

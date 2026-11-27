@@ -899,6 +899,138 @@ def _bank_motion(day, amount, balance, label, **fields):
     )
 
 
+@pytest.mark.parametrize("packet", ["split", "reversed", "single"])
+@pytest.mark.parametrize("opening", [False, True])
+def test_joint_window_keeps_booked_movements_between_its_checkpoints(sandbox, packet, opening):
+    import core
+
+    motions = [
+        (18, -119, -129, "First debit"), (19, -23, -152, "Fee A"), (21, -119, -271, "Middle debit"),
+        (22, 3, -268, "Receipt"), (23, -23, -291, "Fee B"),
+    ]
+    reports = [_bank_motion(f"2026-11-{day}", amount, balance, name, entry_reference=name)
+               for day, amount, balance, name in motions]
+    echoes = [reports[-1] | {"balance_after_transaction": None},
+              reports[3] | {"entry_reference": None},
+              reports[0] | {"booking_date": None, "balance_after_transaction": None}]
+    if opening:
+        reports.insert(0, _bank_motion("2026-11-17", 10, -10, "Opening", entry_reference="opening"))
+    pages = [[*reports, *echoes]] if packet == "single" else [reports, echoes]
+    if packet == "reversed":
+        pages.reverse()
+    with closing(core.db()) as ledger:
+        assert _sync_bank_pages(ledger, [reports]) == len(reports)
+        payment = tuple(ledger.execute("SELECT id,ref,date FROM transactions WHERE description='First debit'").fetchone())
+        core.set_tx_category(ledger, payment[0], "gebuehr", "Checked")
+        for reply in (pages, pages[::-1], [reports]):
+            assert _sync_bank_pages(ledger, reply) == 0
+            assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (
+                len(reports), -271 if opening else -281,
+            )
+        assert tuple(ledger.execute("SELECT id,ref,date,category,note FROM transactions WHERE description='First debit'").fetchone()) == (
+            *payment, "gebuehr", "Checked",
+        )
+
+
+@pytest.mark.parametrize("packet", ["split", "reversed", "single"])
+@pytest.mark.parametrize("assigned", [False, True])
+def test_joint_statement_books_a_proven_extra_with_unknown_purpose(sandbox, packet, assigned):
+    import core
+
+    opening = _bank_motion("2026-11-19", 10, 0, "Opening", entry_reference="opening")
+    rent = _bank_motion("2026-11-20", 119, 119, "Rent", entry_reference="rent", reference_number="rent-invoice")
+    supplies = _bank_motion("2026-11-20", 119, None, "Supplies", entry_reference="supplies", reference_number="supplies-invoice")
+    fee = _bank_motion("2026-11-21", -23, 334, "Fee", entry_reference="fee")
+    reports = [opening, rent, supplies, fee]
+    echoes = [row | {"entry_reference": None, "transaction_id": f"renewed-{index}", "balance_after_transaction": None}
+              for index, row in enumerate((rent, supplies))]
+    pages = [[*reports, *echoes]] if packet == "single" else [reports, echoes]
+    if packet == "reversed":
+        pages.reverse()
+    with closing(core.db()) as ledger:
+        assert _sync_bank_pages(ledger, pages) == 5
+        review = ledger.execute("SELECT id, ref, date, category FROM transactions WHERE description='Kontoauszug prüfen'").fetchone()
+        assert review is not None and tuple(review)[2:] == ("2026-11-20", "offen")
+        proof = ledger.execute(
+            "SELECT provider_ref, creditor_ref, counterparty_ids FROM bank_import_facts WHERE ref=?", (review["ref"],),
+        ).fetchone()
+        assert tuple(proof) == (None, None, None)
+        rent_id = ledger.execute("SELECT id FROM transactions WHERE description='Rent'").fetchone()[0]
+        core.set_tx_category(ledger, rent_id, "einnahme_sonstige", "Rent assigned")
+        if assigned:
+            core.set_tx_category(ledger, review["id"], "einnahme_sonstige", "Review assigned")
+        for reply in (pages[::-1], [reports], pages):
+            assert _sync_bank_pages(ledger, reply) == 0
+            assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (5, 344)
+            assert core.pending_bank_statement_amounts(ledger) == []
+        specified = rent | {"entry_reference": "rent-repeat", "transaction_id": "settled-rent",
+                            "balance_after_transaction": {"amount": "357", "currency": "EUR"}}
+        contradictory = specified | {"balance_after_transaction": {"amount": "500", "currency": "EUR"}}
+        assert _sync_bank_pages(ledger, [[opening, rent, supplies, contradictory, fee]]) == 0
+        assert ledger.execute("SELECT description FROM transactions WHERE id=?", (review["id"],)).fetchone()[0] == "Kontoauszug prüfen"
+        assert ledger.execute("SELECT balance_key FROM bank_import_facts WHERE ref=?", (review["ref"],)).fetchone()[0] is None
+        for reply in ([[opening, rent, supplies, specified, fee]], [reports, echoes], [[specified]]):
+            assert _sync_bank_pages(ledger, reply) == 0
+            assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (5, 344)
+        settled = ledger.execute("SELECT id,ref,date,description,category,note FROM transactions WHERE id=?", (review["id"],)).fetchone()
+        assert tuple(settled) == (
+            review["id"], review["ref"], "2026-11-20", "Kontoauszug prüfen" if assigned else "Rent",
+            "einnahme_sonstige" if assigned else "offen", "Review assigned" if assigned else None,
+        )
+        assert tuple(ledger.execute("SELECT category,note FROM transactions WHERE id=?", (rent_id,)).fetchone()) == (
+            "einnahme_sonstige", "Rent assigned",
+        )
+
+
+def test_joint_statement_counts_an_unplaced_receipt_only_across_its_possible_months(sandbox):
+    import core
+
+    opening = _bank_motion("2026-11-29", 10, 0, "Opening", entry_reference="opening")
+    rent = _bank_motion("2026-11-30", 119, 119, "Rent", entry_reference="rent", reference_number="rent-invoice")
+    supplies = _bank_motion("2026-12-01", 119, None, "Supplies", entry_reference="supplies", reference_number="supplies-invoice")
+    fee = _bank_motion("2026-12-02", -23, 334, "Fee", entry_reference="fee")
+    reports = [opening, rent, supplies, fee]
+    echoes = [row | {"entry_reference": None, "transaction_id": f"renewed-{index}", "balance_after_transaction": None}
+              for index, row in enumerate((rent, supplies))]
+    with closing(core.db()) as ledger:
+        assert _sync_bank_pages(ledger, [reports, echoes]) == 4
+        for reply in ([echoes, reports], [reports], [reports, echoes]):
+            assert _sync_bank_pages(ledger, reply) == 0
+            for start, end, covered in (("2026-11-30", "2026-12-01", 1), ("2026-11-01", "2026-11-30", 0),
+                                        ("2026-12-01", "2026-12-31", 0)):
+                notices = core.pending_bank_statement_amounts(ledger, start, end)
+                assert [(row["state"], row["amount"], row["covered"]) for row in notices] == [("unplaced", 119, covered)]
+            assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (4, 225)
+        specified = supplies | {"entry_reference": "supplies-repeat", "transaction_id": "settled-supplies",
+                                "balance_after_transaction": {"amount": "357", "currency": "EUR"}}
+        assert _sync_bank_pages(ledger, [[opening, rent, supplies, specified, fee]]) == 1
+        assert _sync_bank_pages(ledger, [reports, echoes]) == 0
+        assert _sync_bank_pages(ledger, [[specified]]) == 0
+        assert core.pending_bank_statement_amounts(ledger) == []
+        assert [tuple(row) for row in ledger.execute(
+            "SELECT substr(date,1,7),count(*),sum(amount) FROM transactions GROUP BY 1 ORDER BY 1",
+        )] == [("2026-11", 2, 129), ("2026-12", 3, 215)]
+
+
+def test_joint_statement_books_the_common_extra_and_keeps_the_remainder_in_review(sandbox):
+    import core
+
+    day = "2026-11-20"
+    opening = _bank_motion("2026-11-19", 10, 0, "Opening", entry_reference="opening")
+    rent = _bank_motion(day, 119, 119, "Rent", entry_reference="rent", reference_number="rent-invoice")
+    supplies = _bank_motion(day, 119, None, "Supplies", entry_reference="supplies", reference_number="supplies-invoice")
+    fee = _bank_motion(day, -23, 334, "Fee", entry_reference="fee")
+    reports = [opening, rent, supplies, fee]
+    echoes = [row | {"entry_reference": None, "transaction_id": f"renewed-{index}", "balance_after_transaction": None}
+              for index, row in enumerate((rent, supplies))]
+    with closing(core.db()) as ledger:
+        assert _sync_bank_pages(ledger, [reports, echoes]) == 5
+        for reply in ([reports], [echoes, reports]):
+            assert _sync_bank_pages(ledger, reply) == 0
+            assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (5, 344)
+            assert [(row["state"], row["amount"]) for row in core.pending_bank_statement_amounts(ledger)] == [("pending", 119)]
+
+
 @pytest.mark.parametrize("sign", [-1, 1])
 @pytest.mark.parametrize("seed", [False, True])
 @pytest.mark.parametrize("shape, has_balance", [
