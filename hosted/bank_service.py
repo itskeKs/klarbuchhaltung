@@ -329,11 +329,12 @@ class BankingService:
             try:
                 client = self.client()
                 rows = []
+                assessments = []
                 skipped = 0
                 for account in consent["accounts"]:
                     items, dropped = transaction_rows(account["key"], client.transactions(
                         account["uid"], start, today,
-                    ))
+                    ), assessments=assessments)
                     rows.extend(items)
                     skipped += dropped
                 with closing(self.connect()) as state, state:
@@ -342,13 +343,15 @@ class BankingService:
                     if not state.execute("SELECT 1 FROM consents WHERE id = ?", (consent["id"],)).fetchone():
                         continue
                     with closing(core.db()) as ledger:
-                        result = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True)
+                        result = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True, assessments=assessments)
+                        accounts = {account["key"] for account in consent["accounts"]}
+                        pending = any(row["account_key"] in accounts for row in core.pending_bank_statement_amounts(ledger))
                 skipped += result["ambiguous"]
                 imported, deferred = result["imported"], result["deferred"]
                 message = f"{imported} neue Umsätze importiert."
                 if deferred:
                     message += f" Für {deferred} weitere Umsätze fehlen Wechselkurse. Der Abruf wird wiederholt."
-                self._record(consent["id"], now, message, done=not (skipped or deferred), skipped=skipped)
+                self._record(consent["id"], now, message, done=not (skipped or deferred or pending), skipped=skipped)
                 count += imported
             except BankingError as exc:
                 if exc.code == "EXPIRED_SESSION":

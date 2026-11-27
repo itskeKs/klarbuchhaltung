@@ -789,11 +789,16 @@ def zahlungen():
     for g in groups:
         g["total"] = sum(x["amount"] for x in g["rows"] if not x.get("derived"))
     summary = {"money_in": money_in, "money_out": money_out, "net": money_in + money_out}
+    statement_reviews = []
+    if app.config.get("KLAR_HOSTED"):
+        statement_reviews = [dict(row) | {"display": core.eur(row["amount"]) if row["currency"] == "EUR"
+                                         else f"{core.fmt(row['amount'])} {row['currency']}"}
+                             for row in core.pending_bank_statement_amounts(conn, lo, hi)]
     return render_template("zahlungen.html", active="zahlungen", groups=groups,
                            inv_options=inv_options, cats=core.TX_CATEGORIES,
                            summary=summary, count=len(entries), p=p, plabel=plabel,
                            periods=_period_list(py),
-                           open_count=core.transactions_open_count(conn))
+                           open_count=core.transactions_open_count(conn), statement_reviews=statement_reviews)
 
 
 @app.route("/zahlungen/export")

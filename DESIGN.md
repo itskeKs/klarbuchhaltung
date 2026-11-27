@@ -9,4 +9,7 @@ reload. An expired consent directs them to connect again.
 payment filter. Keep the bank controls and payment amounts reachable at 360 px.
 When a booked amount is confirmed and its reference is unclear, use the payment
 description “Kontoauszug prüfen”.
+Show a possible unbooked payment separately in the selected **Zahlungen**
+period, below the totals, with its date and amount. State that it is excluded
+from the totals.
 See the [bank import walkthrough](docs/acceptance/journeys.md).

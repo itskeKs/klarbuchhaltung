@@ -1139,6 +1139,15 @@ def init_schema(conn: sqlite3.Connection) -> None:
             ref TEXT NOT NULL UNIQUE REFERENCES transactions(ref) ON DELETE CASCADE,
             alternatives TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS bank_statement_assessments (
+            review_key TEXT PRIMARY KEY,
+            account_key TEXT NOT NULL,
+            date TEXT NOT NULL,
+            amount REAL NOT NULL,
+            currency TEXT NOT NULL,
+            state TEXT NOT NULL,
+            details TEXT NOT NULL
+        );
         CREATE INDEX IF NOT EXISTS idx_bank_provider_ref ON bank_import_facts(provider_ref);
         CREATE INDEX IF NOT EXISTS idx_bank_import_group ON bank_import_identity(booking_group);
         CREATE TABLE IF NOT EXISTS fx_rates (
@@ -1997,10 +2006,9 @@ def _stored_secondary_match(row, old):
 
 
 def _bank_economic_replay(first, second):
-    """Positive account-local evidence of the same movement after a provider correction."""
-    dates = _bank_secondary_match((first[field] for field in _BANK_SECONDARY_DATES),
-                                 (second[field] for field in _BANK_SECONDARY_DATES))
-    if dates is False:
+    """Screen an account-local candidate before resolving its occurrence count."""
+    dates = [(first[field], second[field]) for field in _BANK_SECONDARY_DATES if first[field] and second[field]]
+    if any(left != right for left, right in dates):
         return False
     same_payer = _bank_account_match(first["counterparty_ids"], second["counterparty_ids"])
     fields = ("balance_key", "creditor_ref", "reference_schema", "counterparty_iban")
@@ -2009,8 +2017,13 @@ def _bank_economic_replay(first, second):
     corroboration = sum(bool(first[field] and first[field] == second[field])
                         for field in ("balance_key", "creditor_ref"))
     corroboration += same_payer is True
-    return ((dates is True and corroboration >= 2)
-            or (first["booked_day"] and first["booked_day"] == second["booked_day"] and corroboration == 3))
+    same_balance = first["balance_key"] and first["balance_key"] == second["balance_key"]
+    description = first.get("description")
+    same_description = description and description != "Bankumsatz" and description == second.get("description")
+    if dates:
+        return bool(same_balance or corroboration >= 2 or (corroboration and (len(dates) > 1 or same_description)))
+    return bool(first["booked_day"] and first["booked_day"] == second["booked_day"]
+                and (corroboration == 3 or (same_balance and same_description)))
 
 
 def _bank_rejected_statement_booking(row, matched_ref, recorded, *, posting_date=False):
@@ -2186,7 +2199,8 @@ def _bank_matches(conn, rows):
         observed_refs = _bank_observed_secondary_refs(row, by_day)
         corrections[row["ref"]] = {old.ref for old in candidates
                                    if _bank_facts_conflict(row, old) and _bank_economic_replay(row, old._asdict())}
-        confirmed = corrections[row["ref"]] & row.get("_confirmed_reference_aliases", set())
+        confirmed = {old.ref for old in candidates if old.ref in row.get("_confirmed_reference_aliases", ())
+                     and not _bank_facts_conflict(row | {"provider_ref": old.provider_ref}, old)}
         ranked = [(old, rank) for old in candidates
                   if (rank := 1 if old.ref in confirmed else _bank_match_rank(row, old, ref, source_refs)) is not None]
         options[row["ref"]] = {old.ref: _bank_candidate_priority(row, old, rank, source_refs, observed_refs)
@@ -2344,6 +2358,73 @@ def _record_bank_statement_review(conn, row, ref):
                                                "proof": row.get("_statement_review_proof"), "economic": True})))
 
 
+def pending_bank_statement_amounts(conn, start="0000-01-01", end="9999-12-31"):
+    return conn.execute("SELECT account_key, date, amount, currency, state FROM bank_statement_assessments "
+                        "WHERE state IN ('pending', 'protected') AND date BETWEEN ? AND ? ORDER BY date, review_key",
+                        (start, end)).fetchall()
+
+
+def _withdraw_unassigned_statement_payment(conn, ref):
+    tx = conn.execute("SELECT id, date, description, category, invoice_id, expense_id, receipt_path, note "
+                      "FROM transactions WHERE ref = ?", (ref,)).fetchone()
+    if (tx["description"] != "Kontoauszug prüfen" or tx["category"] != "offen"
+            or any(tx[field] is not None and tx[field] != "" for field in ("invoice_id", "expense_id", "receipt_path", "note"))
+            or conn.execute("SELECT 1 FROM documents WHERE suggest_tx = ?", (tx["id"],)).fetchone()):
+        return False
+    try:
+        _guard_open_period(tx["date"], "Bankumsatz prüfen")
+    except ValueError:
+        return False
+    conn.execute("DELETE FROM bank_statement_reviews WHERE ref = ?", (ref,))
+    conn.execute("DELETE FROM bank_import_date_aliases WHERE ref = ?", (ref,))
+    conn.execute("DELETE FROM bank_import_identity WHERE ref = ?", (ref,))
+    conn.execute("DELETE FROM bank_import_facts WHERE ref = ?", (ref,))
+    conn.execute("DELETE FROM transactions WHERE ref = ?", (ref,))
+    return True
+
+
+def _record_bank_statement_assessments(conn, observations):
+    if not observations:
+        return set()
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    blocked = set()
+    stored = {key: (state, json.loads(details)) for key, state, details in conn.execute(
+        "SELECT review_key, state, details FROM bank_statement_assessments",
+    )}
+    for row in observations:
+        proof = row["_statement_review_proof"]
+        matches = [key for key, (_, saved) in stored.items() if _bank_statement_same_proof(proof, saved["proof"])]
+        if len(matches) > 1:
+            blocked.add(row["ref"])
+            continue
+        key = matches[0] if matches else row["ref"]
+        previous = stored.get(key, (None, {}))[0]
+        state = row["state"]
+        if previous in {"confirmed", "ruled_out"}:
+            if state == "pending" or state == previous:
+                continue
+            blocked.add(row["ref"])
+            state = "protected"
+        elif state in {"pending", "ruled_out"}:
+            prior = []
+            for old_key, ref, encoded in conn.execute("SELECT review_key, ref, alternatives FROM bank_statement_reviews"):
+                saved = json.loads(encoded)
+                if isinstance(saved, list):
+                    saved = {"observations": saved, "proof": None}
+                if (_bank_statement_same_proof(proof, saved["proof"]) or _bank_statement_matches_legacy_review(old_key, row, saved)
+                        or (_bank_statement_replays_legacy_witness(row, saved) and _bank_statement_members(conn, row))):
+                    prior.append(ref)
+            if prior and (len(prior) != 1 or not _withdraw_unassigned_statement_payment(conn, prior[0])):
+                state = "protected"
+        details = {"proof": proof, "observations": row["_statement_review_options"]}
+        conn.execute("INSERT INTO bank_statement_assessments VALUES (?, ?, ?, ?, ?, ?, ?) "
+                     "ON CONFLICT(review_key) DO UPDATE SET state = excluded.state, details = excluded.details",
+                     (key, row["account_key"], row["date"], row["amount"], row["currency"], state, json.dumps(details)))
+        stored[key] = state, details
+    return blocked
+
+
 def _prepare_bank_statement_reviews(conn, rows):
     """Reserve independently confirmed payments before matching their disputed copies."""
     if not any(row.get("bank_groups") for row in rows):
@@ -2364,6 +2445,11 @@ def _prepare_bank_statement_reviews(conn, rows):
             stored = {"observations": stored, "proof": None}
         recorded[key] = ref, stored, day, description
         for groups, facts in stored["observations"]:
+            option = _BankBooking(*facts)
+            for group in groups:
+                disputed[group].append(option)
+    for (encoded,) in conn.execute("SELECT details FROM bank_statement_assessments WHERE state = 'pending'"):
+        for groups, facts in json.loads(encoded)["observations"]:
             option = _BankBooking(*facts)
             for group in groups:
                 disputed[group].append(option)
@@ -2445,12 +2531,15 @@ def _prepare_bank_statement_reviews(conn, rows):
     return named, pending, warnings, duplicates
 
 
-def import_bank_rows(conn, rows: list, *, auto_match: bool = True, require_fx: bool = False) -> dict:
+def import_bank_rows(conn, rows: list, *, auto_match: bool = True, require_fx: bool = False, assessments=()) -> dict:
     """Fertig normalisierte Zahlungen aufnehmen (z. B. aus dem Wirex-Konto).
 
     Auto-match is optional. Enable Banking rows are always left for review.
     'ref' ist UNIQUE, ein erneuter Abruf legt also nichts doppelt an."""
     imported = deferred = 0
+    blocked = _record_bank_statement_assessments(conn, assessments)
+    if blocked:
+        rows = [row for row in rows if row["ref"] not in blocked]
     named, pending_reviews, review_warnings, dups = _prepare_bank_statement_reviews(conn, rows)
     seen, ambiguous, storage_refs = _bank_matches(conn, named)
     for r in (*named, *pending_reviews):
@@ -2491,7 +2580,7 @@ def import_bank_rows(conn, rows: list, *, auto_match: bool = True, require_fx: b
     result = {"imported": imported, "duplicates": dups, "matched": matched}
     if require_fx:
         result["deferred"] = deferred
-        result["ambiguous"] = len(ambiguous) + review_warnings
+        result["ambiguous"] = len(ambiguous) + review_warnings + len(blocked)
     return result
 
 

@@ -19,4 +19,10 @@ with either of two references, find one **Kontoauszug prüfen** payment under
 **Zahlungen**. It stays open for statement review. Repeating the import leaves
 the total, the other payments and their assignments intact.
 
+When the same reported movements lack a verified opening balance, **Zahlungen**
+shows five booked payments and EUR 86.00 net. The possible EUR 119.00 appears in
+a separate statement-review notice and stays outside the totals. A verified
+opening balance of EUR 0.00 confirms the neutral payment and clears the notice.
+A verified opening balance of EUR 119.00 clears the notice without a new receipt.
+
 [Banking guide](../../hosted/README.md) · [Regression tests](../../tests/test_hosted.py)

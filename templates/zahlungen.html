@@ -35,6 +35,21 @@
   </div>
 </div>
 
+{% if statement_reviews %}
+<section class="card stack" style="margin-bottom:18px" aria-label="Kontoauszug prüfen">
+  <strong>Kontoauszug prüfen</strong>
+  {% for review in statement_reviews %}
+  <div>
+    {% if review.state == 'pending' %}
+    Möglicher Bankumsatz über {{ review.display }} vom {{ review.date | de_date }}. Nicht gebucht und nicht in den Summen enthalten.
+    {% else %}
+    Bestehende Buchung über {{ review.display }} vom {{ review.date | de_date }} prüfen. Die Buchung bleibt erhalten.
+    {% endif %}
+  </div>
+  {% endfor %}
+</section>
+{% endif %}
+
 <div class="row" style="gap:12px;flex-wrap:wrap;margin-bottom:16px">
   <div class="row" style="flex:1;min-width:220px;gap:10px;padding:11px 15px;border-radius:12px;border:1.5px solid var(--field-border);background:var(--surface)">
     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--ink-3)" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.2-3.2"/></svg>
