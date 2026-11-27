@@ -150,6 +150,8 @@ establish the sequence of movements on the same booking day. Known signed
 amounts carry those balances through movements that omit their own balance.
 When several movements share a reference and an amount, a description unique
 in both reports can identify the right booking and preserve its assignment.
+The verified sequence can include many independent dated movements while
+the importer evaluates only the uncertain payment placements.
 A shorter reply can reuse a verified earlier sequence from the same account. Observations
 without a booking date contribute only when the signed history supports
 their effect in the relevant interval.

@@ -1940,6 +1940,85 @@ def test_repeated_booked_fees_survive_a_clipped_reply_without_checkpoints(sandbo
             assert core.pending_bank_statement_amounts(ledger) == []
 
 
+@pytest.mark.parametrize("sign", [-1, 1])
+@pytest.mark.parametrize("leading_count, newer_fee", [(0, True), (124, False), (151, True)])
+def test_repeated_fees_recover_only_the_earlier_part_of_the_statement(sandbox, sign, leading_count, newer_fee):
+    import core
+
+    def movement(day, amount, balance, label, reference):
+        return _bank_motion(f"2026-11-{day:02d}", sign * amount, None if balance is None else sign * balance,
+                            label, entry_reference=reference) | {"transaction_id": label}
+
+    opening = movement(1, 10, 0, "Opening", "opening")
+    unrelated = [movement(1 + index // 12, 1, index + 1, f"Earlier {index}", f"earlier-{index}")
+                 for index in range(leading_count)]
+    rent_balance = leading_count + 119
+    rent = movement(20, 119, rent_balance, "Rent", "rent")
+    late = movement(21, 50, rent_balance + 50, "Late credit", "late")
+    names = ("Service", "ATM", "Card") if newer_fee else ("Fee", "Fee")
+    old_fees = [movement(22, -23, rent_balance - 23 * index, label, "shared-fee") | {"transaction_id": f"old-fee-{index}"}
+                for index, label in enumerate(names[:2], start=1)]
+    fresh_fees = [movement(22, -23, rent_balance + 50 - 23 * index, label, "shared-fee") | {"transaction_id": f"fresh-fee-{index}"}
+                  for index, label in enumerate(names, start=1)]
+    sparse = [row | {"balance_after_transaction": None} for row in fresh_fees[:2]] + fresh_fees[2:]
+    initial, complete = [opening, *unrelated, rent, *old_fees], [opening, *unrelated, rent, late, *fresh_fees]
+    intermediate = [rent, late, *sparse] if not leading_count else [opening, *unrelated, rent, late, *sparse]
+
+    def sync(ledger, rows):
+        return _sync_bank_pages(ledger, [rows[index:index + 30] for index in range(0, len(rows), 30)])
+
+    with closing(core.db()) as ledger:
+        assert sync(ledger, initial) == leading_count + 4
+        booked = {row["id"]: (row["ref"], row["description"]) for row in ledger.execute(
+            "SELECT id,ref,description FROM transactions WHERE amount=?", (-23 * sign,),
+        )}
+        for ident in booked:
+            core.set_tx_category(ledger, ident, "gebuehr", f"Assigned fee {ident}")
+        assert sync(ledger, intermediate) == 1 + newer_fee
+        for reply in (complete, initial, complete[::-1], intermediate, complete):
+            assert sync(ledger, reply) == 0
+            assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (
+                leading_count + 5 + newer_fee, (leading_count + 133 - 23 * newer_fee) * sign,
+            )
+            assert {row["id"]: (row["ref"], row["description"], row["note"]) for row in ledger.execute(
+                "SELECT id,ref,description,note FROM transactions WHERE category='gebuehr'",
+            )} == {ident: (*saved, f"Assigned fee {ident}") for ident, saved in booked.items()}
+            assert core.pending_bank_statement_amounts(ledger) == []
+
+
+@pytest.mark.parametrize("sale_day, new_sales", [(21, True), (22, False), (23, False)])
+def test_signed_sales_do_not_consume_fee_placement_budget(sandbox, sale_day, new_sales):
+    import core
+
+    def statement(late, omit_fees=False):
+        events = [(18, 10, "Opening", "opening"), (20, 119, "Rent", "rent"),
+                  (22, -23, "Service", "same-fee"), (22, -23, "ATM", "same-fee")]
+        if late:
+            events.append((21, 50, "Late credit", "late"))
+        if late or not new_sales:
+            events.extend((sale_day + (index // 35 if sale_day > 22 else 0), 1, f"Sale {index}", f"sale-{index}")
+                          for index in range(140))
+        balance = -10
+        reports = []
+        for day, amount, label, reference in sorted(events, key=lambda event: event[0]):
+            balance += amount
+            reports.append(_bank_motion(f"2026-11-{day}", amount, None if omit_fees and reference == "same-fee" else balance,
+                                        label, entry_reference=reference))
+        return reports
+
+    def sync(ledger, reports):
+        return _sync_bank_pages(ledger, [reports[start:start + 30] for start in range(0, len(reports), 30)])
+
+    prior, sparse, complete = statement(False), statement(True, omit_fees=True), statement(True)
+    with closing(core.db()) as ledger:
+        assert sync(ledger, prior) == (4 if new_sales else 144)
+        assert sync(ledger, sparse) == (141 if new_sales else 1)
+        for reply in (complete, complete[::-1], prior, complete):
+            assert sync(ledger, reply) == 0
+            assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (145, 273)
+            assert core.pending_bank_statement_amounts(ledger) == []
+
+
 @pytest.mark.parametrize("shape", ["undated tail", "dense days", "long trail", "unreferenced fee", "undated rent", "undated fee"])
 def test_bank_balance_revision_uses_the_evidenced_interval(sandbox, shape):
     import core

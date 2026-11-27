@@ -1482,12 +1482,11 @@ def _review_predecessors(dates, axes):
 def _review_joint_trail(currency, movements, axes, *, sparse_occurrences=()):
     """Check balances against posting order and compatible secondary dates."""
     dates = [days for days, _ in movements]
-    before = _review_predecessors(dates, axes)
-
     amounts = [Decimal(row["amount"]) for _, row in movements]
     balances = [balance[1] if (balance := row["_statement_balance"]) and balance[0] == currency else None
                 for _, row in movements]
-    return core._bank_balance_trail(dates, amounts, balances, before, sparse_occurrences)
+    return core._bank_balance_trail(dates, amounts, balances, _review_predecessors(dates, axes), sparse_occurrences)
+
 
 
 def _review_joint_support(currency, hypotheses, subject_end, posting_order, retain_equal, capacity):
@@ -2955,17 +2954,32 @@ def _signed_observation_groups(drafts, shared, unbalanced):
 
 
 def _booked_balance_window(rows, day):
-    openings, closings = defaultdict(set), defaultdict(set)
+    openings, closings, edges = defaultdict(set), defaultdict(set), defaultdict(list)
     for row in rows:
         if not (booked := row["booked_day"]) or not (amount := Decimal(row["amount"])):
             continue
         balance = _reported_balance(row)
         openings[booked].add(balance[1] - amount if balance else None)
         closings[booked].add(balance[1] if balance else None)
+        if balance:
+            edges[booked].append((row, core._BankMovement(booked, booked, amount, balance[1])))
+
+    def checkpoint(booked, boundaries):
+        if None in boundaries:
+            return False
+        if len(boundaries) == 1:
+            return True
+        # A day can have several reported balances and still end at one
+        # checkpoint if its signed transitions form a single dated trail.
+        group = edges[booked]
+        starts = core._bank_day_openings([movement for _, movement in group])
+        return bool(starts and len(starts) == 1 and
+                    core._bank_revision_order({booked: group}, next(iter(starts)), group[0][0]["currency"]))
+
     # The nearest signed day might end at different balances. Keep its
     # enclosing checkpoint rather than letting that day's opening float.
-    start = max((day_ for day_, values in closings.items() if day_ < day and len(values) == 1 and None not in values), default=None)
-    end = min((day_ for day_, values in openings.items() if day_ > day and len(values) == 1 and None not in values), default=None)
+    start = next((date for date in sorted(closings, reverse=True) if date < day and checkpoint(date, closings[date])), None)
+    end = next((date for date in sorted(openings) if date > day and checkpoint(date, openings[date])), None)
     return [row for row in rows if not (booked := row["booked_day"])
             or ((start is None or start <= booked) and (end is None or booked <= end))]
 
@@ -3163,6 +3177,24 @@ def _unbalanced_placements(versions, minimum):
             yield [((row["booked_day"], None, None), row) for row in (*dated[:known], *undated[:unknown])]
 
 
+def _review_page_balance_trail(currency, movements, unplaced):
+    """Check occurrence counts against fixed BOOK days and known balances."""
+    if not unplaced and all(days[0] for days, _ in movements):
+        groups = defaultdict(list)
+        for days, row in movements:
+            day = days[0]
+            balance = _reported_balance(row)
+            groups[day].append((None, core._BankMovement(day, day, Decimal(row["amount"]), balance[1] if balance else None)))
+        if openings := core._bank_revision_openings(groups):
+            uncertain = False
+            for opening in openings:
+                if trail := core._bank_revision_order(groups, opening, currency):
+                    return True
+                uncertain |= trail is None
+            return None if uncertain else False
+    return _review_joint_trail(currency, movements, (), sparse_occurrences=unplaced)
+
+
 def _unbalanced_page_support(versions, peers, minimum, related):
     days = {row["booked_day"] for row in versions if row["booked_day"]} or {row["date"] for row in versions}
     if len(days) != 1:
@@ -3184,7 +3216,8 @@ def _unbalanced_page_support(versions, peers, minimum, related):
     independent = [copies[0] for copies in _balance_witness_groups(unrelated, versions[0]["currency"])]
     evidence = [*independent, *representatives]
     checkpoint_days = [row["booked_day"] for row in independent if row["booked_day"] and _reported_balance(row)]
-    if (len(peers) + len(versions) > _STATEMENT_PLACEMENT_BUDGET or len(checkpoint_days) < 2
+    unplaced = sum(not row["booked_day"] or not _reported_balance(row) for row in evidence)
+    if (unplaced + len(versions) > _STATEMENT_PLACEMENT_BUDGET or len(checkpoint_days) < 2
             or (day not in checkpoint_days and not min(checkpoint_days) < day < max(checkpoint_days))):
         return set(), evidence
     witnesses = [((row["booked_day"], None, None), row) for row in independent]
@@ -3198,7 +3231,7 @@ def _unbalanced_page_support(versions, peers, minimum, related):
         # A recorded BOOK day can put an unsigned movement before or after
         # the last numeric checkpoint on that day. Keep both placements.
         constrained = [index for index in range(len(witnesses), len(motions)) if not motions[index][0][0]]
-        fits = _review_joint_trail(versions[0]["currency"], motions, (), sparse_occurrences=constrained)
+        fits = _review_page_balance_trail(versions[0]["currency"], motions, constrained)
         if fits is None:
             return set(), evidence
         if fits:
