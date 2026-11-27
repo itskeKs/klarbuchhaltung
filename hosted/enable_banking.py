@@ -2455,8 +2455,153 @@ def _prepare_statement_sources(drafts):
     _mark_statement_capacity(drafts)
 
 
-def _coalesce_single_balance_reports(account_key, drafts, account_rows):
-    """Keep compatible booking reports once when their balance edge cannot recur."""
+def _supported_edge_count(versions, observed):
+    """Find the occurrence counts compatible with the signed statement window."""
+    first = versions[0]
+    day = first["booked_day"] if all(row["booked_day"] for row in versions) else None
+    if day:
+        days = {row["booked_day"] for row in observed if row["booked_day"]}
+        start = max((other for other in days if other < day), default=day)
+        end = min((other for other in days if other > day), default=day)
+        observed = [row for row in observed if not row["booked_day"] or start <= row["booked_day"] <= end]
+    if len(observed) > _STATEMENT_PLACEMENT_BUDGET or not any(_reported_balance(row) for row in observed):
+        return None
+
+    # Each complete trail differs by at most one arrival/departure per
+    # balance. Repeating this edge changes that degree at its start.
+    amount = Decimal(first["amount"])
+    opening = first["_statement_balance"][1] - amount
+    edge = ((day, None, None), first)
+    witness_groups = defaultdict(list)
+    for row in observed:
+        witness_groups[row["_amount_key"], _statement_shape(row)].append(row)
+    witnesses = tuple(witness_groups.values())
+    counts = (1,) * len(witnesses)
+    pending = [counts]
+    checked = {counts}
+    while pending:
+        supported = set()
+        for selection in pending:
+            peers = [row for copies, count in zip(witnesses, selection) for row in copies[:count]]
+            signed = [(Decimal(row["amount"]), balance[1]) for row in peers if (balance := _reported_balance(row))]
+            departure = sum(ending - amount == opening for amount, ending in signed)
+            departure -= sum(ending == opening for _, ending in signed)
+            # A movement without an ending balance can add or remove one
+            # edge at this balance. Its actual position is tested below.
+            gaps = len(peers) - len(signed)
+            minimum = max(1, -1 - departure - gaps)
+            maximum = min(max(2, len(versions)), 1 - departure + gaps)
+            peer_edges = [((row["booked_day"], None, None), row) for row in peers]
+            for count in range(minimum, maximum + 1):
+                fits = _review_joint_trail(first["currency"], [*peer_edges, *([edge] * count)], ())
+                if fits is None:
+                    return None
+                if fits:
+                    supported.add(count)
+        if supported:
+            return (supported, [copies[0] for copies in witnesses]) if min(supported) <= len(versions) else None
+        # A repeated witness is needed only when fewer observations cannot
+        # form a trail. Compare every hypothesis at that level before using it.
+        expanded = []
+        for selection in pending:
+            for index, (copies, count) in enumerate(zip(witnesses, selection)):
+                if count == len(copies):
+                    continue
+                candidate = (*selection[:index], count + 1, *selection[index + 1:])
+                if candidate in checked:
+                    continue
+                if len(checked) >= _STATEMENT_PLACEMENT_BUDGET:
+                    return None
+                checked.add(candidate)
+                expanded.append(candidate)
+        pending = expanded
+    return None
+
+
+def _balance_edge_witnesses(row, peers):
+    ending = row["_statement_balance"][1]
+    opening = ending - Decimal(row["amount"])
+    day = row["booked_day"]
+    before = [core._bank_statement_option(peer) for peer in peers if (balance := _reported_balance(peer)) and balance[1] == opening
+              and (not peer["booked_day"] or peer["booked_day"] <= day)]
+    after = [core._bank_statement_option(peer) for peer in peers if (balance := _reported_balance(peer))
+             and balance[1] - Decimal(peer["amount"]) == ending
+             and (not peer["booked_day"] or peer["booked_day"] >= day)]
+    return before, after
+
+
+def _balance_report_conflict(first, second):
+    if _conflicting_facts(first, second, _FETCH_FIXED_FACTS) or _conflicting_counterparties(first, second):
+        return True
+    if ("_confirmed_reference_aliases" in first or "_confirmed_reference_aliases" in second):
+        if all(row["_remittance"] for row in (first, second)) and first["_remittance"] != second["_remittance"]:
+            return True
+    # With both BOOK dates absent, leave disjoint possible posting days
+    # separate. Calendar overlap alone is used only to admit a hypothesis.
+    return not (first["booked_day"] or second["booked_day"]) and first["bank_groups"].keys().isdisjoint(second["bank_groups"])
+
+
+def _balance_occurrence_reports(versions, count):
+    """Keep distinguishable source facts before selecting repeated reports."""
+    support = Counter(_statement_shape(row) for row in versions)
+    by_details = defaultdict(list)
+    for row in versions:
+        by_details[row["provider_ref"], row["creditor_ref"], row["description"]].append(row)
+
+    def priority(row):
+        return (-support[_statement_shape(row)], not row["booked_day"], row["description"], row["ref"] or row["_source_key"])
+
+    ordered = [(index, row) for reports in by_details.values()
+               for index, row in enumerate(sorted(reports, key=priority))]
+    ordered.sort(key=lambda item: (item[1]["description"] == "Bankumsatz", item[0], *priority(item[1])))
+    kept, dropped = [row for _, row in ordered[:count]], [row for _, row in ordered[count:]]
+    represented = {row["_remittance"] for row in kept}
+    warning = any(row["_remittance"] and row["_remittance"] not in represented for row in dropped)
+    return {row["_report_index"] for row in dropped}, warning
+
+
+def _balance_occurrence_assessment(account_key, versions, supported, peers, trace):
+    first = versions[0]
+    days = {row["booked_day"] for row in versions if row["booked_day"]} or {row["date"] for row in versions}
+    if len(days) != 1 or (len(versions) == 1 and len(supported) > 1):
+        return None
+    day = next(iter(days))
+    # A pending amount needs an observable statement window. An intraday
+    # offset with a floating opening is not evidence of an extra payment.
+    if len(supported) > 1 and not (
+        any(row["booked_day"] and row["booked_day"] < day for row in peers)
+        and any(row["booked_day"] and row["booked_day"] > day for row in peers)
+    ):
+        return None
+    scope = fingerprint(account_key, "balance-occurrence", first["_amount_key"], first["currency"], first["balance_key"])
+    creditor = next((row["creditor_ref"] for row in versions if row["creditor_ref"]), None)
+    party = tuple(sorted(set().union(*(row["counterparty_ids"] for row in versions))))
+    facts = (first["balance_key"], creditor, party)
+    observation = {
+        "ref": core.ENABLE_BANKING_REF_PREFIX + fingerprint(scope, day, facts),
+        "account_key": account_key, "date": day, "amount": first["amount"], "currency": first["currency"],
+        "_statement_review_proof": (scope, {"day": day}, [facts]),
+        "_statement_review_options": [core._bank_statement_option(row) for row in versions],
+        "_statement_observed_balances": sorted({(row["balance_key"], str(balance[1])) for row in (*versions, *peers)
+                                               if (balance := _reported_balance(row))}),
+        "_statement_occurrence_bounds": (min(supported), min(max(supported), len(versions))),
+        "_statement_occurrence_observed": len(versions) > 1,
+        "_statement_occurrence_witnesses": sorted({row["provider_ref"] or fingerprint(row["bank_group"], row["description"])
+                                                    for row in peers}),
+    }
+    if trace:
+        observation["_statement_subject_reports"] = (frozenset(row["_report_index"] for row in versions),)
+    return observation
+
+
+def _reconcile_balance_reports(account_key, drafts, account_rows, assessments, trace):
+    """Reconcile compatible reports to the number supported by the balance trail."""
+    reviewed = defaultdict(set)
+    for assessment in assessments:
+        for days, facts in assessment["_statement_review_members"]:
+            booking = core._BankBooking(*facts)
+            for day in days:
+                reviewed[day].add(booking)
     groups = defaultdict(list)
     account_by_currency = defaultdict(list)
     for row in account_rows:
@@ -2468,14 +2613,15 @@ def _coalesce_single_balance_reports(account_key, drafts, account_rows):
     omitted = set()
     warnings = 0
     for copies in groups.values():
-        if len(copies) < 2 or all(row["provider_ref"] for row in copies):
+        if all(row["provider_ref"] for row in copies):
             continue
-        compatible, _ = _compatible_copy_groups(copies, lambda left, right: (
-            not _same_reported_edge(left, right)
-            or _conflicting_facts(left, right, _FETCH_COPY_FACTS) or _conflicting_counterparties(left, right)
-        ))
+        compatible, _ = _compatible_copy_groups(copies, _balance_report_conflict)
         for versions in compatible:
-            if len(versions) < 2 or all(row["provider_ref"] for row in versions):
+            if all(row["provider_ref"] for row in versions):
+                continue
+            # A separate statement assessment can already have established
+            # independent canonical movements on the same signed edge.
+            if sum("_confirmed_reference_aliases" in row for row in versions) > 1:
                 continue
             first = versions[0]
             origins = {row["_report_index"] for row in versions}
@@ -2490,9 +2636,38 @@ def _coalesce_single_balance_reports(account_key, drafts, account_rows):
             )
             if not has_context:
                 continue
-            day = first["booked_day"] if all(row["booked_day"] for row in versions) else None
-            peers = (row for row in observed if not day or row["booked_day"] in {day, None})
-            if _possible_statement_reset(Decimal(first["amount"]), peers):
+            supported, proof_peers = _supported_edge_count(versions, observed) or (set(), ())
+            assessment = None
+            if supported and not any(
+                not core._bank_facts_conflict(row, booking)
+                for row in versions for group in row["bank_groups"].values() for booking in reviewed.get(group, ())
+            ):
+                assessment = _balance_occurrence_assessment(account_key, versions, supported, proof_peers, trace)
+            disputed = bool(assessment and len(supported) > 1)
+            if assessment:
+                assessments.append(assessment)
+            elif len(supported) > 1 and len(versions) > max(supported):
+                dropped, _ = _balance_occurrence_reports(versions, min(supported))
+                omitted.update(dropped)
+                warnings += 1
+                continue
+            count = min(supported) if disputed or len(supported) == 1 else None
+            if count is None:
+                if len(versions) < 2 or any(not _same_reported_edge(left, right) or _conflicting_facts(left, right, _FETCH_COPY_FACTS)
+                                            for left, right in combinations(versions, 2)):
+                    continue
+                day = first["booked_day"] if all(row["booked_day"] for row in versions) else None
+                peers = (row for row in observed if not day or row["booked_day"] in {day, None})
+                if _possible_statement_reset(Decimal(first["amount"]), peers):
+                    continue
+            if count and count > 1:
+                dropped, label_warning = _balance_occurrence_reports(versions, count)
+                omitted.update(dropped)
+                members = ("balance", frozenset(origins - dropped))
+                kept = (row for row in versions if row["_report_index"] not in dropped)
+                for slot, row in enumerate(kept):
+                    replacements[row["_report_index"]] = row | {"_statement_slot": (members, slot)}
+                warnings += label_warning
                 continue
             preferred = min(versions, key=lambda row: (
                 not row["provider_ref"], not row["booked_day"], row["description"] == "Bankumsatz",
@@ -2500,6 +2675,7 @@ def _coalesce_single_balance_reports(account_key, drafts, account_rows):
                 row["description"], row["ref"] or row["_source_key"],
             ))
             known = {field: row[field] for row in versions for field in ("booked_day", *_OPTIONAL_BOOKING_FACTS) if row[field]}
+            known.update((field, preferred[field]) for field in _SECONDARY_BANK_DATES if preferred[field])
             merged = preferred | known
             if merged["booked_day"]:
                 merged["date"] = merged["booked_day"]
@@ -2512,10 +2688,17 @@ def _coalesce_single_balance_reports(account_key, drafts, account_rows):
             merged["prior_refs"].extend(row["ref"] for row in versions if row["ref"] and row["ref"] != merged["ref"])
             if aliases := set().union(*(row.get("_confirmed_reference_aliases", ()) for row in versions)):
                 merged["_confirmed_reference_aliases"] = aliases
+            if count == 1:
+                merged["_statement_observed_refs"] = {
+                    row["ref"] or core.bank_source_reference(row["_source_key"], 1) for row in versions
+                    if not disputed or row["description"] == preferred["description"]
+                }
+                if merged["booked_day"] and not disputed:
+                    merged["_statement_edge_witnesses"] = _balance_edge_witnesses(merged, proof_peers)
             replacements[preferred["_report_index"]] = merged
             omitted.update(row["_report_index"] for row in versions if row is not preferred)
             warnings += int(len({row["_remittance"] for row in versions if row["_remittance"]}) > 1)
-    if not omitted:
+    if not omitted and not replacements:
         return drafts, 0
     return [replacements.get(row["_report_index"], row) for row in drafts if row["_report_index"] not in omitted], warnings
 
@@ -2560,14 +2743,16 @@ def _map_statement_drafts(account_key, drafts, skipped, assessments, trace=False
     else:
         _prepare_statement_sources(drafts)
         drafts, neutral, review_warnings, statement_assessments = _separate_unresolved_references(account_key, drafts, trace)
-    retained, balance_warnings = _coalesce_single_balance_reports(account_key, drafts, account_rows)
+    retained, balance_warnings = _reconcile_balance_reports(account_key, drafts, account_rows, statement_assessments, trace)
     if retained is not drafts:
         drafts = retained
         _prepare_statement_sources(drafts)
     if assessments is not None:
         assessments.extend(statement_assessments)
     else:
-        review_warnings += sum(row["state"] in {"pending", "unplaced"} for row in statement_assessments)
+        review_warnings += sum(row.get("state") in {"pending", "unplaced"} or (
+            (bounds := row.get("_statement_occurrence_bounds")) is not None and bounds[0] < bounds[1]
+        ) for row in statement_assessments)
     skipped += review_warnings + balance_warnings
     selected, warnings = _resolve_statement_cohorts(drafts)
     skipped += warnings

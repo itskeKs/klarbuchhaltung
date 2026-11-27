@@ -93,8 +93,15 @@ checks repeated reports together and uses the balances to identify any
 additional equal movements. Compatible booking facts can link repeated
 reports after their temporary lookup IDs change. When compatible reports
 show the same movement and ending balance, the other signed movements
-can establish whether that balance could recur. This check also works
-when reference or counterparty details are missing.
+can establish how many times that balance was reached. The importer
+checks which movements can connect one reported balance to the next,
+including repeated reports of the surrounding transactions. When those
+surrounding movements also match the ledger, a later report with amended
+details can match the original payment. When the dated statement window
+still supports several counts, the importer books the supported minimum. Any possible additional
+amount appears in Payments for review outside the totals until further
+bank evidence settles it. This check also works when reference or
+counterparty details are missing.
 Value and transaction dates can help identify a movement or place it when
 its booking date is missing.
 Movements on the same known booking day can follow any order consistent
