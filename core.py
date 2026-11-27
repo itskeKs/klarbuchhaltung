@@ -2356,19 +2356,23 @@ def _bank_statement_matches_legacy_review(key, row, stored):
     return False
 
 
-def _bank_statement_members(conn, observations):
-    """Identify every named movement in the witness using scoped ledger facts."""
+def _bank_statement_group_bookings(conn, groups):
     select = ("SELECT t.ref, t.description, " + ", ".join(f"f.{field}" for field in _BANK_IDENTITY_FIELDS)
               + ", f.counterparty_ids FROM transactions t JOIN bank_import_facts f USING (ref) "
               + "WHERE t.ref NOT IN (SELECT ref FROM bank_statement_reviews) AND t.ref IN ("
               + "SELECT ref FROM bank_import_identity WHERE booking_group = ?1 "
               + "UNION ALL SELECT ref FROM bank_import_date_aliases WHERE booking_group = ?1)")
+    return {_bank_booking(record) for group in groups for record in conn.execute(select, (group,))}
+
+
+def _bank_statement_members(conn, observations):
+    """Identify every named movement in the witness using scoped ledger facts."""
     identified = set()
     matches = []
     for groups, facts in observations:
         observed = _BankBooking(*facts)
         snapshot = observed._asdict()
-        candidates = {_bank_booking(record) for group in groups for record in conn.execute(select, (group,))}
+        candidates = _bank_statement_group_bookings(conn, groups)
         matching = {candidate.ref for candidate in candidates if candidate.ref == observed.ref
                     or _bank_economic_replay(snapshot, candidate._asdict())}
         if len(matching) != 1 or not identified.isdisjoint(matching):
@@ -2504,6 +2508,10 @@ def _record_bank_statement_assessments(conn, observations):
         bounds = row.get("_statement_fiscal_bounds")
         details = {"proof": proof, "observations": row["_statement_review_options"], "remainder": remainder,
                    "fiscal_bounds": bounds}
+        observed_balances = dict(previous_details.get("balances", ()))
+        observed_balances.update(row.get("_statement_observed_balances", ()))
+        if observed_balances:
+            details["balances"] = sorted(observed_balances.items())
         if previous == "unplaced":
             if state == "pending":
                 continue
@@ -2666,12 +2674,33 @@ def _prepare_bank_statement_reviews(conn, rows):
     return named, pending, warnings, duplicates
 
 
+def _restore_bank_statement_fetches(conn, rows, assessments):
+    selected = defaultdict(set)
+    for row in rows:
+        if fetch := row.get("_statement_fetch"):
+            selected[fetch].add(row["ref"])
+    if not selected:
+        return rows, assessments
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    restored = {fetch: replacement for fetch, refs in selected.items() if (replacement := fetch.restore(conn, refs)) is not None}
+    if not restored:
+        return rows, assessments
+    remaining = [row for row in rows if row.get("_statement_fetch") not in restored]
+    decisions = [row for row in assessments if row.get("_statement_fetch") not in restored]
+    for replacement, observations in restored.values():
+        remaining.extend(replacement)
+        decisions.extend(observations)
+    return remaining, decisions
+
+
 def import_bank_rows(conn, rows: list, *, auto_match: bool = True, require_fx: bool = False, assessments=()) -> dict:
     """Fertig normalisierte Zahlungen aufnehmen (z. B. aus dem Wirex-Konto).
 
     Auto-match is optional. Enable Banking rows are always left for review.
     'ref' ist UNIQUE, ein erneuter Abruf legt also nichts doppelt an."""
     imported = deferred = 0
+    rows, assessments = _restore_bank_statement_fetches(conn, rows, assessments)
     blocked, placements = _record_bank_statement_assessments(conn, assessments)
     if blocked:
         rows = [row for row in rows if row["ref"] not in blocked]

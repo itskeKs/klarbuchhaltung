@@ -44,8 +44,9 @@ Dated statement movements, including movements on the same day, can show that a
 balance recurred after a separate payment. Compatible copies can supply missing
 balances. Signed movements can bridge missing balances when other amounts and
 reported balances support the same sequence. The check keeps booking, value,
-and transaction dates separate and uses reported balances to place movements
-with missing dates in possible sequences. Surrounding balances can show
+and transaction dates separate. Booking dates set the order of posting days.
+Value and transaction dates help order movements where they fit the recorded
+balances. Surrounding balances can show
 which of two bank versions fits the statement. When those balances leave both
 counts possible, **Banking** asks for review before adding a second payment.
 For several versions, the statement can establish how many payments share a
@@ -80,6 +81,9 @@ balances support different totals, check the statement before adding another pay
 cannot establish its existence. It contributes to neither the booked count nor
 the gross or net totals. A later verified opening balance can confirm or clear
 the review without reposting the existing payments.
+An overlapping reply can still resolve the review when it omits a balance
+already observed for the same uniquely identified payment. An explicitly
+reported balance or conflicting bank fact is assessed as new evidence.
 When the statement proves one additional payment and leaves a further payment
 possible, **Zahlungen** includes the proven amount and shows the possible
 remainder separately.

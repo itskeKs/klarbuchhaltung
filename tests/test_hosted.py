@@ -2366,6 +2366,179 @@ def test_proven_surplus_counts_only_in_a_period_covering_both_months(sandbox, mo
                     assert "In den Summen dieses Zeitraums nicht enthalten" in single
 
 
+@pytest.mark.parametrize("axis", ["value_date", "transaction_date"])
+@pytest.mark.parametrize("opening", [None, 0, 119])
+def test_secondary_order_cannot_override_posted_balance_chain(sandbox, axis, opening):
+    import core
+
+    statement = [row | {"booking_date": "2026-11-30"} for row in ambiguous_reference_statement()]
+    statement[3]["booking_date"] = None
+    statement[-1].update({"booking_date": "2026-12-01", axis: "2026-11-20"})
+    if opening is not None:
+        statement.insert(0, statement[1] | dict.fromkeys(("booking_date", "value_date", "transaction_date"), "2026-09-30") | {
+            "entry_reference": "prior", "reference_number": "prior", "transaction_id": "prior",
+            "balance_after_transaction": {"amount": str(opening), "currency": "EUR"},
+        })
+    with closing(core.db()) as ledger:
+        for page in (statement, statement[::-1], statement * 2):
+            assessments = []
+            rows, _ = transaction_rows("account-a", page, assessments=assessments)
+            core.import_bank_rows(ledger, rows, require_fx=True, assessments=assessments)
+            assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions WHERE date >= '2026-11-01'").fetchone()) == (5, 86)
+            assert ledger.execute("SELECT count(*) FROM transactions WHERE description = 'Rent'").fetchone()[0] == 1
+            assert [(row["state"], row["amount"]) for row in core.pending_bank_statement_amounts(ledger)] == (
+                [("pending", 119)] if opening is None else [("unplaced", 119)] if opening == 0 else []
+            )
+
+
+@pytest.mark.parametrize("late", [False, True])
+@pytest.mark.parametrize("missing", [0, 1, 2, 4, 5])
+def test_unplaced_statement_reuses_corroborated_balance_on_resolution(sandbox, late, missing):
+    import core
+
+    statement = [row | {"booking_date": "2026-11-30"} for row in ambiguous_reference_statement()]
+    statement[-1]["booking_date"] = "2026-12-01"
+    opening = statement[1] | dict.fromkeys(("booking_date", "value_date", "transaction_date"), "2026-09-30") | {
+        "entry_reference": "prior", "reference_number": "prior", "transaction_id": "prior",
+    }
+    partial = [row | {"booking_date": None} if index == 3 else row for index, row in enumerate(statement)]
+    completed = [row.copy() for row in statement]
+    completed[3]["booking_date"] = "2026-12-01" if late else "2026-11-30"
+    completed[missing]["balance_after_transaction"] = None
+    with closing(core.db()) as ledger:
+        for index, page in enumerate((partial, completed, completed[::-1], partial)):
+            assessments = []
+            rows, _ = transaction_rows("account-a", [opening, *page], assessments=assessments)
+            core.import_bank_rows(ledger, rows, require_fx=True, assessments=assessments)
+            monthly = [tuple(row) for row in ledger.execute("SELECT substr(date,1,7),sum(amount) FROM transactions "
+                                                           "WHERE date >= '2026-11-01' GROUP BY 1 ORDER BY 1")]
+            if index == 0:
+                assert monthly == [("2026-11", 96), ("2026-12", -10)]
+                original = ledger.execute("SELECT id FROM transactions WHERE description='Rent'").fetchone()[0]
+                core.set_tx_category(ledger, original, "einnahme_sonstige", "Checked receipt")
+                if missing == 0 and not late:
+                    original_report = [row for row in rows if row["description"] == "Rent"][0]
+                    corrected = statement[0] | {"balance_after_transaction": {"amount": "120", "currency": "EUR"}}
+                    changed_date = statement[0] | {"booking_date": "2026-12-02", "balance_after_transaction": None}
+                    observed, _ = transaction_rows("account-a", [corrected], ledger=ledger)
+                    assert observed[0]["balance_key"] != original_report["balance_key"]
+                    unmatched, _ = transaction_rows("account-a", [changed_date], ledger=ledger)
+                    assert unmatched[0]["booked_day"] == "2026-12-02" and unmatched[0]["balance_key"] is None
+            else:
+                expected = [("2026-11", 96), ("2026-12", 109)] if late else [("2026-11", 215), ("2026-12", -10)]
+                assert monthly == expected
+                assert core.pending_bank_statement_amounts(ledger) == []
+                assert core.get_transaction(ledger, original)["category"] == "einnahme_sonstige"
+
+
+def test_secondary_dates_cannot_make_a_same_day_balance_sequence_impossible():
+    statement = ambiguous_reference_statement()
+    statement[-1]["booking_date"] = "2026-11-24"
+    statement[1]["value_date"] = statement[1]["transaction_date"] = "2026-11-24"
+    opening = statement[1] | dict.fromkeys(("booking_date", "value_date", "transaction_date"), "2026-10-31") | {
+        "entry_reference": "prior", "reference_number": "prior", "transaction_id": "prior",
+    }
+    for page in ([opening, *statement], [*statement[::-1], opening]):
+        assessments = []
+        rows, _ = transaction_rows("account-a", page, assessments=assessments)
+        assert [entry["state"] for entry in assessments] == ["confirmed"]
+        november = [row for row in rows if row["date"].startswith("2026-11")]
+        assert len(november) == 6 and sum(float(row["amount"]) for row in november) == 205
+        assert sum(row["description"] == "Rent" for row in november) == 1
+
+
+@pytest.mark.parametrize("copies", [1, 2])
+def test_statement_replay_keeps_the_callers_selected_rows(sandbox, copies):
+    import core
+
+    statement = [row | {"booking_date": "2026-11-30"} for row in ambiguous_reference_statement()]
+    statement[-1]["booking_date"] = "2026-12-01"
+    opening = [row | dict.fromkeys(("booking_date", "value_date", "transaction_date"), day) | {
+        "entry_reference": day, "reference_number": day, "transaction_id": day,
+        "transaction_amount": {"amount": "10", "currency": "EUR"},
+        "balance_after_transaction": {"amount": str(amount), "currency": "EUR"},
+    } for row, day, amount in ((statement[0], "2026-10-29", 10), (statement[1], "2026-10-30", 0))]
+    partial = [row | {"booking_date": None} if index == 3 else row for index, row in enumerate(statement)]
+    complete = [row | {"balance_after_transaction": None} if index == 0 else row for index, row in enumerate(statement)]
+    with closing(core.db()) as ledger:
+        for page, expected in ((partial, 5), (complete, 1), (complete[::-1], 0)):
+            assessments = []
+            selected = []
+            for _ in range(copies):
+                mapped, _ = transaction_rows("account-a", [*opening, *page], assessments=assessments)
+                selected.extend(row for row in mapped if row["date"] >= "2026-11-01")
+            result = core.import_bank_rows(ledger, selected, assessments=assessments, require_fx=True)
+            assert result["imported"] == expected
+            assert ledger.execute("SELECT count(*) FROM transactions WHERE date < '2026-11-01'").fetchone()[0] == 0
+        assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (6, 205)
+
+
+@pytest.mark.parametrize("cross_month", [False, True])
+@pytest.mark.parametrize("balance", [0, 119])
+def test_service_can_resolve_pending_amount_when_one_seen_balance_is_omitted(sandbox, monkeypatch, cross_month, balance):
+    import core
+    from hosted.bank_service import BankingService
+
+    left, right = ("2026-11-30", "2026-12-01") if cross_month else ("2026-11-23", "2026-11-24")
+    statement = [row | {"booking_date": left} for row in ambiguous_reference_statement()]
+    statement[-1]["booking_date"] = right
+    source = [row | {"booking_date": None} if i == 3 else row for i, row in enumerate(statement)]
+    opening = statement[1] | dict.fromkeys(("booking_date", "value_date", "transaction_date"), "2026-10-31") | {
+        "entry_reference": "opening", "reference_number": "opening", "transaction_id": "opening",
+        "balance_after_transaction": {"amount": str(balance), "currency": "EUR"},
+    }
+
+    class Provider(StubProvider):
+        def transactions(self, *_):
+            return source
+
+    service = BankingService(sandbox, sandbox, SITE + "/api/bank/callback", client_factory=Provider)
+    service.save_credentials(APP_ID, b"fixture-key")
+    state = parse_qs(urlsplit(service.begin("login-a", "DE", BANK, "business")).query)["state"][0]
+    service.finish("login-a", state, "fixture-code", "")
+    now = datetime.now(timezone.utc)
+    assert service.sync(now=now) == 5
+    with closing(core.db()) as ledger:
+        assert [(row["state"], row["amount"]) for row in core.pending_bank_statement_amounts(ledger)] == [("pending", 119)]
+    source = [opening, statement[0] | {"balance_after_transaction": None}, *statement[1:]]
+    assert service.sync(force=True, now=now) == (2 if balance == 0 else 1)
+    source = source[::-1]
+    assert service.sync(force=True, now=now) == 0
+    assert service.consents()[0]["last_synced"] == now.date().isoformat()
+    with closing(core.db()) as ledger:
+        actual = tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions WHERE date >= '2026-11-01'").fetchone())
+        assert actual == ((6, 205) if balance == 0 else (5, 86))
+        assert core.pending_bank_statement_amounts(ledger) == []
+
+
+def test_statement_restore_keeps_other_fetch_assessments_for_the_same_account(sandbox):
+    import core
+
+    first = [row | {"booking_date": "2026-11-30"} for row in ambiguous_reference_statement()]
+    first[-1]["booking_date"] = "2026-12-01"
+    opening = first[1] | dict.fromkeys(("booking_date", "value_date", "transaction_date"), "2026-10-31") | {
+        "entry_reference": "previous", "reference_number": "previous", "transaction_id": "previous",
+    }
+    sparse = [row | {"booking_date": None} if index == 3 else row for index, row in enumerate(first)]
+    completed = [row | {"balance_after_transaction": None} if index == 0 else row for index, row in enumerate(first)]
+    january = [row | {field: row[field].replace("2026-11-", "2027-01-") for field in
+                      ("booking_date", "value_date", "transaction_date")}
+               | {field: "jan-" + row[field] for field in ("entry_reference", "reference_number", "transaction_id")}
+               for row in ambiguous_reference_statement()]
+    with closing(core.db()) as ledger:
+        assessments = []
+        rows, _ = transaction_rows("account-a", [opening, *sparse], assessments=assessments)
+        core.import_bank_rows(ledger, rows, require_fx=True, assessments=assessments)
+        for _ in range(2):
+            decisions = []
+            november, _ = transaction_rows("account-a", [opening, *completed], assessments=decisions)
+            next_year, _ = transaction_rows("account-a", january, assessments=decisions)
+            core.import_bank_rows(ledger, [*november, *next_year], require_fx=True, assessments=decisions)
+            assert [(row["date"], row["amount"], row["state"]) for row in core.pending_bank_statement_amounts(ledger)] == [
+                ("2027-01-23", 119, "pending"),
+            ]
+
+
 def test_confirmed_ambiguous_year_boundary_is_counted_only_in_covering_range(sandbox, monkeypatch):
     import core
     from app import app

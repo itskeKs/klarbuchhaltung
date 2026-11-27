@@ -328,21 +328,21 @@ class BankingService:
             start = (datetime.fromisoformat(last_sync).date() - timedelta(days=14)).isoformat() if last_sync else None
             try:
                 client = self.client()
+                pages = [(account["key"], client.transactions(account["uid"], start, today)) for account in consent["accounts"]]
                 rows = []
                 assessments = []
                 skipped = 0
-                for account in consent["accounts"]:
-                    items, dropped = transaction_rows(account["key"], client.transactions(
-                        account["uid"], start, today,
-                    ), assessments=assessments)
-                    rows.extend(items)
-                    skipped += dropped
                 with closing(self.connect()) as state, state:
                     # Serialize the final ledger write with consent removal or replacement.
                     state.execute("BEGIN IMMEDIATE")
                     if not state.execute("SELECT 1 FROM consents WHERE id = ?", (consent["id"],)).fetchone():
                         continue
                     with closing(core.db()) as ledger:
+                        ledger.execute("BEGIN IMMEDIATE")
+                        for account_key, page in pages:
+                            items, dropped = transaction_rows(account_key, page, assessments=assessments, ledger=ledger)
+                            rows.extend(items)
+                            skipped += dropped
                         result = core.import_bank_rows(ledger, rows, auto_match=False, require_fx=True, assessments=assessments)
                         accounts = {account["key"] for account in consent["accounts"]}
                         pending = any(row["account_key"] in accounts for row in core.pending_bank_statement_amounts(ledger))
