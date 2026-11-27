@@ -2585,6 +2585,13 @@ def _bank_occurrence_witness_covered(conn, previous, current):
             matching = {index for index, (old_groups, old) in enumerate(earlier)
                         if not old_groups.isdisjoint(groups) and not _bank_facts_conflict(snapshot, old)
                         and _bank_has_shared_date(snapshot, old)}
+            if len(matching) > 1 and witness.ref and witness.provider_ref and witness.balance_key and witness.booked_day:
+                versions = [earlier[index][1] for index in matching]
+                # Earlier proofs could store both the dated and partial
+                # views of the same signed provider movement as witnesses.
+                if (all(old.ref == witness.ref and old.provider_ref == witness.provider_ref and old.balance_key == witness.balance_key
+                        for old in versions) and any(not old.booked_day for old in versions)):
+                    covered.update(matching)
         if len(matching) == 1:
             covered.update(matching)
     return len(covered) == len(previous)

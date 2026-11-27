@@ -142,8 +142,10 @@ A checkpoint on the same booking day can prove a minimum while leaving
 another payment possible after that checkpoint. A later closing balance
 can resolve the remaining amount, and a weaker replay keeps that resolution.
 Receiving the same observations on one page or several pages leaves the booked
-amount unchanged. If the statement establishes both the amount and its purpose,
-**Zahlungen** shows the observed purpose.
+amount unchanged. A report that only omits known details from the same complete
+statement also leaves existing booked and possible amounts unchanged. If the
+statement establishes both the amount and its purpose, **Zahlungen** shows the
+observed purpose.
 An entry reference can also change on a later page or fetch. Matching dates,
 amounts and independent statement facts can identify the existing payment.
 Where the statement leaves a repeat possible, check it before posting again.

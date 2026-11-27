@@ -1326,6 +1326,89 @@ def test_joint_statement_later_checkpoints_bound_unsigned_receipts(sandbox, seed
         assert core.pending_bank_statement_amounts(ledger) == []
 
 
+@pytest.mark.parametrize("cross_month", [False, True])
+@pytest.mark.parametrize("index, omitted", [
+    (0, ("booking_date", "entry_reference", "balance_after_transaction")),
+    (0, ("booking_date", "transaction_date", "entry_reference", "balance_after_transaction", "remittance_information")),
+    (1, ("entry_reference", "transaction_date", "value_date", "reference_number")),
+    (1, ("booking_date", "transaction_date", "entry_reference", "reference_number", "remittance_information")),
+    (3, ("booking_date", "entry_reference", "balance_after_transaction")),
+    (3, ("booking_date", "value_date", "entry_reference", "balance_after_transaction", "remittance_information")),
+])
+def test_joint_statement_weaker_reports_preserve_booked_and_possible_amounts(sandbox, cross_month, index, omitted):
+    import core
+
+    reports, echoes = _joint_receipt_count_fixture(cross_month=cross_month)
+    weaker = [row.copy() for row in reports]
+    for field in omitted:
+        del weaker[index][field]
+    expected = (4, 225) if cross_month else (5, 344)
+    with closing(core.db()) as ledger:
+        assert _sync_bank_pages(ledger, [reports, echoes]) == expected[0]
+        opening_id = ledger.execute("SELECT id FROM transactions WHERE description='Opening'").fetchone()[0]
+        core.set_tx_category(ledger, opening_id, "einnahme_sonstige", "Opening checked")
+        before = [tuple(row) for row in ledger.execute("SELECT id,ref,date,category,note FROM transactions ORDER BY id")]
+        for reply in ([weaker, echoes], [[*weaker, *echoes]], [weaker], [echoes, reports]):
+            assert _sync_bank_pages(ledger, reply) == 0
+            assert [tuple(row) for row in ledger.execute("SELECT id,ref,date,category,note FROM transactions ORDER BY id")] == before
+            assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == expected
+            assert [(row["state"], row["amount"], row["covered"]) for row in core.pending_bank_statement_amounts(ledger)] == (
+                [("unplaced", 119, 1)] if cross_month else []
+            )
+
+
+@pytest.mark.parametrize("packet", ["single", "split", "reversed"])
+@pytest.mark.parametrize("independent_fee", [False, True])
+def test_shared_sparse_statement_uses_one_observation_per_proven_witness(sandbox, packet, independent_fee):
+    import core
+
+    motions = [(19, 10, 0, "Opening"), (20, 119, 119, "Rent"), (20, 119, 238, "Client"), (22, -23, 215, "Fee")]
+    reports = [_bank_motion(f"2026-11-{day}", amount, balance, name, entry_reference=name)
+               for day, amount, balance, name in motions]
+    echoes = [reports[2] | dict.fromkeys(("entry_reference", "balance_after_transaction", "transaction_id")),
+              reports[3] | dict.fromkeys(("booking_date", "transaction_id"))]
+    if independent_fee:
+        reports.append(_bank_motion("2026-11-22", -23, 192, "Separate fee", entry_reference="separate-fee"))
+    pages = [[*reports, *echoes]] if packet == "single" else ([echoes, reports] if packet == "reversed" else [reports, echoes])
+    with closing(core.db()) as ledger:
+        assert _sync_bank_pages(ledger, pages) == len(reports)
+        for reply in ([reports], pages[::-1], pages):
+            assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (
+                len(reports), 202 if independent_fee else 225,
+            )
+            assert core.pending_bank_statement_amounts(ledger) == []
+            assert _sync_bank_pages(ledger, reply) == 0
+        assert core.pending_bank_statement_amounts(ledger) == []
+
+
+def test_shared_sparse_statement_resolves_legacy_repeated_witness_notice(sandbox):
+    import core
+
+    motions = [(19, 10, 0, "Opening"), (20, 119, 119, "Rent"), (20, 119, 238, "Client"), (22, -23, 215, "Fee")]
+    reports = [_bank_motion(f"2026-11-{day}", amount, balance, name, entry_reference=name)
+               for day, amount, balance, name in motions]
+    echoes = [reports[2] | dict.fromkeys(("entry_reference", "balance_after_transaction", "transaction_id")),
+              reports[3] | dict.fromkeys(("booking_date", "transaction_id"))]
+    with closing(core.db()) as ledger:
+        assert _sync_bank_pages(ledger, [reports, echoes]) == 4
+        key, encoded = ledger.execute("SELECT review_key,details FROM bank_statement_assessments WHERE state='confirmed'").fetchone()
+        details = json.loads(encoded)
+        groups, facts = next((groups, facts) for groups, facts in details["witnesses"]
+                             if core._BankBooking(*facts).booked_day == "2026-11-22")
+        # This is the earlier format where the same signed fee was stored
+        # twice, once without its booking day from the continuation page.
+        details["witnesses"].append((groups, core._BankBooking(*facts)._replace(booked_day=None)))
+        details["occurrences"] = (2, 3)
+        ledger.execute("UPDATE bank_statement_assessments SET state='pending',details=? WHERE review_key=?",
+                       (json.dumps(details), key))
+        ledger.commit()
+        assert [(row["state"], row["amount"]) for row in core.pending_bank_statement_amounts(ledger)] == [("pending", 119)]
+        for reply in ([reports, echoes], [reports], [echoes, reports]):
+            assert _sync_bank_pages(ledger, reply) == 0
+            assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (4, 225)
+            assert core.pending_bank_statement_amounts(ledger) == []
+
+
 def test_joint_statement_keeps_distinct_episodes_on_the_same_bank_account(sandbox):
     import core
 

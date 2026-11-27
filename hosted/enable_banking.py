@@ -2210,25 +2210,64 @@ def _joint_replay_rank(row, groups, old, booked, *, subject):
     return None
 
 
+def _joint_replay_assignment(choices, omitted=None):
+    matched = {}
+
+    def place(member, seen):
+        for index in sorted(choices[member]):
+            if index in seen or omitted == (member, index):
+                continue
+            seen.add(index)
+            if index not in matched or place(matched[index], seen):
+                matched[index] = member
+                return True
+        return False
+
+    return matched if all(place(member, set()) for member in range(len(choices))) else {}
+
+
 def _joint_replay_matches(choices):
     """Return assignments that every complete matching must contain."""
-    def assign(omitted=None):
-        matched = {}
+    return {index: member for index, member in _joint_replay_assignment(choices).items()
+            if len(choices[member]) == 1 or not _joint_replay_assignment(choices, (member, index))}
 
-        def place(member, seen):
-            for index in sorted(choices[member]):
-                if index in seen or omitted == (member, index):
-                    continue
-                seen.add(index)
-                if index not in matched or place(matched[index], seen):
-                    matched[index] = member
-                    return True
-            return False
 
-        return matched if all(place(member, set()) for member in range(len(choices))) else {}
+def _joint_replay_has_no_new_evidence(drafts, currency, candidates, members, bookings, observations):
+    """Recognize a complete replay whose reports only omit established facts."""
+    total = len(members) + len(observations)
+    if not len(members) <= len(drafts) <= total or any(row["currency"] != currency for row in drafts):
+        return False
+    # Every stored named movement must have a report. The previously seen
+    # alternatives may be absent, but none can be matched more than once.
+    absent = list(range(len(drafts), total))
 
-    return {index: member for index, member in assign().items()
-            if len(choices[member]) == 1 or not assign((member, index))}
+    def matching(groups, old):
+        description = set((old.description or "").split(" · "))
+        def covered(row):
+            return (all(not row[field] or row[field] == getattr(old, field) for field in core._BANK_IDENTITY_FIELDS)
+                    and set(row["counterparty_ids"]) <= set(old.counterparty_ids)
+                    and (row["description"] == "Bankumsatz" or set(row["description"].split(" · ")) <= description))
+
+        return [index for index in {i for group in groups for i in candidates[currency, group]} if covered(drafts[index])]
+
+    choices = [matching(groups, old) for (groups, _), old in zip(members, bookings)]
+    previous = list(bookings)
+    for groups, facts in observations:
+        option = _overlap_booking(facts)
+        names = {old.description for (other_groups, _), old in zip(members, bookings)
+                 if core._joint_proof_member_matches((groups, option), (other_groups, old), subject=True)}
+        if len(names) == 1:
+            option = option._replace(description=next(iter(names)))
+        choices.append([*matching(groups, option), *absent])
+        previous.append(option)
+
+    assigned = _joint_replay_assignment(choices)
+    return bool(assigned) and (bool(absent) or any(
+        any(getattr(previous[member], field) and not drafts[index][field] for field in core._BANK_IDENTITY_FIELDS)
+        or (previous[member].description and previous[member].description != drafts[index]["description"])
+        or set(previous[member].counterparty_ids) != set(drafts[index]["counterparty_ids"])
+        for index, member in assigned.items() if index < len(drafts)
+    ))
 
 
 def _joint_replay_evidence(conn, account, first, last, drafts):
@@ -2258,28 +2297,36 @@ def _joint_replay_evidence(conn, account, first, last, drafts):
                 continue
             checked.add(identity)
             subjects = {group for groups, _ in proof["observations"] for group in groups}
-            choices, bookings = [], []
+            bookings = []
             for groups, facts in members:
                 scope = tuple(groups)
                 if scope not in recorded:
                     recorded[scope] = core._bank_statement_group_bookings(conn, scope)
-                old = _overlap_booking(facts)
                 subject = not subjects.isdisjoint(groups)
-                current = {index for group in groups for index in candidates[currency, group]}
                 prior = {booking for booking in recorded[scope] if core._joint_proof_member_matches(
                     (groups, facts), (groups, booking), subject=subject,
                 )}
                 if len(prior) != 1:
                     break
                 booking = next(iter(prior))
+                bookings.append(_overlap_booking(facts)._replace(ref=booking.ref, description=booking.description))
+            if len(bookings) != len(members):
+                continue
+            if _joint_replay_has_no_new_evidence(drafts, currency, candidates, members, bookings, proof["observations"]):
+                return {}, balances, True
+
+            choices = []
+            for (groups, facts), booked in zip(members, bookings):
+                old = _overlap_booking(facts)
+                subject = not subjects.isdisjoint(groups)
+                current = {index for group in groups for index in candidates[currency, group]}
                 ranked = [(priority, index) for index in current if (priority := _joint_replay_rank(
-                    drafts[index], groups, old, booking, subject=subject,
+                    drafts[index], groups, old, booked, subject=subject,
                 )) is not None]
                 if not ranked:
                     break
                 best = min(priority for priority, _ in ranked)
                 choices.append([index for priority, index in ranked if priority == best])
-                bookings.append(old._replace(ref=booking.ref))
             else:
                 covered = _joint_replay_matches(choices)
                 if sum(bool(bookings[member].balance_key) for member in covered.values()) < 2:
@@ -2301,7 +2348,7 @@ def _joint_replay_evidence(conn, account, first, last, drafts):
         available = {field: next(iter(values)) for field in fields
                      if len(values := {getattr(old, field) for old in versions if getattr(old, field)}) == 1}
         witnessed[index] = versions[0].ref, available
-    return witnessed, balances
+    return witnessed, balances, False
 
 
 @dataclass(eq=False)
@@ -2325,7 +2372,9 @@ class _StatementFetch:
             "AND json_extract(details, '$.overlap.bounds[1]') >= :first))",
             {"account": self.account_key, "first": first, "last": last},
         )]
-        witnessed, known = _joint_replay_evidence(conn, self.account_key, first, last, self.drafts)
+        witnessed, known, replay = _joint_replay_evidence(conn, self.account_key, first, last, self.drafts)
+        if replay:
+            return [], ()
         if not saved and not witnessed:
             return None
         alternatives = defaultdict(list)
@@ -2410,6 +2459,8 @@ class _StatementFetch:
         if correction is None:
             return None
         drafts, overlaps = correction
+        if not drafts:
+            return [], []
         assessments = []
         rows, _ = _map_statement_drafts(self.account_key, drafts, self.skipped, assessments, trace=True,
                                         overlaps=overlaps)
@@ -2813,8 +2864,8 @@ def _shared_sparse_occurrences(account_key, groups, sparse, account_rows, trace,
     origins = {row["_report_index"] for row in (*anchored, *sparse)}
     observed = [row for row in account_rows if row["currency"] == first["currency"] and row["_report_index"] not in origins]
     window = _booked_balance_window(observed, next(iter(days)))
-    independent = {(row["_amount_key"], _statement_shape(row)): row for row in window}
-    peers = [((row["booked_day"], None, None), row) for row in independent.values()]
+    independent = [copies[0] for copies in _balance_witness_groups(window, first["currency"])]
+    peers = [((row["booked_day"], None, None), row) for row in independent]
     by_day = defaultdict(list)
     for row in sparse:
         by_day[row["booked_day"]].append(row)
@@ -2845,7 +2896,7 @@ def _shared_sparse_occurrences(account_key, groups, sparse, account_rows, trace,
     assessment = None
     if page_bounds:
         assessment = _balance_occurrence_assessment(account_key, [*anchored, *sparse], supported or page_bounds,
-                                                    independent.values(), trace, paginated=True)
+                                                    independent, trace, paginated=True)
     live = preferred[1] if supported else []
     dropped = {row["_report_index"] for row in sparse} - {row["_report_index"] for row in live}
     # The signed payments alone can settle the count while leaving the
