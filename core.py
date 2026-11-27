@@ -2173,6 +2173,7 @@ def _bank_matches(conn, rows):
         {g for row in bank_rows for g in row["bank_groups"].values()},
     )
     by_provider = lookup("f.provider_ref = ?", {r["provider_ref"] for r in bank_rows if r["provider_ref"]})
+    by_alias = lookup("t.ref = ?", {ref for row in bank_rows for ref in row.get("_confirmed_reference_aliases", ())})
     options = {}
     posting_conflicts = set()
     corrections = {}
@@ -2184,7 +2185,9 @@ def _bank_matches(conn, rows):
             posting_conflicts.add(row["ref"])
             continue
         # The stored posting date still matches after the bank drops the original value date.
+        aliases = row.get("_confirmed_reference_aliases", ())
         candidates = {old for old in same_reference if old.booked_day in row["bank_groups"]}
+        candidates.update(old for ref in aliases for old in by_alias[ref])
         for group in row["bank_groups"].values():
             candidates.update(by_day[group])
         ref = row["ref"]
@@ -2199,7 +2202,7 @@ def _bank_matches(conn, rows):
         observed_refs = _bank_observed_secondary_refs(row, by_day)
         corrections[row["ref"]] = {old.ref for old in candidates
                                    if _bank_facts_conflict(row, old) and _bank_economic_replay(row, old._asdict())}
-        confirmed = {old.ref for old in candidates if old.ref in row.get("_confirmed_reference_aliases", ())
+        confirmed = {old.ref for old in candidates if old.ref in aliases
                      and not _bank_facts_conflict(row | {"provider_ref": old.provider_ref}, old)}
         ranked = [(old, rank) for old in candidates
                   if (rank := 1 if old.ref in confirmed else _bank_match_rank(row, old, ref, source_refs)) is not None]
@@ -2249,7 +2252,7 @@ def _bank_matches(conn, rows):
     ambiguous.update(ref for ref, candidates in corrections.items() if ref not in matched and candidates - used)
     storage_refs = {}
     reserved = set()
-    known = {booking.ref: booking for candidates in by_day.values() for booking in candidates}
+    known = {booking.ref: booking for candidates in (*by_day.values(), *by_alias.values()) for booking in candidates}
     for row in bank_rows:
         source_ref = row["ref"]
         if source_ref in matched:
@@ -2391,8 +2394,17 @@ def _record_bank_statement_review(conn, row, ref):
 
 
 def pending_bank_statement_amounts(conn, start="0000-01-01", end="9999-12-31"):
-    return conn.execute("SELECT account_key, date, amount, currency, state FROM bank_statement_assessments "
-                        "WHERE state IN ('pending', 'protected') AND date BETWEEN ? AND ? ORDER BY date, review_key",
+    return conn.execute("WITH assessed AS (SELECT account_key, date, amount, currency, review_key, state, "
+                        "COALESCE(json_extract(details, '$.fiscal_bounds[0]'), date) AS earliest, "
+                        "COALESCE(json_extract(details, '$.fiscal_bounds[1]'), date) AS latest, "
+                        "json_extract(details, '$.remainder') AS remainder FROM bank_statement_assessments), "
+                        "reviews AS (SELECT account_key, date, amount, currency, review_key, state, earliest, latest "
+                        "FROM assessed WHERE state IN ('pending', 'protected', 'unplaced') UNION ALL "
+                        "SELECT account_key, CASE WHEN state = 'confirmed' THEN date END, amount, currency, review_key, "
+                        "'pending', earliest, latest FROM assessed WHERE state IN ('confirmed', 'unplaced') AND remainder) "
+                        "SELECT account_key, date, amount, currency, state, "
+                        "state = 'unplaced' AND earliest >= ?1 AND latest <= ?2 AS covered "
+                        "FROM reviews WHERE earliest <= ?2 AND latest >= ?1 ORDER BY earliest, review_key, state = 'pending'",
                         (start, end)).fetchall()
 
 
@@ -2457,12 +2469,24 @@ def _legacy_unestablished_bank_bookings(conn, row):
     return posted - {ref for _, _, ref in witnesses} if witnesses else set()
 
 
+def _statement_fiscal_window_open(bounds):
+    start, end = bounds
+    if start == "0000-01-01" or end == "9999-12-31":
+        return False
+    for period in closed_periods():
+        lo, hi, _, _ = period_bounds_token(period)
+        if lo <= end and hi >= start:
+            return False
+    return True
+
+
 def _record_bank_statement_assessments(conn, observations):
     if not observations:
-        return set()
+        return set(), {}
     if not conn.in_transaction:
         conn.execute("BEGIN IMMEDIATE")
     blocked = set()
+    placements = {}
     stored = {key: (state, json.loads(details)) for key, state, details in conn.execute(
         "SELECT review_key, state, details FROM bank_statement_assessments",
     )}
@@ -2474,14 +2498,34 @@ def _record_bank_statement_assessments(conn, observations):
             blocked.add(row["ref"])
             continue
         key = matches[0] if matches else row["ref"]
-        previous = stored.get(key, (None, {}))[0]
+        previous, previous_details = stored.get(key, (None, {}))
         state = row["state"]
-        if previous in {"confirmed", "ruled_out"}:
-            if state == "pending" or state == previous:
+        remainder = row.get("_statement_remainder", False)
+        bounds = row.get("_statement_fiscal_bounds")
+        details = {"proof": proof, "observations": row["_statement_review_options"], "remainder": remainder,
+                   "fiscal_bounds": bounds}
+        if previous == "unplaced":
+            if state == "pending":
+                continue
+            if state == "confirmed":
+                placements[row["ref"]] = (key, row["date"], details)
+                continue
+            if state == "ruled_out":
+                blocked.add(row["ref"])
+                continue
+            old_bounds = previous_details["fiscal_bounds"]
+            earliest, latest = max(bounds[0], old_bounds[0]), min(bounds[1], old_bounds[1])
+            if earliest > latest:
+                blocked.add(row["ref"])
+                continue
+            details["fiscal_bounds"] = (earliest, latest)
+        clears_remainder = previous == state == "confirmed" and previous_details.get("remainder") and not remainder
+        if previous in {"confirmed", "ruled_out"} and not clears_remainder:
+            if state == "pending" or state == previous or (previous == "confirmed" and state == "unplaced"):
                 continue
             blocked.add(row["ref"])
             state = "protected"
-        elif state in {"pending", "ruled_out"}:
+        elif previous != "unplaced" and state in {"pending", "ruled_out", "unplaced"}:
             prior = set()
             for old_key, ref, encoded in conn.execute("SELECT review_key, ref, alternatives FROM bank_statement_reviews"):
                 saved = json.loads(encoded)
@@ -2494,16 +2538,18 @@ def _record_bank_statement_assessments(conn, observations):
                     prior.add(ref)
             named = _legacy_unestablished_bank_bookings(conn, row) if not prior else set()
             prior.update(named)
-            if prior and (len(prior) != 1 or not _withdraw_unassigned_statement_payment(
+            repairable = state != "unplaced" or (bool(named) and _statement_fiscal_window_open(bounds))
+            if prior and (not repairable or len(prior) != 1 or not _withdraw_unassigned_statement_payment(
                 conn, next(iter(prior)), identified_named=bool(named),
             )):
                 state = "protected"
-        details = {"proof": proof, "observations": row["_statement_review_options"]}
+        if state != "unplaced":
+            details["fiscal_bounds"] = None
         conn.execute("INSERT INTO bank_statement_assessments VALUES (?, ?, ?, ?, ?, ?, ?) "
                      "ON CONFLICT(review_key) DO UPDATE SET state = excluded.state, details = excluded.details",
                      (key, row["account_key"], row["date"], row["amount"], row["currency"], state, json.dumps(details)))
         stored[key] = state, details
-    return blocked
+    return blocked, placements
 
 
 def _prepare_bank_statement_reviews(conn, rows):
@@ -2529,7 +2575,7 @@ def _prepare_bank_statement_reviews(conn, rows):
             option = _BankBooking(*facts)
             for group in groups:
                 disputed[group].append(option)
-    for (encoded,) in conn.execute("SELECT details FROM bank_statement_assessments WHERE state = 'pending'"):
+    for (encoded,) in conn.execute("SELECT details FROM bank_statement_assessments WHERE state IN ('pending', 'unplaced')"):
         for groups, facts in json.loads(encoded)["observations"]:
             option = _BankBooking(*facts)
             for group in groups:
@@ -2626,9 +2672,11 @@ def import_bank_rows(conn, rows: list, *, auto_match: bool = True, require_fx: b
     Auto-match is optional. Enable Banking rows are always left for review.
     'ref' ist UNIQUE, ein erneuter Abruf legt also nichts doppelt an."""
     imported = deferred = 0
-    blocked = _record_bank_statement_assessments(conn, assessments)
+    blocked, placements = _record_bank_statement_assessments(conn, assessments)
     if blocked:
         rows = [row for row in rows if row["ref"] not in blocked]
+    if placements:
+        rows = [row | {"ref": placements[row["ref"]][0]} if row["ref"] in placements else row for row in rows]
     named, pending_reviews, review_warnings, dups = _prepare_bank_statement_reviews(conn, rows)
     seen, ambiguous, storage_refs = _bank_matches(conn, named)
     for r in (*named, *pending_reviews):
@@ -2664,6 +2712,12 @@ def import_bank_rows(conn, rows: list, *, auto_match: bool = True, require_fx: b
                 _record_bank_statement_review(conn, r, ref)
         imported += inserted.rowcount
         dups += 1 - inserted.rowcount
+    for key, date_, details in placements.values():
+        # Keep the aggregate receipt through a deferred import (for example,
+        # while the exchange rate for the newly known booking day is missing).
+        conn.execute("UPDATE bank_statement_assessments SET date = ?, state = 'confirmed', details = ? "
+                     "WHERE review_key = ? AND EXISTS (SELECT 1 FROM bank_statement_reviews WHERE review_key = ?)",
+                     (date_, json.dumps(details), key, key))
     conn.commit()
     matched = _auto_match_transactions(conn) if imported and auto_match else 0
     result = {"imported": imported, "duplicates": dups, "matched": matched}

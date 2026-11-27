@@ -60,6 +60,14 @@ day established by the surrounding statement. A proven booking date replaces
 a fallback on an unassigned payment in open periods and uses the exchange rate
 for the booking day. For assigned payments and closed periods, **Banking** flags
 changes to the period or conversion date for review.
+Balances on neighboring booking days can establish the count while the precise
+booking day remains open. A named payment keeps its fallback in that case.
+If a confirmed payment could fall in different months, **Zahlungen** shows the
+amount with its month open. It counts once in periods that cover every possible
+booking month and stays outside the individual monthly totals until assigned
+by bank evidence. Use **Alle Jahre** if the possible months span a year boundary.
+For a foreign-currency payment, the home-currency totals use the exchange rate
+once the booking date is known.
 If the statement proves an additional payment on a known booking date and
 leaves its bank reference unresolved, **Zahlungen** shows it once as an open
 payment. Check the statement before assigning it. The import leaves the
@@ -72,6 +80,9 @@ balances support different totals, check the statement before adding another pay
 cannot establish its existence. It contributes to neither the booked count nor
 the gross or net totals. A later verified opening balance can confirm or clear
 the review without reposting the existing payments.
+When the statement proves one additional payment and leaves a further payment
+possible, **Zahlungen** includes the proven amount and shows the possible
+remainder separately.
 Receiving the same observations on one page or several pages leaves the booked
 amount unchanged. If the statement establishes both the amount and its purpose,
 **Zahlungen** shows the observed purpose.

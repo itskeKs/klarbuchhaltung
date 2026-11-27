@@ -715,7 +715,11 @@ def _day_label(iso):
 def zahlungen():
     conn = core.db()
     p = request.args.get("p") or str(date.today().year)
-    lo, hi, plabel, py, _pq = _period_from_token(p)
+    hosted = app.config.get("KLAR_HOSTED")
+    if hosted and p == "all":
+        lo, hi, plabel, py = "0000-01-01", "9999-12-31", "Alle Jahre", None
+    else:
+        lo, hi, plabel, py, _pq = _period_from_token(p)
     entries = core.list_ledger(conn, lo, hi)          # Ausgaben + Rechnungen + Bank-Bewegungen
     inv_list = core.list_invoices(conn)
     linked = {t["invoice_id"] for t in core.list_transactions(conn) if t["invoice_id"]}
@@ -788,17 +792,30 @@ def zahlungen():
         cur_rows.append(row)
     for g in groups:
         g["total"] = sum(x["amount"] for x in g["rows"] if not x.get("derived"))
-    summary = {"money_in": money_in, "money_out": money_out, "net": money_in + money_out}
+    count = len(entries)
+    periods = _period_list(py)
     statement_reviews = []
-    if app.config.get("KLAR_HOSTED"):
-        statement_reviews = [dict(row) | {"display": core.eur(row["amount"]) if row["currency"] == "EUR"
-                                         else f"{core.fmt(row['amount'])} {row['currency']}"}
-                             for row in core.pending_bank_statement_amounts(conn, lo, hi)]
+    if hosted:
+        periods.insert(0, ("all", "Alle Jahre"))
+        home = core._fx_norm(core.home_currency())
+        open_count = sum(r["kind"] == "bank" and r["category"] == "offen" for r in entries)
+        for row in core.pending_bank_statement_amounts(conn, lo, hi):
+            amount, currency = row["amount"], row["currency"]
+            included = bool(row["covered"] and core._fx_norm(currency) == home)
+            count += int(row["covered"])
+            open_count += int(row["covered"])
+            if included:
+                money_in += max(0.0, amount)
+                money_out += min(0.0, amount)
+            display = core.eur(amount) if currency == "EUR" else f"{core.fmt(amount)} {currency}"
+            statement_reviews.append(dict(row) | {"display": display, "included": included})
+    else:
+        open_count = core.transactions_open_count(conn)
+    summary = {"money_in": money_in, "money_out": money_out, "net": money_in + money_out}
     return render_template("zahlungen.html", active="zahlungen", groups=groups,
                            inv_options=inv_options, cats=core.TX_CATEGORIES,
-                           summary=summary, count=len(entries), p=p, plabel=plabel,
-                           periods=_period_list(py),
-                           open_count=core.transactions_open_count(conn), statement_reviews=statement_reviews)
+                           summary=summary, count=count, p=p, plabel=plabel, periods=periods,
+                           open_count=open_count, statement_reviews=statement_reviews)
 
 
 @app.route("/zahlungen/export")

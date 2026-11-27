@@ -25,4 +25,11 @@ a separate statement-review notice and stays outside the totals. A verified
 opening balance of EUR 0.00 confirms the neutral payment and clears the notice.
 A verified opening balance of EUR 119.00 clears the notice without a new receipt.
 
+When the statement confirms the EUR 119.00 payment but cannot determine
+whether November or December contains it, the combined period shows six
+payments and EUR 205.00 net. Each month shows the confirmation below its own
+totals and keeps the EUR 119.00 outside them. Sync again with the booking day
+provided. Only the identified month's totals change. The combined period
+still shows six payments and EUR 205.00 net.
+
 [Banking guide](../../hosted/README.md) · [Regression tests](../../tests/test_hosted.py)

@@ -41,7 +41,12 @@
   {% for review in statement_reviews %}
   <div>
     {% if review.state == 'pending' %}
-    Möglicher Bankumsatz über {{ review.display }} vom {{ review.date | de_date }}. Nicht gebucht und nicht in den Summen enthalten.
+    Möglicher Bankumsatz über {{ review.display }}{% if review.date %} vom {{ review.date | de_date }}{% endif %}. Nicht gebucht und nicht in den Summen enthalten.
+    {% elif review.state == 'unplaced' %}
+    Bestätigter Bankumsatz über {{ review.display }}. Buchungsmonat noch offen.
+    {% if review.included %}In den Summen dieses Zeitraums enthalten.
+    {% elif review.covered %}Der Wechselkurs für die Summe steht noch aus.
+    {% else %}In den Summen dieses Zeitraums nicht enthalten.{% endif %}
     {% else %}
     Bestehende Buchung über {{ review.display }} vom {{ review.date | de_date }} prüfen. Die Buchung bleibt erhalten.
     {% endif %}

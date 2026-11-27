@@ -12,4 +12,8 @@ description “Kontoauszug prüfen”.
 Show a possible unbooked payment separately in the selected **Zahlungen**
 period, below the totals, with its date and amount. State that it is excluded
 from the totals.
+Show a confirmed payment whose booking month remains open in the same notice
+area. Display its amount and whether the selected period includes it. Leave
+its booking date blank. Include it once when the range covers every possible
+booking month. Use the existing period selector for the all-years view.
 See the [bank import walkthrough](docs/acceptance/journeys.md).
