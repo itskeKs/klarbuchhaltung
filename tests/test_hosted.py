@@ -1646,6 +1646,75 @@ def test_late_bank_posting_explains_a_new_balance_without_duplicating_the_fee(sa
             )
 
 
+@pytest.mark.parametrize("sign", [-1, 1])
+@pytest.mark.parametrize("late_day, late_amount, extra_fee", [(18, 50, 0), (20, 50, 0), (21, 50, 0), (22, 50, 0),
+                                                               (22, 23, 0), (22, 23, 1)])
+@pytest.mark.parametrize("seed_complete", [False, True])
+def test_bank_balance_revision_matches_the_same_fee_in_a_shifted_statement(
+    sandbox, sign, late_day, late_amount, extra_fee, seed_complete,
+):
+    import core
+
+    steps = [(19, 10, "Opening"), (20, 119, "Rent"), (22, -23, "Fee"), (22, -23, "Fee")]
+
+    def statement(include_late):
+        entries = [(late_day, late_amount, "Late movement"), *steps, *([(22, -23, "Fee")] * extra_fee)] if include_late else steps
+        balance = -10
+        reports = []
+        for day, amount, name in sorted(entries, key=lambda entry: entry[0]):
+            balance += amount
+            reports.append(_bank_motion(f"2026-11-{day}", sign * amount, sign * balance, name,
+                                        entry_reference=name, reference_number=name))
+        return reports
+
+    older, newer = statement(False), statement(True)
+    clipped = [report for report in newer if report["booking_date"] >= f"2026-11-{late_day}"]
+    with closing(core.db()) as ledger:
+        _sync_bank_pages(ledger, [newer if seed_complete else older])
+        fees = {row["id"]: row["ref"] for row in ledger.execute("SELECT id,ref FROM transactions WHERE description='Fee'")}
+        for fee in fees:
+            core.set_tx_category(ledger, fee, "gebuehr", "Checked fee")
+        first = [older] if seed_complete else [clipped[1::2], clipped[::2]]
+        for pages in (first, [newer], [older[::-1]], [clipped[::-1]], [newer]):
+            _sync_bank_pages(ledger, [page for page in pages if page])
+            assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (
+                5 + extra_fee, sign * (83 + late_amount - 23 * extra_fee),
+            )
+            assert {row["id"]: (row["ref"], row["category"], row["note"]) for row in ledger.execute(
+                "SELECT id,ref,category,note FROM transactions WHERE description='Fee' AND category='gebuehr'"
+            )} == {ident: (ref, "gebuehr", "Checked fee") for ident, ref in fees.items()}
+            assert core.pending_bank_statement_amounts(ledger) == []
+
+
+@pytest.mark.parametrize("tail_day, tail_balance", [(True, False), (False, False), (False, True)])
+def test_bank_balance_revision_preserves_a_short_signed_window_beside_an_unplaced_charge(sandbox, tail_day, tail_balance):
+    import core
+
+    def motion(day, amount, balance, label):
+        return _bank_motion(f"2026-11-{day}", amount, balance, label, entry_reference=label)
+
+    opening = motion(19, 10, 0, "Opening")
+    rent = motion(20, 119, 119, "Rent")
+    late = motion(21, 50, 169, "Late movement")
+    before, after = motion(22, -23, 96, "Fee"), motion(22, -23, 146, "Fee")
+    earlier_tail = motion(25, -3, 93 if tail_balance else None, "Independent charge")
+    later_tail = motion(25, -3, 143 if tail_balance else None, "Independent charge")
+    if not tail_day:
+        del earlier_tail["booking_date"], later_tail["booking_date"]
+    with closing(core.db()) as ledger:
+        older = [opening, rent, before, earlier_tail]
+        _sync_bank_pages(ledger, [older])
+        fee = ledger.execute("SELECT id,ref FROM transactions WHERE description='Fee'").fetchone()
+        core.set_tx_category(ledger, fee["id"], "gebuehr", "Checked fee")
+        for pages in ([[later_tail, after], [late]], [older], [[opening, rent, late, after, later_tail]]):
+            _sync_bank_pages(ledger, pages)
+            assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (5, 153)
+            assert tuple(ledger.execute("SELECT ref,category,note FROM transactions WHERE id=?", (fee["id"],)).fetchone()) == (
+                fee["ref"], "gebuehr", "Checked fee",
+            )
+            assert core.pending_bank_statement_amounts(ledger) == []
+
+
 @pytest.mark.parametrize("shape", ["undated tail", "dense days", "long trail", "unreferenced fee", "undated rent", "undated fee"])
 def test_bank_balance_revision_uses_the_evidenced_interval(sandbox, shape):
     import core
