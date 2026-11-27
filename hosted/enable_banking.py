@@ -2478,14 +2478,21 @@ class _StatementFetch:
                 row = row | {"_statement_new_observation": True}
             if ref := observed.get("_bank_balance_revision"):
                 row = row.copy()
-                if not row["date"]:
+                if not row["booked_day"]:
                     known = conn.execute("SELECT t.date,f.booked_day FROM transactions t JOIN bank_import_facts f USING(ref) "
                                          "WHERE ref=?", (ref,)).fetchone()
-                    row |= {"date": known[0], "booked_day": known[1]}
-                    row["bank_groups"] = {known[0]: fingerprint(self.account_key, known[0], row["_amount_key"], row["currency"])}
-                    row["bank_group"] = row["bank_groups"][known[0]]
-                if not row["balance_key"] and (ending := observed.get("_bank_revision_ending")) is not None:
-                    row |= {"balance_key": observed["_bank_revision_balance"], "_statement_balance": (row["currency"], ending)}
+                    if known[1] or not row["date"]:
+                        row |= {"date": known[0], "booked_day": known[1]}
+                        row["bank_groups"] = row["bank_groups"] | {
+                            known[0]: fingerprint(self.account_key, known[0], row["_amount_key"], row["currency"]),
+                        }
+                        row["bank_group"] = row["bank_groups"][known[0]]
+            if not row["balance_key"] and (ending := observed.get("_bank_revision_ending")) is not None:
+                balance = observed["_bank_revision_balance"], (row["currency"], ending)
+                if observed.get("_bank_balance_revision"):
+                    row = row | {"balance_key": balance[0], "_statement_balance": balance[1]}
+                else:
+                    row = row | {"_statement_inferred_balance": balance}
             result.append(row)
         return result
 
@@ -3712,6 +3719,13 @@ def _map_statement_drafts(account_key, drafts, skipped, assessments, trace=False
         drafts, neutral, review_warnings, statement_assessments = _separate_unresolved_references(account_key, drafts, trace)
     retained, balance_warnings = _reconcile_balance_reports(account_key, drafts, account_rows, statement_assessments, neutral, trace,
                                                            overlap_witnesses)
+    for row in retained:
+        inferred = row.pop("_statement_inferred_balance", None)
+        # Inference assumes this observation is a movement. Preserve that
+        # hypothesis until the original facts prove a separate occurrence;
+        # its implied endpoint must not turn a possible page copy into one.
+        if inferred and not row["balance_key"] and row.get("_statement_edge_occurrence"):
+            row.update(balance_key=inferred[0], _statement_balance=inferred[1])
     if retained is not drafts:
         drafts = retained
         _prepare_statement_sources(drafts)

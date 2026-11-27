@@ -3463,7 +3463,7 @@ def _bank_common_revision_matches(first, second):
             for row, (ref, ending, by_name) in first.items() if row in second and second[row][0] == ref}
 
 
-def _bank_aligned_balance_revisions(conn, account, currency, current, prior, matches):
+def _bank_aligned_balance_revisions(conn, account, currency, current, prior, matches, *, prior_opening=None):
     """Use assignments supported by both partially witnessed balance trails."""
     if not current:
         return {}, None
@@ -3503,11 +3503,12 @@ def _bank_aligned_balance_revisions(conn, account, currency, current, prior, mat
         if incoming is False:
             continue
         feasible = True
-        previous = _bank_previous_revision_order(conn, account, currency, first, recorded, opening, previous_family)
+        previous_start = opening if prior_opening is None else prior_opening
+        previous = _bank_previous_revision_order(conn, account, currency, first, recorded, previous_start, previous_family)
         groups = tuple(_bank_revision_families(incoming[0], families))
         if not previous:
             assignments = _bank_recover_revision_assignments(
-                conn, groups, recorded, matches, opening, currency, previous_family,
+                conn, groups, recorded, matches, previous_start, currency, previous_family,
             )
             # An incomplete earlier import can contain checkpoints on both
             # sides of an unbooked movement. Its stored trail cannot balance
@@ -3555,41 +3556,55 @@ def _bank_revision_placements(dated, undated, previous, links):
         yield trial, earlier
 
 
-def _bank_aligned_revision_windows(conn, account, currency, current, prior, matches, unplaced):
+def _bank_aligned_revision_windows(conn, account, currency, current, prior, matches, unplaced, undated, links):
     """Keep independently anchored spans when another part of the fetch is unresolved."""
     if not current:
-        return {}, None
+        return {}
     first, last = min(current), max(current)
 
     def crosses_unplaced(start, end):
         return any(row.first <= end and start <= row.last for row in unplaced)
 
-    aligned, feasible = {}, None
-    if not crosses_unplaced(first, last):
-        aligned, feasible = _bank_aligned_balance_revisions(conn, account, currency, current, prior, matches)
-        required = {id(row) for entries in current.values() for row, _ in entries if matches[id(row)]}
-        if required <= aligned.keys():
-            return aligned, feasible
     boundaries = {first, last}
+    openings = {}
     for day, entries in current.items():
         payments = [row for row, _ in entries]
         previous = [(old, movement.amount, movement.balance_keys) for old, movement in prior.get(day, ())]
-        if (crosses_unplaced(day, day) or not all(row["booked_day"] == day for row in payments)
+        if (crosses_unplaced(day, day) or not all(row["booked_day"] in (None, day) for row in payments)
                 or not all(old.booked_day == day for old, _, _ in previous)):
             continue
-        if _bank_shared_closing_balance(payments, previous, matches, currency, day) is not None:
+        if (ending := _bank_shared_closing_balance(payments, previous, matches, currency, day)) is not None:
             boundaries.add(day)
-    if len(boundaries) < 3:
-        return aligned, feasible
+            openings[day] = ending - sum(amount for _, amount, _ in previous)
     ordered = sorted(boundaries)
+    windows = [(first, last)]
+    if len(ordered) > 2:
+        windows.extend(zip(ordered, ordered[1:]))
+    placements = tuple(_bank_revision_placements(current, undated, prior, links)) if undated else ((current, prior),)
+    required = {id(row) for entries in current.values() for row, _ in entries if matches[id(row)]}
+    required.update(id(row) for row in undated if matches[id(row)])
+    aligned = {}
     disputed = set()
-    for start, end in zip(ordered, ordered[1:]):
+    for start, end in windows:
         if crosses_unplaced(start, end):
             continue
-        incoming = {day: entries for day, entries in current.items() if start <= day <= end}
-        recorded = {day: entries for day, entries in prior.items() if start <= day <= end}
-        evidence, _ = _bank_aligned_balance_revisions(conn, account, currency, incoming, recorded, matches)
-        for source, answer in evidence.items():
+        # A placement must fit the span which proves the occurrence. An
+        # unresolved prefix cannot veto that proof, and an impossible local
+        # placement cannot erase it merely by matching another checkpoint.
+        evidence = None
+        for placement, earlier in placements:
+            incoming = {day: entries for day, entries in placement.items() if start <= day <= end}
+            recorded = {day: entries for day, entries in earlier.items() if start <= day <= end}
+            # A new undated movement may precede the shared checkpoint on
+            # its comparison day. The earlier trail retains its own opening;
+            # the observed checkpoint connects the two versions after it.
+            previous_start = openings.get(start) if recorded.get(start) == prior.get(start) else None
+            answer, feasible = _bank_aligned_balance_revisions(
+                conn, account, currency, incoming, recorded, matches, prior_opening=previous_start,
+            )
+            if feasible is not False:
+                evidence = _bank_common_revision_matches(evidence, answer)
+        for source, answer in (evidence or {}).items():
             if source in disputed:
                 continue
             if source in aligned:
@@ -3600,7 +3615,9 @@ def _bank_aligned_revision_windows(conn, account, currency, current, prior, matc
                     continue
                 answer = common[source]
             aligned[source] = answer
-    return aligned, None
+        if start == first and end == last and required <= aligned.keys():
+            return aligned
+    return aligned
 
 
 def _reconcile_bank_balance_revisions(conn, rows, assessments):
@@ -3689,30 +3706,19 @@ def _reconcile_bank_balance_revisions(conn, rows, assessments):
             if (ending := _bank_shared_closing_balance(payments, prior[day], matches, currency, day)) is not None:
                 anchors[day] = ending
 
-        aligned = None
+        aligned = {}
         unplaced = [entry for entry in (*live, *recorded) if entry.first != entry.last]
         links = _bank_undated_revision_links(undated_reports, undated_bookings, matches)
         if links is not None:
-            shared = len(links) == len(undated_reports) and all(
-                row["balance_key"] in links[id(row)][1].balance_keys
-                or not row["balance_key"] and not links[id(row)][1].balance_keys
-                for row in undated_reports
+            aligned = _bank_aligned_revision_windows(
+                conn, account, currency, live_days, prior_days, matches, unplaced, undated_reports, links,
             )
-            if shared:
-                aligned, _ = _bank_aligned_revision_windows(conn, account, currency, live_days, prior_days, matches, unplaced)
-            if undated_reports and not aligned and not unplaced:
-                aligned = None
-                # An undated addition can cross a checkpoint. Its possible
-                # placements still require the complete signed comparison.
-                for placement, earlier in _bank_revision_placements(live_days, undated_reports, prior_days, links):
-                    answer, feasible = _bank_aligned_balance_revisions(conn, account, currency, placement, earlier, matches)
-                    if feasible is not False:
-                        aligned = _bank_common_revision_matches(aligned, answer)
-        aligned = aligned or {}
         aligned_rows.update(aligned)
         for row in reports:
             if id(row) in aligned and aligned[id(row)][0] is None:
-                revisions[id(row)] = {"_bank_new_occurrence": True}
+                ending = aligned[id(row)][1]
+                revisions[id(row)] = {"_bank_new_occurrence": True, "_bank_revision_ending": ending,
+                                      "_bank_revision_balance": _bank_balance_hash(currency, ending) if ending is not None else None}
         verified.update(id(row) for row in reports if id(row) in aligned
                         and row.get("_bank_account_key") and row.get("_bank_observed_balance"))
         candidates = defaultdict(list)

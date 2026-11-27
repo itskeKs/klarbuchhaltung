@@ -122,7 +122,11 @@ needs independent evidence; unresolved replies can wait for a fuller statement
 without making the later reconciliation post the established payments again.
 An unresolved earlier statement does not block a later segment whose shared
 checkpoints independently establish its payments. The earlier amount remains
-in review until its own evidence is complete.
+in review until its own evidence is complete. Each segment considers possible
+positions of undated movements and reuses an identified payment's known booking
+date. An inferred balance stays separate from bank observations until the
+statement proves the additional payment, so a possible page copy cannot supply
+its own proof. This does not assign a booking date to a new undated payment.
 After the bank establishes a payment's booking month, replays of its confirmed
 reports can use the same statement evidence even if the fetch only covers that month.
 Previously confirmed movements on that day can also help check a new report
