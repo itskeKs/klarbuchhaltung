@@ -2490,6 +2490,7 @@ class _StatementFetch:
         return result
 
     def corrected_drafts(self, conn):
+        """Return all effective evidence; only a confirmed replay returns no drafts."""
         self.drafts = self.revision_drafts(conn)
         last = max(row["date"] for row in self.drafts)
         first = min(row["date"] for row in self.drafts)
@@ -2508,7 +2509,7 @@ class _StatementFetch:
         if replay:
             return [], (), ()
         if not saved and not witnessed:
-            return self.drafts, (), ()
+            return self.drafts, (), checkpoints
         alternatives = defaultdict(list)
         pending_pages = defaultdict(list)
         for index, (state, _, currency, details) in enumerate(saved):
@@ -2565,7 +2566,7 @@ class _StatementFetch:
             known[currency].update(_recover_legacy_statement_balances(currency, self.drafts, fingerprints, witnessed_amounts=amounts))
         has_balances = any(key in known[currency] for currency, key in sources.values())
         if not has_balances and not witnessed and not pending_counts and not any(state in {"unplaced", "confirmed"} for state, _, _, _ in saved):
-            return None
+            return self.drafts, (), checkpoints
         drafts = []
         for index, row in enumerate(self.drafts):
             currency, key = sources.get(index, (row["currency"], None))
@@ -2596,13 +2597,10 @@ class _StatementFetch:
                     and (overlap := _overlap_proof_rows(conn, self.account_key, amount, currency, details, drafts))]
         claims = Counter(index for overlap in overlaps for index in overlap.matched)
         independent = [overlap for overlap in overlaps if all(claims[index] == 1 for index in overlap.matched)]
-        return (drafts, independent, checkpoints) if has_balances or witnessed or independent or pending_counts else None
+        return drafts, independent, checkpoints
 
     def restore(self, conn, selected):
-        correction = self.corrected_drafts(conn)
-        if correction is None:
-            return None
-        drafts, overlaps, checkpoints = correction
+        drafts, overlaps, checkpoints = self.corrected_drafts(conn)
         if not drafts:
             return [], []
         assessments = []
@@ -2758,8 +2756,7 @@ def transaction_rows(account_key, transactions, *, assessments=None, ledger=None
     overlaps, checkpoints = (), ()
     if drafts:
         if ledger is not None:
-            if correction := _StatementFetch(account_key, drafts, skipped).corrected_drafts(ledger):
-                drafts, overlaps, checkpoints = correction
+            drafts, overlaps, checkpoints = _StatementFetch(account_key, drafts, skipped).corrected_drafts(ledger)
         elif assessments is not None:
             snapshot = [row | {"bank_groups": row["bank_groups"].copy(), "prior_refs": row["prior_refs"].copy()} for row in drafts]
             source = _StatementFetch(account_key, snapshot, skipped)
