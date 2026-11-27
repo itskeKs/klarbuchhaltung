@@ -2019,6 +2019,79 @@ def test_signed_sales_do_not_consume_fee_placement_budget(sandbox, sale_day, new
             assert core.pending_bank_statement_amounts(ledger) == []
 
 
+@pytest.mark.parametrize("sign", [-1, 1])
+@pytest.mark.parametrize("omitted", ["entry_reference", "booking_date"])
+def test_bank_revision_keeps_fee_names_when_an_optional_fact_disappears(sandbox, sign, omitted):
+    import core
+
+    def report(day, amount, balance, label, reference):
+        return _bank_motion(f"2026-11-{day}", amount * sign, balance * sign, label, entry_reference=reference)
+
+    opening = report(18, 10, 0, "Opening", "opening")
+    rent = report(20, 119, 119, "Rent", "rent")
+    late = report(21, 50, 169, "Late credit", "late")
+    before = [report(22, -23, 96, "Service", "fees"), report(22, -23, 73, "ATM", "fees")]
+    after = [report(22, -23, 146, "Service", "fees"), report(22, -23, 123, "ATM", "fees"),
+             report(22 if omitted == "entry_reference" else 23, -23, 100, "Extra", "fees")]
+    closing_fee = report(24, 15, 115, "Closing", "closing")
+    affected = {"Service", "ATM"} if omitted == "entry_reference" else {"Service", "Extra"}
+    sparse = [row | {omitted: None, "balance_after_transaction": None}
+              if row["remittance_information"][0] in affected else row for row in after]
+    prior, full = [opening, rent, *before], [opening, rent, late, *after, closing_fee]
+
+    with closing(core.db()) as ledger:
+        assert _sync_bank_pages(ledger, [prior]) == 4
+        original = {row["id"]: (row["ref"], row["description"]) for row in ledger.execute(
+            "SELECT id,ref,description FROM transactions WHERE description IN ('Service','ATM')",
+        )}
+        for ident in original:
+            core.set_tx_category(ledger, ident, "gebuehr", f"Assigned {ident}")
+        partial = [opening, rent, late, *sparse, closing_fee]
+        for reply, imported in ((partial, 3), (full, 0), (full[::-1], 0), (partial[::-1], 0), (prior, 0), (full, 0)):
+            assert _sync_bank_pages(ledger, [reply[:4], reply[4:]] if len(reply) > 4 else [reply]) == imported
+            assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (7, 125 * sign)
+            assert [row[0] for row in ledger.execute("SELECT description FROM transactions WHERE amount=? ORDER BY description",
+                                                    (-23 * sign,))] == ["ATM", "Extra", "Service"]
+            assert {row["id"]: (row["ref"], row["description"], row["note"]) for row in ledger.execute(
+                "SELECT id,ref,description,note FROM transactions WHERE category='gebuehr'",
+            )} == {ident: (*record, f"Assigned {ident}") for ident, record in original.items()}
+            assert core.pending_bank_statement_amounts(ledger) == []
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_bank_revision_retains_named_fee_beside_unresolved_equal_occurrences(sandbox, sign):
+    import core
+
+    def report(day, amount, balance, label, reference, index):
+        return _bank_motion(f"2026-11-{day}", amount * sign, None if balance is None else balance * sign,
+                            label, entry_reference=reference) | {"transaction_id": f"report-{index}"}
+
+    sale = report(23, 31, 31, "Sale", "sale", 0)
+    fee = report(24, -23, 8, "Fee", "reused", 1)
+    next_sale = report(24, 11, 19, "Other sale", "other-sale", 2)
+    phone = report(27, -17, 2, "Phone", "phone", 3)
+    earlier = [sale, fee, next_sale, phone]
+    updated = [report(22, -23, -23, "Fee", "reused", 4),
+               report(23, 31, 8, "Sale", "sale", 5),
+               report(24, -23, -15, "Fee", "reused", 6),
+               report(24, -23, -38, "ATM", "reused", 7),
+               report(24, -23, -61, "ATM", "reused", 8),
+               report(24, 11, -50, "Other sale", "other-sale", 9),
+               report(27, -17, -67, "Phone", "phone", 10)]
+    sparse = [row | {"balance_after_transaction": None} if index in {2, 4} else row for index, row in enumerate(updated)]
+    with closing(core.db()) as ledger:
+        assert _sync_bank_pages(ledger, [earlier]) == 4
+        original = ledger.execute("SELECT id,ref FROM transactions WHERE description='Fee'").fetchone()
+        core.set_tx_category(ledger, original["id"], "gebuehr", "Assigned")
+        for reply, imported in ((sparse, 3), (updated, 0), (updated[::-1], 0), (earlier, 0), (updated, 0)):
+            assert _sync_bank_pages(ledger, [reply[:3], reply[3:]]) == imported
+            assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (7, -67 * sign)
+            assert tuple(ledger.execute("SELECT ref,date,category,note FROM transactions WHERE id=?", (original["id"],)).fetchone()) == (
+                original["ref"], "2026-11-24", "gebuehr", "Assigned",
+            )
+            assert core.pending_bank_statement_amounts(ledger) == []
+
+
 @pytest.mark.parametrize("shape", ["undated tail", "dense days", "long trail", "unreferenced fee", "undated rent", "undated fee"])
 def test_bank_balance_revision_uses_the_evidenced_interval(sandbox, shape):
     import core
