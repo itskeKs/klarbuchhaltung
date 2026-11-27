@@ -2159,6 +2159,21 @@ def _bank_source_refs(row, candidates):
                                      for number in range(1, len(candidates) + 1))
 
 
+def _bank_has_shared_date(row, old):
+    return any(row[field] and row[field] == getattr(old, field) for field in ("booked_day", *_BANK_SECONDARY_DATES))
+
+
+def _bank_balance_overlap(row, old):
+    """An incomplete report can describe an existing signed movement."""
+    if row["provider_ref"] or _bank_facts_conflict(row, old) or not _bank_has_shared_date(row, old):
+        return False
+    if row["balance_key"] and old.balance_key:
+        return True
+    same_party = _bank_account_match(row["counterparty_ids"], old.counterparty_ids) is True
+    same_invoice = row["creditor_ref"] and row["creditor_ref"] == old.creditor_ref
+    return bool((row["balance_key"] or old.balance_key) and (same_party or same_invoice or _bank_description_matches(row, old)))
+
+
 def _bank_corroborated_balance_edge(conn, row, candidates):
     """Reuse an older posting only when its signed window also matches."""
     if not (witnesses := row.get("_statement_edge_witnesses")):
@@ -2206,6 +2221,7 @@ def _bank_matches(conn, rows):
     options = {}
     posting_conflicts = set()
     corrections = {}
+    amended_observations = set()
     proven_matches = {}
     unconfirmed_payers = defaultdict(list)
     cohorts = defaultdict(list)
@@ -2230,8 +2246,19 @@ def _bank_matches(conn, rows):
             ref = _occupied_bank_reference(ref, row)
         source_refs = _bank_source_refs(row, candidates)
         observed_refs = _bank_observed_secondary_refs(row, by_day)
-        corrections[row["ref"]] = {old.ref for old in candidates
-                                   if _bank_facts_conflict(row, old) and _bank_economic_replay(row, old._asdict())}
+        overlaps = {old for old in candidates if _bank_balance_overlap(row, old)}
+        corrections[row["ref"]] = {old.ref for old in overlaps} | {
+            old.ref for old in candidates if _bank_facts_conflict(row, old) and _bank_economic_replay(row, old._asdict())
+        }
+        if not row.get("_statement_edge_occurrence") and any(
+            (old.balance_key == row["balance_key"] and _stored_secondary_match(row, old) is False
+             and not _bank_description_matches(row, old))
+            or (not row["balance_key"] and old.balance_key and conn.execute(
+                "SELECT 1 FROM bank_import_date_aliases WHERE booking_group = ? AND ref = ?",
+                (_bank_statement_observation_alias(old.ref), old.ref),
+            ).fetchone()) for old in overlaps
+        ):
+            amended_observations.add(row["ref"])
         witnessed = set(by_day.get(_bank_statement_observation_alias(row["ref"]), ()))
         witnessed.update(_bank_corroborated_balance_edge(conn, row, candidates))
         witnessed = {old for old in witnessed if not _bank_facts_conflict(row, old)}
@@ -2288,7 +2315,9 @@ def _bank_matches(conn, rows):
     ambiguous = posting_conflicts | {ref for ref, candidates in options.items() if candidates.keys() - used}
     # An independently matched original can coexist with a different reference.
     # Without it, a correction and an additional payment may look identical.
-    ambiguous.update(ref for ref, candidates in corrections.items() if ref not in matched and candidates - used)
+    ambiguous.update(ref for ref, candidates in corrections.items() if ref not in matched and (
+        candidates - used or ref in amended_observations
+    ))
     storage_refs = {}
     reserved = set()
     known = {booking.ref: booking for candidates in (*by_day.values(), *by_alias.values()) for booking in candidates}
@@ -2526,13 +2555,46 @@ def _statement_fiscal_window_open(bounds):
     return True
 
 
+def _bank_occurrence_witness_covered(conn, previous, current):
+    """Compare compatible account-scoped evidence, including older memo-based keys."""
+    if not previous:
+        return True
+    legacy = isinstance(previous[0], str)
+    earlier = [] if legacy else [(set(groups), _BankBooking(*facts[:-1], tuple(map(tuple, facts[-1]))))
+                                 for groups, facts in previous]
+    covered = set()
+    for group, (groups, facts), description in current:
+        witness = _BankBooking(*facts)
+        snapshot = witness._asdict()
+        if legacy:
+            def legacy_key(memo):
+                identity = json.dumps((group, memo), ensure_ascii=False, separators=(",", ":"))
+                return sha256(identity.encode()).hexdigest()
+
+            possible = {witness.provider_ref or legacy_key(description)}
+            if possible.isdisjoint(previous):
+                matches = {old for old in _bank_statement_group_bookings(conn, groups)
+                           if not _bank_facts_conflict(snapshot, old) and _bank_has_shared_date(snapshot, old)}
+                if len(matches) == 1:
+                    old = next(iter(matches))
+                    possible.add(old.provider_ref or legacy_key(old.description))
+            matching = {index for index, old in enumerate(previous) if old in possible}
+        else:
+            matching = {index for index, (old_groups, old) in enumerate(earlier)
+                        if not old_groups.isdisjoint(groups) and not _bank_facts_conflict(snapshot, old)
+                        and _bank_has_shared_date(snapshot, old)}
+        if len(matching) == 1:
+            covered.update(matching)
+    return len(covered) == len(previous)
+
+
 def _record_bank_statement_occurrences(conn, key, row, saved):
     lower, upper = row["_statement_occurrence_bounds"]
     previous = saved.get("occurrences")
     if not previous and lower == upper == 1 and not row["_statement_occurrence_observed"]:
         return None
-    witnesses = set(row["_statement_occurrence_witnesses"])
-    if previous and not set(saved.get("witnesses", ())) <= witnesses:
+    witnesses = row["_statement_occurrence_witnesses"]
+    if previous and not _bank_occurrence_witness_covered(conn, saved.get("witnesses", ()), witnesses):
         return None
     if previous and max(lower, previous[0]) <= min(upper, previous[1]):
         lower, upper = max(lower, previous[0]), min(upper, previous[1])
@@ -2543,7 +2605,8 @@ def _record_bank_statement_occurrences(conn, key, row, saved):
     balances = dict(saved.get("balances", ()))
     balances.update(row["_statement_observed_balances"])
     details = {"proof": row["_statement_review_proof"], "observations": row["_statement_review_options"],
-               "occurrences": (lower, upper), "balances": sorted(balances.items()), "witnesses": sorted(witnesses)}
+               "occurrences": (lower, upper), "balances": sorted(balances.items()),
+               "witnesses": [option for _, option, _ in witnesses]}
     amount = float(row["amount"]) * (upper - lower if state == "pending" else 1)
     conn.execute("INSERT INTO bank_statement_assessments VALUES (?, ?, ?, ?, ?, ?, ?) "
                  "ON CONFLICT(review_key) DO UPDATE SET amount = excluded.amount, state = excluded.state, details = excluded.details",

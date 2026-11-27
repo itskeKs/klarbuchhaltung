@@ -411,7 +411,7 @@ def test_signed_statement_reset_keeps_two_reference_less_equal_movements(sandbox
 
 @pytest.mark.parametrize("case", [
     "complementary dates", "wrong balance", "unknown opening", "unknown closing",
-    "unknown inner balance", "one-step reset", "two-step reset", "repeated witness", "distinct memos", "reused lookup",
+    "unknown inner balance", "one-step reset", "two-step reset", "repeated witness", "distinct memos", "reused lookup", "sparse receipt",
 ])
 @pytest.mark.parametrize("sign", [-1, 1])
 @pytest.mark.parametrize("seed", [False, True])
@@ -461,6 +461,8 @@ def test_balance_path_sets_occurrences_independently_of_lookup_ids(sandbox, case
                   else credit | {"transaction_id": "another booked receipt"})
         if case == "reused lookup":
             second["transaction_id"] = credit["transaction_id"]
+        if case == "sparse receipt":
+            second["balance_after_transaction"] = None
         actual = [opening, credit, *reset, second, movement("Closing", -23, 96, 21)]
         total = 106
     with closing(core.db()) as ledger:
@@ -550,7 +552,8 @@ def test_balance_path_reviews_an_unconfirmed_occurrence_independently_of_pages(s
         ).fetchone()) == (*existing, "einnahme_sonstige", "Reviewed")
 
 
-def test_closed_balance_path_learns_amended_reference_less_observation(sandbox):
+@pytest.mark.parametrize("boundaries", ["both", "before", "after", "neither"])
+def test_closed_balance_path_learns_amended_reference_less_observation(sandbox, boundaries):
     import core
 
     credit, debit = reported_balance_pair()
@@ -570,13 +573,154 @@ def test_closed_balance_path_learns_amended_reference_less_observation(sandbox):
         assert sync([opening, credit, debit]) == (3, 0)
         old = tuple(ledger.execute("SELECT id,ref,date FROM transactions WHERE amount=119").fetchone())
         core.set_tx_category(ledger, old[0], "einnahme_sonstige", "Checked")
-        assert sync([debit, amended, opening]) == (0, 1)
+        page = [amended]
+        if boundaries in {"both", "after"}:
+            page.insert(0, debit)
+        if boundaries in {"both", "before"}:
+            page.append(opening)
+        assert sync(page) == (0, 1)
+        assert sync([amended, credit]) == (0, 1)
         assert sync([amended]) == (0, 1)
+        assert sync([debit, amended, opening]) == (0, 1)
         assert sync([opening, credit, debit]) == (0, 0)
         assert tuple(ledger.execute("SELECT id,ref,date,category,note FROM transactions WHERE amount=119").fetchone()) == (
             *old, "einnahme_sonstige", "Checked",
         )
         assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (3, 106)
+
+
+@pytest.mark.parametrize("position", [0, 1])
+@pytest.mark.parametrize("seed", [False, True])
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_balance_path_reconciles_a_sparse_page_copy(sandbox, position, seed, reverse, sign):
+    import core
+
+    page = list(reported_balance_pair())
+    for row in page:
+        if sign < 0:
+            row["credit_debit_indicator"] = "DBIT" if row["credit_debit_indicator"] == "CRDT" else "CRDT"
+            balance = row["balance_after_transaction"]
+            row["balance_after_transaction"] = balance | {"amount": str(-int(balance["amount"]))}
+    sparse = page[position] | {"transaction_id": "renewed", "balance_after_transaction": None}
+    overlap = [*page, sparse]
+    with closing(core.db()) as ledger:
+        def sync(items):
+            assessments = []
+            rows, warnings = transaction_rows("account-a", items, assessments=assessments, ledger=ledger)
+            result = core.import_bank_rows(ledger, rows, require_fx=True, auto_match=False, assessments=assessments)
+            assert warnings + result["ambiguous"] == 0
+            return result["imported"]
+
+        if seed:
+            assert sync(page) == 2
+        assert sync(overlap[::-1] if reverse else overlap) == (0 if seed else 2)
+        assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (2, 96 * sign)
+        saved = [tuple(row) for row in ledger.execute("SELECT id,ref,date,amount FROM transactions ORDER BY id")]
+        core.set_tx_category(ledger, saved[0][0], "einnahme_sonstige", "Checked")
+        assert sync([sparse]) == sync(overlap) == sync(page[::-1]) == 0
+        assert [tuple(row) for row in ledger.execute("SELECT id,ref,date,amount FROM transactions ORDER BY id")] == saved
+        assert tuple(ledger.execute("SELECT category,note FROM transactions WHERE id=?", (saved[0][0],)).fetchone()) == (
+            "einnahme_sonstige", "Checked",
+        )
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+@pytest.mark.parametrize("third", [False, True])
+@pytest.mark.parametrize("seed", [False, True])
+def test_signed_balance_family_counts_sparse_reports_without_guessing_their_origin(sandbox, sign, third, seed):
+    import core
+
+    credit, fee = reported_balance_pair()
+    opening = credit | {"entry_reference": "opening", "booking_date": "2026-11-19", "transaction_date": "2026-11-19",
+                        "transaction_amount": {"amount": "10", "currency": "EUR"}, "remittance_information": ["Opening"],
+                        "balance_after_transaction": {"amount": "0", "currency": "EUR"}}
+    second = credit | {"transaction_id": "second", "balance_after_transaction": {"amount": "238", "currency": "EUR"}}
+    sparse = credit | {"transaction_id": "sparse", "balance_after_transaction": None}
+    fee["balance_after_transaction"] = {"amount": "334" if third else "215", "currency": "EUR"}
+    for row in (opening, credit, second, sparse, fee):
+        if sign < 0:
+            row["credit_debit_indicator"] = "DBIT" if row["credit_debit_indicator"] == "CRDT" else "CRDT"
+            if balance := row["balance_after_transaction"]:
+                row["balance_after_transaction"] = balance | {"amount": str(-int(balance["amount"]))}
+    clean = [opening, credit, second, *([sparse] if third else []), fee]
+    repeated = [*clean, sparse | {"transaction_id": "renewed"}]
+    reused_lookup = [row | {"transaction_id": credit["transaction_id"]} for row in repeated if row is not opening and row is not fee]
+    reused_lookup = [opening, *reused_lookup, fee]
+    with closing(core.db()) as ledger:
+        def sync(page):
+            assessments = []
+            rows, warnings = transaction_rows("account-a", page, assessments=assessments, ledger=ledger)
+            result = core.import_bank_rows(ledger, rows, require_fx=True, auto_match=False, assessments=assessments)
+            assert warnings + result["ambiguous"] == 0
+            return result["imported"]
+
+        if seed:
+            assert sync(clean) == len(clean)
+        assert sync(reused_lookup[::-1]) == (0 if seed else len(clean))
+        assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (
+            len(clean), (344 if third else 225) * sign,
+        )
+        old = [tuple(row) for row in ledger.execute("SELECT id,ref,date,amount FROM transactions ORDER BY id")]
+        assert sync(repeated) == sync(clean) == sync(reused_lookup) == 0
+        assert not core.pending_bank_statement_amounts(ledger)
+        assert [tuple(row) for row in ledger.execute("SELECT id,ref,date,amount FROM transactions ORDER BY id")] == old
+
+
+def test_signed_balance_family_accepts_complementary_dates_on_a_sparse_copy(sandbox):
+    import core
+
+    credit, fee = reported_balance_pair()
+    opening = credit | {"entry_reference": "opening", "booking_date": "2026-11-19", "transaction_date": "2026-11-19",
+                        "transaction_amount": {"amount": "10", "currency": "EUR"}, "remittance_information": ["Opening"],
+                        "balance_after_transaction": {"amount": "0", "currency": "EUR"}}
+    credit["booking_date"] = None
+    sparse = credit | {"transaction_id": "renewed", "transaction_date": None, "value_date": "2026-11-20",
+                       "balance_after_transaction": None}
+    page = [sparse, fee, credit, opening]
+    with closing(core.db()) as ledger:
+        for statement, count in ((page, 3), (page[::-1], 0), ([credit, opening, fee], 0)):
+            rows, warnings = transaction_rows("account-a", statement, ledger=ledger)
+            result = core.import_bank_rows(ledger, rows, require_fx=True, auto_match=False)
+            assert (result["imported"], warnings + result["ambiguous"]) == (count, 0)
+            assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (3, 106)
+
+
+@pytest.mark.parametrize("opening_balance", [0, 119])
+def test_balance_path_resolves_a_pending_occurrence_after_an_amended_witness(sandbox, opening_balance):
+    import core
+
+    credit, fee = reported_balance_pair()
+    credit["value_date"] = credit["booking_date"]
+    opening = credit | {"booking_date": "2026-11-19", "transaction_date": "2026-11-19", "value_date": "2026-11-19",
+                        "remittance_information": ["Opening"], "transaction_id": "opening",
+                        "transaction_amount": {"amount": "10", "currency": "EUR"}, "balance_after_transaction": None}
+    reversal = fee | {"entry_reference": "reversal", "booking_date": "2026-11-20", "value_date": "2026-11-20",
+                      "remittance_information": ["Reversal"], "transaction_amount": {"amount": "119", "currency": "EUR"},
+                      "balance_after_transaction": {"amount": "0", "currency": "EUR"}}
+    statement = [opening, credit, reversal, credit | {"transaction_id": "second"}, fee]
+    updated = opening | {"transaction_id": "rotated", "remittance_information": ["Amended opening"],
+                         "balance_after_transaction": {"amount": str(opening_balance), "currency": "EUR"}}
+    confirmed_page = [updated, *statement[1:]]
+    with closing(core.db()) as ledger:
+        def sync(items):
+            assessments = []
+            rows, _ = transaction_rows("account-a", items, assessments=assessments, ledger=ledger)
+            return core.import_bank_rows(ledger, rows, require_fx=True, auto_match=False, assessments=assessments)["imported"]
+
+        assert sync(statement) == 4
+        assert [(row["state"], row["amount"]) for row in core.pending_bank_statement_amounts(ledger)] == [("pending", 119)]
+        original = tuple(ledger.execute("SELECT id,ref,date FROM transactions WHERE amount=10").fetchone())
+        core.set_tx_category(ledger, original[0], "einnahme_sonstige", "Reviewed")
+        assert sync(confirmed_page[::-1]) == int(opening_balance == 0)
+        assert not core.pending_bank_statement_amounts(ledger)
+        assert sync(confirmed_page) == sync(statement) == 0
+        assert not core.pending_bank_statement_amounts(ledger)
+        assert tuple(ledger.execute("SELECT id,ref,date,category,note FROM transactions WHERE amount=10").fetchone()) == (
+            *original, "einnahme_sonstige", "Reviewed",
+        )
+        expect = (5, 106) if opening_balance == 0 else (4, -13)
+        assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == expect
 
 
 @pytest.mark.parametrize("origin", ["http://tilisy.enablebanking.com", "https://other.example",

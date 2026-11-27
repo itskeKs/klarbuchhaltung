@@ -98,10 +98,15 @@ checks which movements can connect one reported balance to the next,
 including repeated reports of the surrounding transactions. When those
 surrounding movements also match the ledger, a later report with amended
 details can match the original payment. When the dated statement window
-still supports several counts, the importer books the supported minimum. Any possible additional
-amount appears in Payments for review outside the totals until further
-bank evidence settles it. This check also works when reference or
-counterparty details are missing.
+still supports several counts, the importer books the supported minimum.
+Any possible additional amount appears in Payments for review outside the
+totals until further bank evidence settles it. When a later page omits a
+balance, the same signed statement can establish the total count across
+several compatible payments. Reference and counterparty details can help
+identify a payment when they are available. A short sync that cannot resolve an
+amended report against the established booking flags it for review and
+preserves the original amount and assignment. Updated bank descriptions
+can still corroborate an earlier statement when the monetary facts agree.
 Value and transaction dates can help identify a movement or place it when
 its booking date is missing.
 Movements on the same known booking day can follow any order consistent
