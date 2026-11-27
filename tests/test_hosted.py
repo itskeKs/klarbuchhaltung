@@ -5109,10 +5109,12 @@ def test_full_payments_csv_tracks_the_confirmed_receipt_across_booking_months(sa
                 assert ("Buchungsmonat noch offen" in receipt["Beschreibung"]) == (phase == "confirmed")
 
 
-def test_undated_foreign_payment_csv_leaves_conversion_open(sandbox, monkeypatch):
+@pytest.mark.parametrize("home", ["EUR", "GBP"])
+def test_undated_foreign_payment_csv_leaves_conversion_open(sandbox, monkeypatch, home):
     import core
     from app import app
 
+    core.save_settings({"home_currency": home})
     with closing(core.db()) as ledger, ledger:
         ledger.execute("INSERT INTO bank_statement_assessments "
                        "(review_key, account_key, date, amount, currency, state, details) "

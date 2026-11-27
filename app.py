@@ -843,14 +843,11 @@ def zahlungen_export():
     for t in transactions:
         w.writerow([t["date"], sheet_text(t["description"]), t["amount"], sheet_text(t["currency"]),
                     t["amount_home"], sheet_text(t["category"]), sheet_text(t["tx_type"])])
-    if reviews:
-        home = core._fx_norm(core.home_currency())
-        for row in reviews:
-            if row["covered"]:
-                amount, currency = row["amount"], row["currency"]
-                w.writerow(["", "Bestätigter Bankumsatz – Buchungsmonat noch offen", amount,
-                            sheet_text(currency), amount if core._fx_norm(currency) == home else None,
-                            "offen", ""])
+    for row in reviews:
+        if row["covered"]:
+            amount, currency = row["amount"], row["currency"]
+            w.writerow(["", "Bestätigter Bankumsatz – Buchungsmonat noch offen", amount,
+                        sheet_text(currency), amount if currency == "EUR" else None, "offen", ""])
     return Response(out.getvalue(), mimetype="text/csv",
                     headers={"Content-Disposition": "attachment; filename=zahlungen.csv"})
 
