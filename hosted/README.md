@@ -146,8 +146,9 @@ the import keeps its ledger entry and any user assignment. An extended
 statement can also prove a genuinely separate payment. A late movement can
 explain a revised balance on an existing entry when both signed histories
 reconcile from the same implied opening balance. The reported balances can
-establish the sequence of movements on the same booking day. A shorter reply
-can reuse a verified earlier sequence from the same account. Observations
+establish the sequence of movements on the same booking day. Known signed
+amounts carry those balances through movements that omit their own balance.
+A shorter reply can reuse a verified earlier sequence from the same account. Observations
 without a booking date contribute only when the signed history supports
 their effect in the relevant interval.
 Receiving the same observations on one page or several pages leaves the booked

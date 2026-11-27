@@ -1952,9 +1952,9 @@ def _remember_bank_booking(conn, ref, row):
         observed = {*observed, row["ref"]}
         conn.executemany("INSERT OR IGNORE INTO bank_import_date_aliases (booking_group, ref) VALUES (?, ?)",
                          ((_bank_statement_observation_alias(alias), ref) for alias in observed))
-    if row.get("_bank_balance_revision") == ref:
+    if row.get("_bank_balance_revision") == ref and (balance := row.get("_bank_revision_balance") or row["balance_key"]):
         conn.execute("INSERT OR IGNORE INTO bank_import_date_aliases VALUES (?, ?)", (
-            _bank_balance_revision_key(ref, row["balance_key"]), ref,
+            _bank_balance_revision_key(ref, balance), ref,
         ))
     alternate = {pair for pair in row["counterparty_ids"] if pair != ("IBAN", row["counterparty_iban"])}
     identifiers = None
@@ -3073,30 +3073,56 @@ def _bank_shared_closing_balance(reports, stored, matches, currency, day):
     return None
 
 
-def _bank_revision_opening(groups):
-    """Find the common starting balance implied by the incoming signed days."""
+def _bank_day_openings(movements):
+    """Bound a day's opening from its reported balance transitions."""
+    reported = [row for row in movements if row.balance is not None]
+    if not reported:
+        return None
+    if len(reported) == len(movements):
+        starts = Counter(row.balance - row.amount for row in reported)
+        ends = Counter(row.balance for row in reported)
+        boundaries = tuple((starts - ends).elements())
+        return set(boundaries or starts) if len(boundaries) <= 1 else set()
+
+    # Only movements without a balance can precede the first reported edge.
+    offsets = {Decimal(0)}
+    for row in movements:
+        if row.balance is None:
+            offsets |= {amount + row.amount for amount in offsets}
+            if len(offsets) > _BANK_BALANCE_TRAIL_LIMIT:
+                return None
+    candidates = set()
+    for row in reported:
+        candidates.update(row.balance - row.amount - offset for offset in offsets)
+        if len(candidates) > _BANK_BALANCE_TRAIL_LIMIT:
+            return None
+    return candidates
+
+
+def _bank_revision_openings(groups):
+    """Transfer the observed constraints back through known daily amounts."""
     candidates = None
     net = Decimal(0)
     for _, group in sorted(groups.items()):
-        ends = Counter(row.balance for _, row in group)
-        starts = Counter(row.balance - row.amount for _, row in group)
-        boundaries = tuple((starts - ends).elements())
-        if len(boundaries) > 1:
-            return None
-        possible = {balance - net for balance in (boundaries or starts)}
-        candidates = possible if candidates is None else candidates & possible
-        if not candidates:
-            return None
-        net += sum(row.amount for _, row in group)
-    return next(iter(candidates)) if candidates and len(candidates) == 1 else None
+        movements = [row for _, row in group]
+        if (opening := _bank_day_openings(movements)) is not None:
+            possible = {balance - net for balance in opening}
+            candidates = possible if candidates is None else candidates & possible
+            if not candidates:
+                return set()
+        net += sum(row.amount for row in movements)
+    return candidates or set()
 
 
-def _bank_revision_order(groups, opening, currency):
-    """Read same-day order from balance transitions, not the provider's list order."""
+def _bank_revision_order(groups, opening, currency, family=None, *, infer=False):
+    """Find a trail and establish only the comparisons shared by its possible orders."""
     order = {}
+    verified = {}
     for day, group in sorted(groups.items()):
         if len(group) > _BANK_BALANCE_TRAIL_LIMIT:
             return None
+        roles = [family(source) if family else None for source, _ in group]
+        repeated = {role for role, count in Counter(roles).items() if role and count > 1}
 
         def trails(remaining, running, path):
             nonlocal budget
@@ -3107,21 +3133,50 @@ def _bank_revision_order(groups, opening, currency):
             if budget < 0:
                 return
             for index in remaining:
-                source, movement = group[index]
+                movement = group[index][1]
                 ending = running + movement.amount
                 if (movement.balance is not None and movement.balance != ending
                         or movement.balance_keys and _bank_balance_hash(currency, ending) not in movement.balance_keys):
                     continue
-                yield from trails(remaining - {index}, ending, (*path, source))
+                yield from trails(remaining - {index}, ending, (*path, index))
 
         budget = _BANK_BALANCE_TRAIL_LIMIT + len(group)
         paths = trails(set(range(len(group))), opening, ())
         ordered = next(paths, None)
-        if ordered is None or next(paths, None) is not None or budget < 0:
+        if ordered is None:
+            return None if budget < 0 else False
+        sparse = {index for index, (_, row) in enumerate(group) if infer and roles[index] and row.balance is None}
+
+        def projection(path):
+            return {role: tuple(index for index in path if roles[index] == role) for role in repeated}
+
+        def endings(path):
+            running = opening
+            balances = {}
+            for index in path:
+                running += group[index][1].amount
+                if index in sparse:
+                    balances[index] = running
+            return balances
+
+        fixed = endings(ordered) if sparse else {}
+        established = projection(ordered)
+        if repeated or fixed:
+            for path in paths:
+                if projection(path) != established:
+                    return None
+                if fixed:
+                    possible = endings(path)
+                    fixed = {index: balance for index, balance in fixed.items() if possible[index] == balance}
+                    if not fixed and not repeated:
+                        break
+        if budget < 0 and repeated:
             return None
-        order[day] = ordered
+        if budget >= 0:
+            verified.update((id(group[index][0]), balance) for index, balance in fixed.items())
+        order[day] = tuple(group[index][0] for index in ordered)
         opening += sum(row.amount for _, row in group)
-    return order, opening
+    return order, opening, verified
 
 
 def _bank_align_revision_family(reports, stored, matches):
@@ -3138,24 +3193,6 @@ def _bank_align_revision_family(reports, stored, matches):
     return {id(row): old.ref for row, old in zip(reports, stored)}
 
 
-def _bank_signed_revision_windows(current, prior):
-    """Exclude unevidenced days without discarding a disjoint signed trail."""
-    opening_barrier = None
-    signed = {}
-    for day in sorted(current.keys() | prior.keys()):
-        reports, bookings = current.get(day, ()), prior.get(day, ())
-        if any(not row.get("_bank_observed_balance") for row in reports) or any(not keys for _, _, keys in bookings):
-            if signed:
-                yield signed, opening_barrier
-                signed = {}
-            opening_barrier = day
-        elif reports:
-            signed[day] = [(row, _BankMovement(day, day, Decimal(str(row["amount"])), row["_bank_observed_balance"][1]))
-                           for row in reports]
-    if signed:
-        yield signed, opening_barrier
-
-
 def _bank_same_undated_members(reports, prior, matches):
     """Check that both versions already contain the same independently identified movements."""
     all_refs = {old.ref for old in prior}
@@ -3169,59 +3206,87 @@ def _bank_same_undated_members(reports, prior, matches):
     return associated == all_refs
 
 
-def _bank_aligned_balance_revisions(conn, account, currency, signed, prior, matches, opening_barrier):
-    """Compare ordered occurrences in two evidenced versions of a statement."""
-    first, last = min(signed), max(signed)
-    recorded = {day: [(old, _BankMovement(day, day, amount, balance_keys=keys)) for old, amount, keys in bookings]
-                for day, bookings in prior.items() if first <= day <= last and bookings}
-    if not recorded or any(not movement.balance_keys for group in recorded.values() for _, movement in group):
-        return {}
-    opening = _bank_revision_opening(signed)
-    if opening is None or (incoming := _bank_revision_order(signed, opening, currency)) is None:
-        return {}
-    previous = _bank_revision_order(recorded, opening, currency)
-    if previous is None:
-        # The older reply can be clipped at the start of a newer observed
-        # history. Check only contiguous saved movements of this account.
-        if first == date.min.isoformat():
-            return {}
-        cutoff = (date.fromisoformat(first) - timedelta(days=1)).isoformat()
-        earlier = _bank_account_bookings(conn, account, currency, date.min.isoformat(), cutoff, newest_first=True)
-        prefix = {}
-        starts = {opening}
-        for count, (day, bookings) in enumerate(groupby(earlier, key=lambda entry: entry[0].booked_day)):
-            if count == _BANK_BALANCE_TRAIL_LIMIT or opening_barrier is not None and day <= opening_barrier:
-                break
-            prefix[day] = [(old, _BankMovement(day, day, amount, balance_keys=_bank_known_balance_keys(conn, old)))
-                           for old, amount in bookings]
-            if any(not row.balance_keys for _, row in prefix[day]):
-                break
-            if (trail := _bank_revision_order(prefix, opening, currency)) is None or trail[1] in starts:
+def _bank_previous_revision_order(conn, account, currency, first, recorded, opening, family):
+    previous = _bank_revision_order(recorded, opening, currency, family)
+    if previous is not False or first == date.min.isoformat():
+        return previous
+    # A clipped reply can omit a previous movement which explains the
+    # change to the opening balance of the shared dates.
+    cutoff = (date.fromisoformat(first) - timedelta(days=1)).isoformat()
+    earlier = _bank_account_bookings(conn, account, currency, date.min.isoformat(), cutoff, newest_first=True)
+    prefix = {}
+    starts = {opening}
+    for count, (day, bookings) in enumerate(groupby(earlier, key=lambda entry: entry[0].booked_day)):
+        if count == _BANK_BALANCE_TRAIL_LIMIT:
+            break
+        prefix[day] = [(old, _BankMovement(day, day, amount, balance_keys=_bank_known_balance_keys(conn, old)))
+                       for old, amount in bookings]
+        trail = _bank_revision_order(prefix, opening, currency)
+        if trail is None:
+            return None
+        if trail is False or trail[1] in starts:
+            continue
+        starts.add(trail[1])
+        trial = _bank_revision_order(recorded, trail[1], currency, family)
+        if trial is None or trial is not False and previous is not False:
+            return None
+        if trial is not False:
+            previous = trial
+    return previous
+
+
+def _bank_revision_assignments(incoming, previous, matches, families):
+    revisions = {}
+    for day, reports in incoming.items():
+        by_family = defaultdict(list)
+        for row in reports:
+            if family := families[id(row)]:
+                by_family[family].append(row)
+        for family, siblings in by_family.items():
+            if any(family & other for other in by_family if family != other):
                 continue
-            starts.add(trail[1])
-            if (trial := _bank_revision_order(recorded, trail[1], currency)) is not None:
-                if previous is not None:
-                    return {}
-                previous = trial
+            existing = [old for old in previous.get(day, ()) if old.ref in family]
+            if existing:
+                assignments = _bank_align_revision_family(siblings, existing, matches)
+                revisions.update((id(row), assignments.get(id(row))) for row in siblings)
+    return revisions
+
+
+def _bank_aligned_balance_revisions(conn, account, currency, current, prior, matches):
+    """Use assignments supported by both partially witnessed balance trails."""
+    if not current:
+        return {}
+    first, last = min(current), max(current)
+    recorded = {day: group for day, group in prior.items() if first <= day <= last}
+    if not any(row.balance_keys for group in recorded.values() for _, row in group):
+        return {}
+    families = {row: frozenset(old.ref for old, _, _ in candidates) for row, candidates in matches.items()}
+    reflected = defaultdict(set)
+    for row, family in families.items():
+        for ref in family:
+            reflected[ref].add(row)
+
+    common = None
+    for opening in _bank_revision_openings(current):
+        incoming = _bank_revision_order(current, opening, currency, lambda row: families[id(row)], infer=True)
+        if incoming is None:
+            return {}
+        if incoming is False:
+            continue
+        previous = _bank_previous_revision_order(conn, account, currency, first, recorded, opening,
+                                                 lambda old: frozenset(reflected[old.ref]))
         if previous is None:
             return {}
-
-    revisions = {}
-    for day, reports in incoming[0].items():
-        families = defaultdict(list)
-        for row in reports:
-            family = frozenset(old.ref for old, _, _ in matches[id(row)])
-            if family:
-                families[family].append(row)
-        for family, siblings in families.items():
-            if any(family & other for other in families if family != other):
-                continue
-            existing = [old for old in previous[0].get(day, ()) if old.ref in family]
-            if not existing:
-                continue
-            assignments = _bank_align_revision_family(siblings, existing, matches)
-            revisions.update((id(row), assignments.get(id(row))) for row in siblings)
-    return revisions
+        if previous is False:
+            continue
+        assignments = _bank_revision_assignments(incoming[0], previous[0], matches, families)
+        evidence = {row: (ref, incoming[2].get(row)) for row, ref in assignments.items()}
+        if common is None:
+            common = evidence
+        else:
+            common = {row: (ref, ending if evidence[row][1] == ending else None)
+                      for row, (ref, ending) in common.items() if row in evidence and evidence[row][0] == ref}
+    return common or {}
 
 
 def _reconcile_bank_balance_revisions(conn, rows, assessments):
@@ -3277,10 +3342,17 @@ def _reconcile_bank_balance_revisions(conn, rows, assessments):
                 undated_bookings.append(booking)
                 old_undated.append(_BankMovement(None, None, amount, balance_keys=keys))
 
-        live = [_BankMovement(day, day, Decimal(str(row["amount"])), balance[1] if (balance := row.get("_bank_observed_balance")) else None)
-                for day, payments in current.items() for row in payments]
-        recorded = [_BankMovement(day, day, amount, balance_keys=keys)
-                    for day, payments in prior.items() for _, amount, keys in payments]
+        live_days = {
+            day: [(row, _BankMovement(day, day, Decimal(str(row["amount"])),
+                                      balance[1] if (balance := row.get("_bank_observed_balance")) else None))
+                  for row in payments] for day, payments in current.items()
+        }
+        prior_days = {
+            day: [(booking, _BankMovement(day, day, amount, balance_keys=keys)) for booking, amount, keys in payments]
+            for day, payments in prior.items()
+        }
+        live = [movement for entries in live_days.values() for _, movement in entries]
+        recorded = [movement for entries in prior_days.values() for _, movement in entries]
         live.extend(_BankMovement(*row["_statement_fiscal_bounds"], Decimal(str(row["amount"])))
                     for row in assessments if row.get("_statement_joint") and row["state"] == "unplaced"
                     and row["account_key"] == account and row["currency"] == currency)
@@ -3302,35 +3374,40 @@ def _reconcile_bank_balance_revisions(conn, rows, assessments):
         aligned = {}
         if (_bank_same_undated_members(undated_reports, undated_bookings, matches)
                 and not any(entry.first != entry.last for entry in (*live, *recorded))):
-            for signed, barrier in _bank_signed_revision_windows(current, prior):
-                aligned.update(_bank_aligned_balance_revisions(conn, account, currency, signed, prior, matches, barrier))
+            aligned = _bank_aligned_balance_revisions(conn, account, currency, live_days, prior_days, matches)
         candidates = defaultdict(list)
-        for day in sorted(current):
-            targets = [row for row in current[day] if row.get("_bank_observed_balance")
-                       and any(old.balance_key and old.balance_key != row["balance_key"] for old, _, _ in matches[id(row)])]
-            if not targets:
-                continue
-            before = max((anchor for anchor in anchors if anchor < day), default=None)
+        for day, reports in current.items():
+            targets = [row for row in reports if id(row) in aligned or (
+                row.get("_bank_observed_balance")
+                and any(old.balance_key and old.balance_key != row["balance_key"] for old, _, _ in matches[id(row)])
+            )]
             delta = None
-            if before and not any(entry.first <= day < entry.last for entry in (*live, *recorded)):
-                current_amounts = _bank_statement_window_amounts(live, live_undated, currency, before, day, anchors[before])
-                previous_amounts = _bank_statement_window_amounts(recorded, old_undated, currency, before, day, anchors[before])
-                if len(current_amounts) == len(previous_amounts) == 1:
-                    delta = next(iter(current_amounts)) - next(iter(previous_amounts))
+            if any(id(row) not in aligned for row in targets):
+                before = max((anchor for anchor in anchors if anchor < day), default=None)
+                if before and not any(entry.first <= day < entry.last for entry in (*live, *recorded)):
+                    current_amounts = _bank_statement_window_amounts(live, live_undated, currency, before, day, anchors[before])
+                    previous_amounts = _bank_statement_window_amounts(recorded, old_undated, currency, before, day, anchors[before])
+                    if len(current_amounts) == len(previous_amounts) == 1:
+                        delta = next(iter(current_amounts)) - next(iter(previous_amounts))
             for row in targets:
                 source = [(old, keys) for old, _, keys in matches[id(row)]]
                 known = {old.ref for old, keys in source if row["balance_key"] != old.balance_key and row["balance_key"] in keys}
+                inferred = None
                 if id(row) in aligned:
-                    known = {aligned[id(row)]} if aligned[id(row)] else set()
+                    ref, ending = aligned[id(row)]
+                    known = {ref} if ref else set()
+                    if ending is not None:
+                        inferred = _bank_balance_hash(currency, ending)
                 elif not known and delta:
                     previous_balance = _bank_balance_hash(currency, row["_bank_observed_balance"][1] - delta)
                     known = {old.ref for old, keys in source if previous_balance in keys and row["balance_key"] not in keys}
-                if len(known) == 1:
-                    candidates[next(iter(known))].append(row)
+                if len(known) == 1 and (row["balance_key"] or inferred):
+                    candidates[next(iter(known))].append((row, inferred))
         for ref, matches in candidates.items():
             if len(matches) == 1:
-                revisions[matches[0]["ref"]] = ref
-    return [row | {"_bank_balance_revision": revisions[row["ref"]]} if row["ref"] in revisions else row for row in rows]
+                row, inferred = matches[0]
+                revisions[row["ref"]] = {"_bank_balance_revision": ref, "_bank_revision_balance": inferred}
+    return [row | revisions[row["ref"]] if row["ref"] in revisions else row for row in rows]
 
 
 def _joint_statement_scope(account, amount, currency, checkpoints, dates, members):
