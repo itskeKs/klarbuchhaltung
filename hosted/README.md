@@ -132,7 +132,9 @@ or reversal stays outside the gross amounts and net total until the
 statement establishes it.
 When the statement proves one additional payment and leaves a further payment
 possible, **Zahlungen** includes the proven amount and shows the possible
-remainder separately.
+remainder separately. Later balances that close the period can clear this
+notice. The established payment stays linked to the same ledger entry when
+the bank revises a reference or supplies a previously missing balance.
 Receiving the same observations on one page or several pages leaves the booked
 amount unchanged. If the statement establishes both the amount and its purpose,
 **Zahlungen** shows the observed purpose.

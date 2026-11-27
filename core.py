@@ -2962,12 +2962,84 @@ def _joint_statement_dates(joint, options):
     return (min(days), max(days)) if days and None not in days else joint["bounds"]
 
 
-def _joint_statement_membership(rows, groups, facts):
+def _joint_proof_member_matches(left, right, *, subject):
+    left_groups, left_facts = left
+    right_groups, right_facts = right
+    groups = set(left_groups).intersection(right_groups)
+    if not groups:
+        return False
+    before, after = _BankBooking(*left_facts), _BankBooking(*right_facts)
+    row = after._asdict() | {"bank_groups": {group: group for group in groups}}
+    if _joint_statement_source(row, groups, before):
+        return True
+    # A reference revision on an independently attested checkpoint does
+    # not change the signed movement. Distinct named subjects still need
+    # the same economic party or remittance evidence.
+    same_edge = before.booked_day and before.booked_day == after.booked_day and before.balance_key and before.balance_key == after.balance_key
+    if not same_edge or (subject and not (
+        (before.creditor_ref and before.creditor_ref == after.creditor_ref)
+        or _bank_account_match(before.counterparty_ids, after.counterparty_ids) is True
+    )):
+        return False
+    return not _bank_facts_conflict(row | {"provider_ref": before.provider_ref}, before)
+
+
+def _joint_proof_covers(first, second, *, subjects):
+    """Find an injective correspondence between actual statement movements."""
+    matching = {}
+
+    def assign(index, visited):
+        for target, member in enumerate(second):
+            if target in visited or not _joint_proof_member_matches(first[index], member, subject=subjects):
+                continue
+            visited.add(target)
+            if target not in matching or assign(matching[target], visited):
+                matching[target] = index
+                return True
+        return False
+
+    return all(assign(index, set()) for index in range(len(first)))
+
+
+def _same_joint_statement(prior, current):
+    before, after = prior["joint"], current["joint"]
+    if before["account_key"] != after["account_key"] or prior["currency"] != current["currency"]:
+        return False
+    if Decimal(str(prior["amount"])) != Decimal(str(current["amount"])):
+        return False
+    for first, second in ((prior, current), (current, prior)):
+        dates = _joint_statement_dates(first["joint"], first["observations"])
+        if dates[1] < _joint_statement_dates(second["joint"], second["observations"])[0]:
+            return False
+
+    def subjects(details):
+        groups = {group for groups, _ in details["observations"] for group in groups}
+        return [member for member in details["joint"]["members"] if not groups.isdisjoint(member[0])]
+
+    old_subjects, new_subjects = subjects(prior), subjects(current)
+    if (len(old_subjects) < 2 or len(old_subjects) != len(new_subjects)
+            or not _joint_proof_covers(old_subjects, new_subjects, subjects=True)):
+        return False
+    old, new = before["members"], after["members"]
+    # References are tolerated only with a matching dated balance edge.
+    # The subject correspondence alone would confuse two separate windows.
+    def edges(members):
+        return {(booking.booked_day, booking.balance_key, group) for groups, facts in members for group in groups
+                if (booking := _BankBooking(*facts)).booked_day and booking.balance_key}
+
+    shared = {(day, balance) for day, balance, _ in edges(old) & edges(new)}
+    return len(shared) >= 2 and (
+        _joint_proof_covers(old, new, subjects=False) or _joint_proof_covers(new, old, subjects=False)
+    )
+
+
+def _joint_statement_membership(rows, groups, facts, *, subject):
     booking = _BankBooking(*facts)
     compatible = {i for i, row in rows.items() if _joint_statement_source(row, groups, booking)}
     direct = {i for i in compatible if (booking.ref and rows[i]["ref"] == booking.ref)
               or (booking.provider_ref and rows[i]["provider_ref"] == booking.provider_ref)}
-    return direct or compatible
+    return direct or compatible or {i for i, row in rows.items()
+                                   if _joint_proof_member_matches((groups, facts), _bank_statement_option(row), subject=subject)}
 
 
 def _joint_statement_existing(conn, joint, options):
@@ -2978,11 +3050,12 @@ def _joint_statement_existing(conn, joint, options):
     def in_groups(groups):
         return {booking for group in groups for booking in candidates[group]}
 
+    subjects = {group for groups, _ in options for group in groups}
     members = []
     for groups, facts in joint["members"]:
         bank_groups = {group: group for group in groups}
         rows = {booking.ref: booking._asdict() | {"bank_groups": bank_groups} for booking in in_groups(groups)}
-        matches = _joint_statement_membership(rows, groups, facts)
+        matches = _joint_statement_membership(rows, groups, facts, subject=not subjects.isdisjoint(groups))
         if len(matches) != 1:
             return {}
         members.extend(matches)
@@ -3003,7 +3076,9 @@ def _joint_statement_allocation(rows, joint, options, currency, amount):
     eligible = {index: row for index, row in enumerate(rows)
                 if row.get("_bank_account_key") == joint["account_key"] and row["currency"] == currency
                 and first <= row["date"] <= last}
-    members = [_joint_statement_membership(eligible, groups, facts) for groups, facts in joint["members"]]
+    subjects = {group for groups, _ in options for group in groups}
+    members = [_joint_statement_membership(eligible, groups, facts, subject=not subjects.isdisjoint(groups))
+               for groups, facts in joint["members"]]
     known = set().union(*members)
     alternatives = {i for i, row in eligible.items() if i not in known and Decimal(str(row["amount"])) == amount
                     and any(not set(groups).isdisjoint(row["bank_groups"].values())
@@ -3078,13 +3153,84 @@ def _joint_statement_template(scope, slot, details, dates, currency, amount, *, 
     }
 
 
+def _joint_evidence_versions(details):
+    yield details
+    for evidence in details["joint"].get("evidence", {}).values():
+        yield details | {
+            "joint": details["joint"] | evidence["joint"],
+            "observations": evidence["observations"],
+        }
+
+
+def _store_joint_evidence(conn, slots, assessments, snapshot, details):
+    """Remember corroborated evidence without changing the ledger slot key."""
+    joint = details["joint"]
+    evidence = {
+        "joint": {field: joint[field] for field in ("bounds", "dates", "members")},
+        "observations": details["observations"],
+    }
+    for key, ref, _, _, _, saved in slots:
+        if not ref:
+            continue
+        known = saved["joint"].setdefault("evidence", {})
+        if snapshot in known:
+            continue
+        known[snapshot] = evidence
+        conn.execute("UPDATE bank_statement_reviews SET alternatives=? WHERE review_key=?", (json.dumps(saved), key))
+    for key, saved in assessments.items():
+        known = saved["joint"].setdefault("evidence", {})
+        if snapshot in known:
+            continue
+        known[snapshot] = evidence
+        conn.execute("UPDATE bank_statement_assessments SET details=? WHERE review_key=?", (json.dumps(saved), key))
+
+
+def _joint_statement_has_closing_bound(rows, account, currency, dates):
+    """Check a closed interval that contains every possible surplus day."""
+    opening, closing = defaultdict(set), defaultdict(set)
+    movements = defaultdict(list)
+    for row in rows:
+        if row.get("_bank_account_key") != account or row["currency"] != currency:
+            continue
+        if not (day := row["booked_day"]):
+            return False
+        amount = Decimal(str(row["amount"]))
+        ending = observed[1] if (observed := row.get("_bank_observed_balance")) else None
+        movements[day].append((amount, row["provider_ref"]))
+        opening[day].add(ending - amount if ending is not None else None)
+        closing[day].add(ending)
+    before = max((day for day, balances in closing.items()
+                  if day < dates[0] and len(balances) == 1 and None not in balances), default=None)
+    after = min((day for day, balances in opening.items()
+                 if day > dates[1] and len(balances) == 1 and None not in balances), default=None)
+    if not before or not after:
+        return False
+    inside = [entry for day, entries in movements.items() if before < day < after for entry in entries]
+    return all(ref for _, ref in inside) and sum(amount for amount, _ in inside) == (
+        next(iter(opening[after])) - next(iter(closing[before]))
+    )
+
+
+def _store_joint_upper_bound(conn, slots, assessments, bound):
+    for key, ref, _, _, _, saved in slots:
+        if not ref or saved["joint"].get("closed_upper") == bound:
+            continue
+        saved["joint"]["closed_upper"] = bound
+        conn.execute("UPDATE bank_statement_reviews SET alternatives=? WHERE review_key=?", (json.dumps(saved), key))
+    for key, saved in assessments.items():
+        if saved["joint"].get("closed_upper") == bound:
+            continue
+        saved["joint"]["closed_upper"] = bound
+        conn.execute("UPDATE bank_statement_assessments SET details=? WHERE review_key=?", (json.dumps(saved), key))
+
+
 def _restore_joint_bank_reviews(conn, rows, assessments):
     """Reconcile named movements and review slots against one scoped count."""
     if not any(row.get("_bank_account_key") or row.get("_statement_joint") for row in (*rows, *assessments)):
         return rows, assessments, 0, 0
     if not conn.in_transaction:
         conn.execute("BEGIN IMMEDIATE")
-    grouped = defaultdict(lambda: {"slots": [], "assessments": {}, "incoming": {}})
+    grouped = defaultdict(lambda: {"slots": [], "assessments": {}, "incoming": {}, "proofs": []})
     for key, ref, day, currency, amount, encoded in conn.execute(
         "SELECT review_key,ref,date,currency,amount,alternatives FROM bank_statement_reviews JOIN transactions USING(ref) "
         "WHERE json_type(alternatives, '$.joint') = 'object' ORDER BY transactions.id",
@@ -3096,6 +3242,7 @@ def _restore_joint_bank_reviews(conn, rows, assessments):
             _joint_statement_dates(joint, details["observations"]), joint["members"],
         )
         grouped[scope]["slots"].append((key, ref, day, currency, amount, details))
+        grouped[scope]["proofs"].append(details | {"currency": currency, "amount": amount})
     for key, day, currency, amount, state, encoded in conn.execute(
         "SELECT review_key,date,currency,amount,state,details FROM bank_statement_assessments "
         "WHERE state IN ('unplaced', 'confirmed') AND json_type(details, '$.joint') = 'object'",
@@ -3107,18 +3254,36 @@ def _restore_joint_bank_reviews(conn, rows, assessments):
             _joint_statement_dates(joint, details["observations"]), joint["members"],
         )
         grouped[scope]["assessments"][key] = details
+        grouped[scope]["proofs"].append(details | {"currency": currency, "amount": amount})
         if state == "unplaced":
             grouped[scope]["slots"].append((key, None, day, currency, amount, details))
+    known_scopes = {snapshot: scope for scope, group in grouped.items() for proof in group["proofs"]
+                    for snapshot in proof["joint"].get("evidence", {})}
+    warnings = 0
     for row in (*rows, *assessments):
-        if joint := row.get("_statement_joint"):
-            grouped[joint["scope"]]["incoming"][row["ref"]] = row
+        if not (joint := row.get("_statement_joint")):
+            continue
+        snapshot = joint["scope"]
+        scope = known_scopes.get(snapshot, snapshot)
+        if scope not in grouped:
+            current = {"joint": joint, "observations": row["_statement_review_options"],
+                       "amount": row["amount"], "currency": row["currency"]}
+            matches = {candidate for candidate, group in grouped.items()
+                       if any(_same_joint_statement(version, current) for prior in group["proofs"]
+                              for version in _joint_evidence_versions(prior))}
+            if len(matches) > 1:
+                warnings += 1
+                continue
+            if matches:
+                scope = next(iter(matches))
+                known_scopes[snapshot] = scope
+        grouped[scope]["incoming"][row["ref"]] = row
     if not grouped:
         return rows, assessments, 0, 0
 
     named = [row for row in rows if not row.get("_statement_joint")]
     decisions = [row for row in assessments if not row.get("_statement_joint")]
     discarded, additions = set(), []
-    warnings = 0
     for scope, group in grouped.items():
         slots, stored, incoming = group["slots"], group["assessments"], group["incoming"]
         if incoming:
@@ -3126,6 +3291,8 @@ def _restore_joint_bank_reviews(conn, rows, assessments):
             currency, amount = template["currency"], template["amount"]
             details = {"joint": template["_statement_joint"], "proof": template["_statement_review_proof"],
                        "observations": template["_statement_review_options"]}
+            if template["_statement_joint"]["scope"] != scope:
+                _store_joint_evidence(conn, slots, stored, template["_statement_joint"]["scope"], details)
         elif slots:
             _, _, _, currency, amount, details = slots[0]
         else:
@@ -3133,6 +3300,16 @@ def _restore_joint_bank_reviews(conn, rows, assessments):
         joint, options = details["joint"], details["observations"]
         dates = _joint_statement_dates(joint, options)
         clean, alternatives = _joint_statement_allocation(named, joint, options, currency, amount)
+        if not incoming:
+            # A complete update can use an amended witness even when all
+            # movements now have names and the mapper emits no review row.
+            for version in _joint_evidence_versions(details):
+                current = _joint_statement_allocation(named, version["joint"], version["observations"], currency, amount)
+                if (len(current[0]), len(current[1])) > (len(clean), len(alternatives)):
+                    details = version
+                    joint, options = details["joint"], details["observations"]
+                    dates = _joint_statement_dates(joint, options)
+                    clean, alternatives = current
         if not incoming and not alternatives:
             continue
         existing = _joint_statement_existing(conn, joint, options)
@@ -3155,6 +3332,14 @@ def _restore_joint_bank_reviews(conn, rows, assessments):
         minimum = max(occupied, verified, joint.get("minimum", len(slots)) if incoming else 0)
         maximum = max(minimum, joint.get("maximum", minimum),
                       *(entry["joint"].get("maximum", len(slots) + bool(entry.get("remainder"))) for entry in stored.values()))
+        prior_bounds = [entry["joint"]["closed_upper"] for entry in (
+            *(slot[-1] for slot in slots), *stored.values(),
+        ) if "closed_upper" in entry["joint"]]
+        if verified and not incoming and _joint_statement_has_closing_bound(named, joint["account_key"], currency, dates):
+            _store_joint_upper_bound(conn, slots, stored, verified)
+            maximum = minimum
+        elif prior_bounds:
+            maximum = max(minimum, min(maximum, *prior_bounds))
         matches, ambiguous = _joint_statement_slot_matches(conn, named, fresh, free)
         occupied += len(fresh) - len(matches) - len(ambiguous)
         discarded.update(ambiguous | (clean - fresh - known))

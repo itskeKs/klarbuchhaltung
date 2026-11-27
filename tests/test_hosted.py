@@ -1154,6 +1154,93 @@ def test_joint_statement_identity_uses_the_known_checkpoint_booking_day(sandbox,
             )
 
 
+@pytest.mark.parametrize("cross_month", [False, True])
+@pytest.mark.parametrize("change", ["opening omitted", "opening corrected", "closing omitted", "closing corrected", "running balance", "fee"])
+def test_joint_statement_retains_its_slot_when_bank_evidence_changes(sandbox, cross_month, change):
+    import core
+
+    reports, copies = _joint_receipt_count_fixture(cross_month=cross_month)
+    changed = [row.copy() for row in reports]
+    if change == "running balance":
+        changed[2]["balance_after_transaction"] = {"amount": "238", "currency": "EUR"}
+    elif change == "fee":
+        changed.append(_bank_motion(changed[-1]["booking_date"], -20, 314, "New fee", entry_reference="new-fee"))
+    else:
+        row = changed[0 if change.startswith("opening") else -1]
+        row["entry_reference"] = "corrected-checkpoint" if change.endswith("corrected") else None
+        row["transaction_id"] = "different-lookup"
+    with closing(core.db()) as ledger:
+        assert _sync_bank_pages(ledger, [reports, copies]) == (4 if cross_month else 5)
+        if cross_month:
+            key = ledger.execute("SELECT review_key FROM bank_statement_assessments WHERE state='unplaced'").fetchone()[0]
+        else:
+            slot = ledger.execute("SELECT id,ref FROM transactions WHERE description='Kontoauszug prüfen'").fetchone()
+            core.set_tx_category(ledger, slot["id"], "einnahme_sonstige", "Keep assigned")
+        assert _sync_bank_pages(ledger, [changed, copies]) == int(change == "fee")
+        for reply in ([copies, changed], [reports, copies], [changed]):
+            assert _sync_bank_pages(ledger, reply) == 0
+        count, amount = (4, 225) if cross_month else (5, 344)
+        assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (
+            count + int(change == "fee"), amount - 20 * int(change == "fee"),
+        )
+        if cross_month:
+            assert [tuple(row) for row in ledger.execute(
+                "SELECT review_key,amount FROM bank_statement_assessments WHERE state='unplaced'",
+            )] == [(key, 119)]
+        else:
+            assert tuple(ledger.execute("SELECT ref,category,note FROM transactions WHERE id=?", (slot["id"],)).fetchone()) == (
+                slot["ref"], "einnahme_sonstige", "Keep assigned",
+            )
+            assert core.pending_bank_statement_amounts(ledger) == []
+
+
+def test_joint_statement_keeps_distinct_episodes_on_the_same_bank_account(sandbox):
+    import core
+
+    reports, copies = _joint_receipt_count_fixture()
+
+    def later(row):
+        returned = row.copy()
+        for field in ("booking_date", "value_date", "transaction_date"):
+            returned[field] = (date.fromisoformat(row[field]) + timedelta(days=7)).isoformat()
+        for field in ("entry_reference", "reference_number", "transaction_id"):
+            if row.get(field):
+                returned[field] += "-later"
+        if balance := row["balance_after_transaction"]:
+            returned["balance_after_transaction"] = balance | {"amount": str(344 + int(balance["amount"]))}
+        return returned
+
+    later_reports, later_copies = list(map(later, reports)), list(map(later, copies))
+    with closing(core.db()) as ledger:
+        assert _sync_bank_pages(ledger, [reports, copies]) == 5
+        assert _sync_bank_pages(ledger, [later_reports, later_copies]) == 5
+        assert _sync_bank_pages(ledger, [later_copies, later_reports]) == 0
+        assert _sync_bank_pages(ledger, [reports, copies]) == 0
+        assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (10, 688)
+        assert ledger.execute("SELECT count(*) FROM transactions WHERE description='Kontoauszug prüfen'").fetchone()[0] == 2
+
+
+@pytest.mark.parametrize("corrected_opening", [False, True])
+def test_joint_statement_clears_possible_overflow_only_after_a_later_checkpoint(sandbox, corrected_opening):
+    import core
+
+    reports, echoes = _joint_receipt_count_fixture(close_same_day=True)
+    rent = reports[1] | {"entry_reference": "rent-repeat", "balance_after_transaction": {"amount": "357", "currency": "EUR"}}
+    resolved = [*reports[:3], rent, reports[-1]]
+    closure = _bank_motion("2026-11-21", -10, 324, "Later checkpoint", entry_reference="close-later")
+    with closing(core.db()) as ledger:
+        assert _sync_bank_pages(ledger, [reports, echoes]) == 5
+        for reply in ([resolved], [[closure]]):
+            assert _sync_bank_pages(ledger, reply) == int(reply == [[closure]])
+            assert [(row["state"], row["amount"]) for row in core.pending_bank_statement_amounts(ledger)] == [("pending", 119)]
+        if corrected_opening:
+            resolved[0] |= {"entry_reference": "amended-opening"}
+        for reply in ([[*resolved, closure]], [reports, echoes], [[*resolved, closure]]):
+            assert _sync_bank_pages(ledger, reply) == 0
+            assert core.pending_bank_statement_amounts(ledger) == []
+            assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (6, 334)
+
+
 @pytest.mark.parametrize("sign", [-1, 1])
 @pytest.mark.parametrize("seed", [False, True])
 @pytest.mark.parametrize("shape, has_balance", [
