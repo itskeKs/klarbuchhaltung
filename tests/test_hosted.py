@@ -2074,7 +2074,161 @@ def test_full_statement_uses_known_primary_period_when_one_report_omits_it(missi
         assert assessments[0]["date"] == "2026-11-23"
         if missing_primary == 3:
             supplies = next(row for row in disputed_period if row["description"] == "Supplies")
-            assert (supplies["booked_day"], supplies["date"]) == (None, "2026-11-22")
+            assert (supplies["booked_day"], supplies["value_day"], supplies["transaction_day"]) == (
+                None, "2026-11-22", "2026-11-22",
+            )
+            assert supplies["date"] == "2026-11-23"
+
+
+@pytest.mark.parametrize("missing", [0, 3])
+@pytest.mark.parametrize("delivery", ["partial", "complete", "legacy", "legacy-assigned", "legacy-closed", "legacy-destination-closed"])
+def test_statement_period_uses_proven_booking_day_across_month_boundary(sandbox, missing, delivery):
+    import core
+
+    whole = [row | {"booking_date": "2026-12-01"} for row in ambiguous_reference_statement()]
+    partial = [row | {"booking_date": None} if index == missing else row for index, row in enumerate(whole)]
+    protected = delivery in {"legacy-assigned", "legacy-closed", "legacy-destination-closed"}
+    with closing(core.db()) as ledger:
+        target = None
+        if delivery.startswith("legacy"):
+            raw = [transaction_rows("account-a", [row])[0][0] for index, row in enumerate(partial) if index != 2]
+            assert core.import_bank_rows(ledger, raw, require_fx=True)["imported"] == 5
+            target = ledger.execute("SELECT id, ref, date FROM transactions WHERE date < '2026-12-01'").fetchone()
+            if delivery == "legacy-assigned":
+                core.set_tx_category(ledger, target["id"], "einnahme_sonstige", "Leave this booking intact")
+            elif delivery.endswith("closed"):
+                core.close_period("2026-12" if delivery == "legacy-destination-closed" else "2026-11")
+        first = whole if delivery == "complete" else partial
+        for response in (first, whole, partial[::-1], [whole[missing]], whole[::-1]):
+            decisions = []
+            rows, _ = transaction_rows("account-a", response, assessments=decisions)
+            result = core.import_bank_rows(ledger, rows, require_fx=True, assessments=decisions)
+            by_month = [tuple(row) for row in ledger.execute(
+                "SELECT substr(date, 1, 7), count(*), sum(amount) FROM transactions GROUP BY 1 ORDER BY 1",
+            )]
+            if protected:
+                assert by_month == [("2026-11", 1, 119), ("2026-12", 4, -33)]
+                assert result["ambiguous"] > 0
+            else:
+                assert by_month == [("2026-12", 5, 86)]
+            assert [row["amount"] for row in core.pending_bank_statement_amounts(ledger, "2026-12-01", "2026-12-31")] == [119]
+        if target:
+            assert ledger.execute("SELECT ref, date FROM transactions WHERE id = ?", (target["id"],)).fetchone()[:] == (
+                target["ref"], target["date"] if protected else "2026-12-01",
+            )
+
+
+@pytest.mark.parametrize("currency, booking_day", [("EUR", "2026-12-01"), ("USD", "2026-11-23")])
+@pytest.mark.parametrize("protection", [None, "assignment", "original period", "booking period"])
+def test_first_explicit_booking_day_corrects_only_an_unassigned_fallback(sandbox, monkeypatch, currency, booking_day, protection):
+    import core
+
+    monkeypatch.setattr(core, "fx_rate", lambda _, __, ___, day: 1.2 if day == booking_day else 1.0)
+    supplies = ambiguous_reference_statement()[3] | {
+        "booking_date": None, "transaction_amount": {"amount": "119", "currency": currency},
+    }
+    with closing(core.db()) as ledger:
+        initial, _ = transaction_rows("account-a", [supplies])
+        core.import_bank_rows(ledger, initial, require_fx=True)
+        before = ledger.execute("SELECT id, ref, date, amount_home FROM transactions").fetchone()
+        assert tuple(before)[2:] == ("2026-11-22", 119)
+        if protection == "assignment":
+            core.set_tx_category(ledger, before["id"], "einnahme_sonstige", "Keep this entry")
+        elif protection:
+            core.close_period(booking_day[:7] if protection == "booking period" else "2026-11")
+        for response in ([supplies | {"booking_date": booking_day}], [supplies]):
+            rows, _ = transaction_rows("account-a", response)
+            result = core.import_bank_rows(ledger, rows, require_fx=True)
+            assert result["imported"] == 0
+            actual = ledger.execute("SELECT id, ref, date, amount_home, booked_day FROM transactions "
+                                    "JOIN bank_import_facts USING (ref)").fetchall()
+            home = 142.8 if currency == "USD" else 119
+            expected = tuple(before) if protection else (*tuple(before)[:2], booking_day, home)
+            assert [tuple(row) for row in actual] == [(*expected, booking_day)]
+            if response[0]["booking_date"]:
+                assert bool(result["ambiguous"]) == bool(protection)
+
+
+@pytest.mark.parametrize("direction", [-1, 1])
+@pytest.mark.parametrize("before", [False, True])
+def test_same_amount_outside_statement_interval_keeps_its_own_payment(sandbox, direction, before):
+    import core
+
+    whole = ambiguous_reference_statement(direction)
+    partial = [row | {"booking_date": None} if i == 3 else row for i, row in enumerate(whole)]
+    day = "2026-11-17" if before else "2026-11-27"
+    independent = whole[0] | dict.fromkeys(("booking_date", "value_date", "transaction_date"), day) | {
+        "entry_reference": "other", "reference_number": "other", "transaction_id": "other",
+        "remittance_information": ["Independent receipt"], "balance_after_transaction": None if before else
+        {"amount": str(324 * direction), "currency": "EUR"},
+    }
+    with closing(core.db()) as ledger:
+        for response in ([*partial, independent], [independent, *whole[::-1]], [independent]):
+            decisions = []
+            rows, _ = transaction_rows("account-a", response, assessments=decisions)
+            core.import_bank_rows(ledger, rows, require_fx=True, assessments=decisions)
+            assert tuple(ledger.execute("SELECT count(*), sum(amount), sum(abs(amount)) FROM transactions").fetchone()) == (
+                6, 205 * direction, 509,
+            )
+            assert [row["amount"] for row in core.pending_bank_statement_amounts(ledger)] == [119 * direction]
+            assert ledger.execute("SELECT date FROM transactions WHERE description = 'Independent receipt'").fetchone()[0] == day
+
+
+@pytest.mark.parametrize("missing", range(6))
+@pytest.mark.parametrize("direction", [-1, 1])
+def test_later_booking_checkpoint_settles_count_with_an_unplaced_typed_observation(sandbox, missing, direction):
+    import core
+
+    whole = ambiguous_reference_statement(direction)
+    whole[-1]["booking_date"] = "2026-11-24"
+    partial = [row | {"value_date": None, "transaction_date": None} if i == missing else row for i, row in enumerate(whole)]
+    anchor = whole[1] | dict.fromkeys(("booking_date", "value_date", "transaction_date"), "2026-10-31") | {
+        "entry_reference": "prior-balance", "reference_number": "prior-balance", "transaction_id": "prior-balance",
+        "remittance_information": ["Prior balance"], "transaction_amount": {"amount": "10", "currency": "EUR"},
+        "balance_after_transaction": {"amount": "0", "currency": "EUR"},
+    }
+    with closing(core.db()) as ledger:
+        def sync(response):
+            decisions = []
+            rows, _ = transaction_rows("account-a", response, assessments=decisions)
+            core.import_bank_rows(ledger, rows, require_fx=True, assessments=decisions)
+
+        sync(whole)
+        assert [row["amount"] for row in core.pending_bank_statement_amounts(ledger)] == [119 * direction]
+        for response in ([anchor, *partial], [*partial[::-1], anchor], [anchor, *whole], partial):
+            sync(response)
+            assert tuple(ledger.execute("SELECT count(*), sum(amount), sum(abs(amount)) FROM transactions "
+                                        "WHERE date LIKE '2026-11-%'").fetchone()) == (6, 205 * direction, 509)
+            assert core.pending_bank_statement_amounts(ledger) == []
+
+
+@pytest.mark.parametrize("missing", [0, 1, 2, 4])
+@pytest.mark.parametrize("opening", [0, 119])
+@pytest.mark.parametrize("direction", [-1, 1])
+def test_same_day_balances_settle_count_with_an_unplaced_typed_observation(sandbox, missing, opening, direction):
+    import core
+
+    whole = ambiguous_reference_statement(direction)
+    partial = [row | {"value_date": None, "transaction_date": None} if i == missing else row
+               for i, row in enumerate(whole)]
+    anchor = whole[1] | dict.fromkeys(("booking_date", "value_date", "transaction_date"), "2026-10-31") | {
+        "entry_reference": "prior-balance", "reference_number": "prior-balance", "transaction_id": "prior-balance",
+        "remittance_information": ["Prior balance"], "transaction_amount": {"amount": "10", "currency": "EUR"},
+        "balance_after_transaction": {"amount": str(opening * direction), "currency": "EUR"},
+    }
+    expected = (6, 205 * direction) if opening == 0 else (5, 86 * direction)
+    with closing(core.db()) as ledger:
+        for i, response in enumerate((partial, [anchor, *partial], [*partial[::-1], anchor], [anchor, *whole], partial)):
+            decisions = []
+            rows, _ = transaction_rows("account-a", response, assessments=decisions)
+            core.import_bank_rows(ledger, rows, require_fx=True, assessments=decisions)
+            booked = tuple(ledger.execute("SELECT count(*), sum(amount) FROM transactions "
+                                          "WHERE date LIKE '2026-11-%'").fetchone())
+            pending = [row["amount"] for row in core.pending_bank_statement_amounts(ledger)]
+            if i == 0:
+                assert booked == (5, 86 * direction) and pending == [119 * direction]
+            else:
+                assert booked == expected and pending == []
 
 
 @pytest.mark.parametrize("protection", [None, "assigned", "closed"])

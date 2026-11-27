@@ -14,7 +14,7 @@ from collections import Counter, defaultdict, namedtuple
 from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from hashlib import sha256
-from itertools import combinations
+from itertools import combinations, product
 from pathlib import Path
 
 # ── Pfade ────────────────────────────────────────────────────────────────
@@ -2249,6 +2249,7 @@ def _bank_matches(conn, rows):
     ambiguous.update(ref for ref, candidates in corrections.items() if ref not in matched and candidates - used)
     storage_refs = {}
     reserved = set()
+    known = {booking.ref: booking for candidates in by_day.values() for booking in candidates}
     for row in bank_rows:
         source_ref = row["ref"]
         if source_ref in matched:
@@ -2257,6 +2258,9 @@ def _bank_matches(conn, rows):
             ):
                 ambiguous.add(source_ref)
             else:
+                old = known.get(matched[source_ref])
+                if old and not _correct_bank_fallback_date(conn, row, old):
+                    ambiguous.add(source_ref)
                 _remember_bank_booking(conn, matched[source_ref], row)
         elif source_ref not in ambiguous:
             ref = source_ref
@@ -2300,7 +2304,34 @@ def _bank_statement_same_proof(first, second):
         return False
     days, other = first[1], second[1]
     shared = days.keys() & other.keys()
-    return bool(shared) and all(days[key] == other[key] for key in shared)
+    if shared:
+        return all(days[key] == other[key] for key in shared)
+    if len(first) < 4 or len(second) < 4 or (days and other) or first[3][0] != second[3][0]:
+        return False
+    checkpoints = set()
+    for left, right in product(first[3][1], second[3][1]):
+        if (tuple(left[3:]) == tuple(right[3:]) and _bank_secondary_match(left[:3], right[:3]) is True):
+            checkpoints.add(tuple(left[3:]))
+            if len(checkpoints) >= 2:
+                return True
+    return False
+
+
+def _bank_statement_matches_partial_proof(conn, row, stored):
+    """Recognize a dated assessment made before its balance witnesses were saved."""
+    proof, previous = row["_statement_review_proof"], stored["proof"]
+    if (not previous or len(previous) != 3 or proof[1] or not _bank_statement_compatible_proof(proof, previous)):
+        return False
+    prior = [_BankBooking(*facts) for _, facts in stored["observations"]]
+    versions = [_BankBooking(*facts) for _, facts in row["_statement_review_versions"]]
+    if not any(old.booked_day == current.booked_day == row["date"] and (
+        _bank_statement_option_match(current._asdict(), old)
+        or (current.provider_ref and current.provider_ref == old.provider_ref
+            and _bank_economic_replay(current._asdict(), old._asdict()))
+    ) for old, current in product(prior, versions)):
+        return False
+    witnesses = row["_statement_review_members"][:-2]
+    return len(_bank_statement_members(conn, witnesses)) >= 2
 
 
 def _bank_statement_matches_legacy_review(key, row, stored):
@@ -2322,7 +2353,7 @@ def _bank_statement_matches_legacy_review(key, row, stored):
     return False
 
 
-def _bank_statement_members(conn, row):
+def _bank_statement_members(conn, observations):
     """Identify every named movement in the witness using scoped ledger facts."""
     select = ("SELECT t.ref, t.description, " + ", ".join(f"f.{field}" for field in _BANK_IDENTITY_FIELDS)
               + ", f.counterparty_ids FROM transactions t JOIN bank_import_facts f USING (ref) "
@@ -2331,7 +2362,7 @@ def _bank_statement_members(conn, row):
               + "UNION ALL SELECT ref FROM bank_import_date_aliases WHERE booking_group = ?1)")
     identified = set()
     matches = []
-    for groups, facts in row.get("_statement_review_members", ()):
+    for groups, facts in observations:
         observed = _BankBooking(*facts)
         snapshot = observed._asdict()
         candidates = {_bank_booking(record) for group in groups for record in conn.execute(select, (group,))}
@@ -2379,6 +2410,29 @@ def _unassigned_statement_payment(conn, ref):
     return tx
 
 
+def _correct_bank_fallback_date(conn, row, old):
+    """Move an untouched fallback posting after the statement establishes its day."""
+    day = row.get("_statement_booking_day") or row["booked_day"]
+    if not day or (old.booked_day and old.booked_day != day):
+        return True
+    posting = conn.execute("SELECT date, amount, currency FROM transactions WHERE ref = ?", (old.ref,)).fetchone()
+    if posting["date"] == day or posting["date"] not in {old.value_day, old.transaction_day}:
+        return True
+    same_month_and_currency = (posting["date"][:7] == day[:7]
+                               and _fx_norm(posting["currency"]) == _fx_norm(home_currency()))
+    if not _unassigned_statement_payment(conn, old.ref):
+        return same_month_and_currency
+    try:
+        _guard_open_period(day, "Bankumsatz prüfen")
+    except ValueError:
+        return same_month_and_currency
+    home, rate = to_home(conn, posting["amount"], posting["currency"], day)
+    if home is None:
+        return False
+    conn.execute("UPDATE transactions SET date = ?, amount_home = ?, fx_rate = ? WHERE ref = ?", (day, home, rate, old.ref))
+    return True
+
+
 def _withdraw_unassigned_statement_payment(conn, ref, *, identified_named=False):
     tx = _unassigned_statement_payment(conn, ref)
     if not tx or (not identified_named and tx["description"] != "Kontoauszug prüfen"):
@@ -2399,7 +2453,7 @@ def _legacy_unestablished_bank_bookings(conn, row):
     ).fetchone()}
     if not posted:
         return set()
-    witnesses = _bank_statement_members(conn, row)
+    witnesses = _bank_statement_members(conn, row.get("_statement_review_members", ()))
     return posted - {ref for _, _, ref in witnesses} if witnesses else set()
 
 
@@ -2414,7 +2468,8 @@ def _record_bank_statement_assessments(conn, observations):
     )}
     for row in observations:
         proof = row["_statement_review_proof"]
-        matches = [key for key, (_, saved) in stored.items() if _bank_statement_same_proof(proof, saved["proof"])]
+        matches = [key for key, (_, saved) in stored.items() if _bank_statement_same_proof(proof, saved["proof"])
+                   or _bank_statement_matches_partial_proof(conn, row, saved)]
         if len(matches) > 1:
             blocked.add(row["ref"])
             continue
@@ -2433,7 +2488,9 @@ def _record_bank_statement_assessments(conn, observations):
                 if isinstance(saved, list):
                     saved = {"observations": saved, "proof": None}
                 if (_bank_statement_same_proof(proof, saved["proof"]) or _bank_statement_matches_legacy_review(old_key, row, saved)
-                        or (_bank_statement_replays_legacy_witness(row, saved) and _bank_statement_members(conn, row))):
+                        or _bank_statement_matches_partial_proof(conn, row, saved)
+                        or (_bank_statement_replays_legacy_witness(row, saved)
+                            and _bank_statement_members(conn, row.get("_statement_review_members", ())))):
                     prior.add(ref)
             named = _legacy_unestablished_bank_bookings(conn, row) if not prior else set()
             prior.update(named)
@@ -2485,10 +2542,11 @@ def _prepare_bank_statement_reviews(conn, rows):
                 disputed[group].append(option)
             alternatives.append(option.ref)
         proof = row.get("_statement_review_proof")
-        members = _bank_statement_members(conn, row)
+        members = _bank_statement_members(conn, row.get("_statement_review_members", ()))
         prior = [key for key, (_, stored, _, _) in recorded.items() if (
             key == row["ref"] or _bank_statement_matches_legacy_review(key, row, stored)
             or _bank_statement_same_proof(proof, stored["proof"])
+            or _bank_statement_matches_partial_proof(conn, row, stored)
             or (members and _bank_statement_replays_legacy_witness(row, stored))
         )]
         if prior:

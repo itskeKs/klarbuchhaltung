@@ -53,15 +53,21 @@ reported posting day even when their secondary dates remain unclear.
 Compatible bank facts can support that check when an optional reference is
 missing. Reported balances can also confirm two otherwise identical payments.
 The balance check considers related repeated movements together and preserves
-the bank's reported dates when other date fields are missing.
+the bank's reported dates when other date fields are missing. Independent
+balances can establish the number of payments even when a movement has only
+a booking date. A payment without a reported booking date can use the ledger
+day established by the surrounding statement. A proven booking date replaces
+a fallback on an unassigned payment in open periods and uses the exchange rate
+for the booking day. For assigned payments and closed periods, **Banking** flags
+changes to the period or conversion date for review.
 If the statement proves an additional payment on a known booking date and
 leaves its bank reference unresolved, **Zahlungen** shows it once as an open
 payment. Check the statement before assigning it. The import leaves the
 reference, counterparty and category of that payment open.
 Compatible versions, including copies with missing dates or a changed lookup
 ID, contribute to the balance check without deciding the reference. A proven
-correction keeps the existing payment and its posting date. If the balances
-support different totals, check the statement before adding another payment.
+reference correction keeps the existing payment and its posting date. If the
+balances support different totals, check the statement before adding another payment.
 **Zahlungen** shows a possible unbooked amount separately when the statement
 cannot establish its existence. It contributes to neither the booked count nor
 the gross or net totals. A later verified opening balance can confirm or clear
