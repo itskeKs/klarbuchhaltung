@@ -2638,6 +2638,108 @@ def test_overlapping_reply_reuses_only_witnesses_from_the_proven_statement(sandb
             )
 
 
+@pytest.mark.parametrize("shape", [
+    "combined", "reversed", "split", "full", "mixed", "selected", "unplaced sibling",
+    "contradictory sibling", "shared checkpoint", "older proofs",
+])
+def test_overlapping_reply_places_each_confirmed_statement_independently(sandbox, shape):
+    import core
+
+    def statement(offset, opening_balance, label):
+        def day(value):
+            return (date.fromisoformat(value) + timedelta(days=offset)).isoformat()
+
+        rows = ambiguous_reference_statement()
+        for row in rows:
+            row.update(booking_date=day("2026-11-30"), value_date=day(row["value_date"]),
+                       transaction_date=day(row["transaction_date"]))
+            for field in ("entry_reference", "transaction_id", "reference_number"):
+                row[field] += label
+            if balance := row["balance_after_transaction"]:
+                row["balance_after_transaction"] = balance | {"amount": str(int(balance["amount"]) + opening_balance)}
+            row["remittance_information"] = [f"{row['remittance_information'][0]} {label}"]
+        rows[-1]["booking_date"] = day("2026-12-01")
+        opening = rows[1] | dict.fromkeys(("booking_date", "value_date", "transaction_date"), day("2026-10-31")) | {
+            "entry_reference": f"opening-{label}", "reference_number": f"opening-{label}", "transaction_id": f"opening-{label}",
+            "remittance_information": [f"Opening {label}"],
+        }
+        placed = rows[3] | {"booking_date": day("2026-12-01")}
+        rows[3]["booking_date"] = None
+        return [opening, *rows], placed
+
+    first, one = statement(-153, 0, "A")
+    second, two = statement(0, 205, "B")
+    if shape == "shared checkpoint":
+        second[0] = first[-1]
+    unrelated = two | dict.fromkeys(("booking_date", "value_date", "transaction_date"), "2026-12-02") | {
+        "entry_reference": "different", "transaction_id": "different", "reference_number": "different",
+        "remittance_information": ["Unrelated payment"],
+        "transaction_amount": {"amount": "7", "currency": "EUR"},
+        "balance_after_transaction": {"amount": "417", "currency": "EUR"},
+    }
+    with closing(core.db()) as ledger:
+        def sync(page, selected=None):
+            assessments = []
+            rows, _ = transaction_rows("account-a", page, assessments=assessments, ledger=ledger if selected is None else None)
+            if selected is not None:
+                rows = [row for row in rows if row["description"] in selected]
+            return core.import_bank_rows(ledger, rows, require_fx=True, auto_match=False, assessments=assessments)["imported"]
+
+        assert sync(first) == 6
+        assert sync(second) == (5 if shape == "shared checkpoint" else 6)
+        notices = [(row["date"], row["state"], row["amount"]) for row in core.pending_bank_statement_amounts(ledger)]
+        assert len(notices) == 2 and all(row[1:] == ("unplaced", 119) for row in notices)
+        saved = [tuple(row) for row in ledger.execute(
+            "SELECT id, ref, date FROM transactions WHERE description IN ('Rent A', 'Rent B') ORDER BY id",
+        )]
+        assert len(saved) == 2
+        for id_, _, _ in saved:
+            core.set_tx_category(ledger, id_, "einnahme_sonstige", "Checked payment")
+        if shape == "older proofs":
+            ledger.execute("UPDATE bank_statement_assessments SET details = json_remove(details, '$.overlap')")
+
+        selected = None
+        expected = 2
+        if shape == "split":
+            assert sync([one]) == 1
+            page, expected = [two], 1
+        elif shape == "reversed":
+            page = [two, one]
+        elif shape == "full":
+            page = [*first[:4], one, *first[5:], *second[:4], two, *second[5:]]
+        elif shape == "mixed":
+            page = [one, *(two if index == 4 else row for index, row in enumerate(second)), unrelated]
+            expected = 3
+        elif shape == "selected":
+            page, selected = [one, two, unrelated], {"Supplies A"}
+            expected = 1
+        elif shape == "unplaced sibling":
+            page, expected = [one, second[4]], 1
+        elif shape == "contradictory sibling":
+            page, expected = [one, two, two | {"booking_date": "2026-11-30"}], 1
+        elif shape == "shared checkpoint":
+            page = [one, first[-1], two]
+        else:
+            page = [one, two]
+        assert sync(page, selected) == expected
+        assert sync(page[::-1], selected) == 0
+        assert sync([first[4], second[4]]) == 0
+        unresolved = shape in {"selected", "unplaced sibling", "contradictory sibling"}
+        assert [(row["date"], row["state"], row["amount"]) for row in core.pending_bank_statement_amounts(ledger)] == (
+            notices[1:] if unresolved else []
+        )
+        monthly = [tuple(row) for row in ledger.execute(
+            "SELECT substr(date,1,7),count(*),sum(amount) FROM transactions WHERE substr(date,1,7) "
+            "IN ('2026-06','2026-07','2026-11','2026-12') GROUP BY 1 ORDER BY 1",
+        )]
+        december = (1, -10) if unresolved else (3, 116) if shape == "mixed" else (2, 109)
+        assert monthly == [("2026-06", 4, 96), ("2026-07", 2, 109), ("2026-11", 4, 96), ("2026-12", *december)]
+        for booking in saved:
+            assert tuple(ledger.execute("SELECT id,ref,date,category,note FROM transactions WHERE id=?", (booking[0],)).fetchone()) == (
+                *booking, "einnahme_sonstige", "Checked payment",
+            )
+
+
 @pytest.mark.parametrize("changed", ["fee", "later rent"])
 @pytest.mark.parametrize("sign", [-1, 1])
 @pytest.mark.parametrize("same_day", [False, True])

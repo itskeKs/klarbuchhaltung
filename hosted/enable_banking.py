@@ -1987,12 +1987,8 @@ def _separate_unresolved_references(account_key, drafts, trace=False):
     for index, row in enumerate(drafts):
         if index in excluded:
             continue
-        row["_statement_sources"] = frozenset((len(retained),))
-        row.pop("_statement_evidence", None)
-        row.pop("_statement_capacity", None)
         retained.append(row)
-    _link_repeated_statement_sources(retained)
-    _mark_statement_capacity(retained)
+    _prepare_statement_sources(retained)
     return retained, neutral, warnings, assessments
 
 
@@ -2035,6 +2031,16 @@ def _overlap_same_report(current, previous):
         or (current["provider_ref"] and current["provider_ref"] == old.provider_ref
             and core._stored_secondary_match(current, old) is True)
     )
+
+
+@dataclass
+class _StatementOverlap:
+    members: frozenset
+    matched: frozenset
+    checkpoints: frozenset
+    context: list
+    counts: tuple
+    proof: dict
 
 
 def _overlap_proof_rows(conn, account_key, amount, currency, details, drafts):
@@ -2089,14 +2095,27 @@ def _overlap_proof_rows(conn, account_key, amount, currency, details, drafts):
     booked = {row["booked_day"] for row in matching if row["booked_day"]}
     if len(booked) != 1:
         return None
+    matched = frozenset(row["_report_index"] for row in matching)
+    members = matched | {row["_report_index"] for row in current if lower <= row["date"] <= upper}
+    known_reports = [(report, _overlap_booking(report[1])) for report in reports]
+
+    def checkpoint(row):
+        # Outside the period, only a report linked to a saved witness can
+        # inform this proof. A different payment on that day is independent.
+        return any(_overlap_same_report(row, report) or (
+            row["_amount_key"] == report[0] and row["provider_ref"] and row["provider_ref"] == old.provider_ref
+            and core._stored_secondary_match(row, old) is True
+        ) for report, old in known_reports)
+
+    checkpoints = frozenset(row["_report_index"] for row in current if row["_report_index"] not in members and checkpoint(row))
+    current = [row for row in current if row["_report_index"] in members or row["_report_index"] in checkpoints]
     known = {key: Decimal(value) for key, value in details.get("balances", ())}
     missing = {key for _, facts in reports if (key := _overlap_booking(facts).balance_key)} - known.keys()
     if missing:
         known.update(_recover_legacy_statement_balances(currency, current, missing,
                      witnessed_amounts={Decimal(signed) for signed, _ in reports}))
     anchored = []
-    for report in reports:
-        old = _overlap_booking(report[1])
+    for report, old in known_reports:
         if any(_overlap_same_report(row, report) for row in current):
             continue
         if old.balance_key and old.balance_key not in known:
@@ -2119,8 +2138,9 @@ def _overlap_proof_rows(conn, account_key, amount, currency, details, drafts):
             "_remittance": (), "_statement_balance": (currency, known[old.balance_key]) if old.balance_key else None,
             "_statement_context": True,
         })
-    overlap = {"bounds": bounds, "sparse": sparse, "reports": reports}
-    return {id(row) for row in matching}, anchored, (3, 4) if details.get("remainder") else (3,), overlap
+    return _StatementOverlap(members, matched, checkpoints, anchored,
+                             (3, 4) if details.get("remainder") else (3,),
+                             {"bounds": bounds, "sparse": sparse, "reports": reports})
 
 
 def _verified_statement_balance(row, candidates):
@@ -2217,25 +2237,20 @@ class _StatementFetch:
             drafts.append(row | {"bank_groups": row["bank_groups"].copy(), "prior_refs": row["prior_refs"].copy()})
         overlaps = [overlap for state, amount, currency, details in saved if state in {"unplaced", "confirmed"}
                     and (overlap := _overlap_proof_rows(conn, self.account_key, amount, currency, details, drafts))]
-        if len(overlaps) == 1:
-            matched, context, floor, overlap = overlaps[0]
-            for row in drafts:
-                if id(row) in matched:
-                    row["_statement_overlap_floor"] = floor
-                    row["_statement_replay_overlap"] = overlap
-            for row in context:
-                row["_statement_sources"] = frozenset((len(drafts),))
-                row["_report_index"] = -1 - len(drafts)
-                drafts.append(row)
-            return drafts
-        return drafts if has_balances else None
+        # A real correction must belong to one statement. A checkpoint
+        # outside its period can witness more than one independently.
+        claims = Counter(index for overlap in overlaps for index in overlap.members)
+        independent = [overlap for overlap in overlaps if all(claims[index] == 1 for index in overlap.members)]
+        return (drafts, independent) if has_balances or independent else None
 
     def restore(self, conn, selected):
-        drafts = self.corrected_drafts(conn)
-        if drafts is None:
+        correction = self.corrected_drafts(conn)
+        if correction is None:
             return None
+        drafts, overlaps = correction
         assessments = []
-        rows, _ = _map_statement_drafts(self.account_key, drafts, self.skipped, assessments, trace=True)
+        rows, _ = _map_statement_drafts(self.account_key, drafts, self.skipped, assessments, trace=True,
+                                        overlaps=overlaps)
         if self.original.keys() <= selected:
             return rows, assessments
 
@@ -2253,7 +2268,9 @@ class _StatementFetch:
 
         def selected_statement(row):
             subjects = row["_statement_subject_reports"]
-            return all(reports & allowed for reports in subjects) and not any(
+            selected = [bool(reports & allowed) for reports in subjects]
+            return any(selected) and all(included or (reports and max(reports) < 0)
+                                         for included, reports in zip(selected, subjects)) and not any(
                 all(left & right for left, right in zip(subjects, prior)) for prior in withheld
             )
 
@@ -2379,14 +2396,17 @@ def transaction_rows(account_key, transactions, *, assessments=None, ledger=None
         row["prior_refs"] = list(dict.fromkeys(prior_refs))
         drafts.append(row)
     source = None
+    overlaps = ()
     if drafts:
         if ledger is not None:
-            drafts = _StatementFetch(account_key, drafts, skipped).corrected_drafts(ledger) or drafts
+            if correction := _StatementFetch(account_key, drafts, skipped).corrected_drafts(ledger):
+                drafts, overlaps = correction
         elif assessments is not None:
             snapshot = [row | {"bank_groups": row["bank_groups"].copy(), "prior_refs": row["prior_refs"].copy()} for row in drafts]
             source = _StatementFetch(account_key, snapshot, skipped)
     assessment_start = len(assessments) if source is not None else 0
-    rows, skipped = _map_statement_drafts(account_key, drafts, skipped, assessments, trace=source is not None)
+    rows, skipped = _map_statement_drafts(account_key, drafts, skipped, assessments,
+                                         trace=source is not None, overlaps=overlaps)
     if source is not None:
         for assessment in assessments[assessment_start:]:
             assessment["_statement_fetch"] = source
@@ -2396,18 +2416,50 @@ def transaction_rows(account_key, transactions, *, assessments=None, ledger=None
     return rows, skipped
 
 
-def _map_statement_drafts(account_key, drafts, skipped, assessments, trace=False):
+def _prepare_statement_sources(drafts):
+    for index, row in enumerate(drafts):
+        row["_statement_sources"] = frozenset((index,))
+        row.pop("_statement_evidence", None)
+        row.pop("_statement_capacity", None)
     _link_repeated_statement_sources(drafts)
     _mark_statement_capacity(drafts)
-    drafts, neutral, review_warnings, statement_assessments = _separate_unresolved_references(account_key, drafts, trace)
-    if any(row.get("_statement_context") for row in drafts):
-        drafts = [row for row in drafts if not row.get("_statement_context")]
-        for index, row in enumerate(drafts):
-            row["_statement_sources"] = frozenset((index,))
-            row.pop("_statement_evidence", None)
-            row.pop("_statement_capacity", None)
-        _link_repeated_statement_sources(drafts)
-        _mark_statement_capacity(drafts)
+
+
+def _separate_overlapping_statements(account_key, drafts, overlaps, trace):
+    """Evaluate retained proofs independently, then return one set of live reports."""
+    by_index = {row["_report_index"]: row for row in drafts}
+    batches = []
+    claimed = set()
+    for overlap in overlaps:
+        witnesses = [by_index[index] | {"_statement_context": True} for index in sorted(overlap.checkpoints)]
+        for index, row in enumerate((*witnesses, *overlap.context), 1):
+            row["_report_index"] = -index
+        marker = {"_statement_overlap_floor": overlap.counts, "_statement_replay_overlap": overlap.proof}
+        members = [by_index[index] | marker if index in overlap.matched else by_index[index]
+                   for index in sorted(overlap.members)]
+        batches.append([*members, *witnesses, *overlap.context])
+        claimed.update(overlap.members)
+    batches.append([row for row in drafts if row["_report_index"] not in claimed])
+    retained, neutral, assessments = [], [], []
+    warnings = 0
+    for batch in batches:
+        _prepare_statement_sources(batch)
+        rows, reviews, skipped, decisions = _separate_unresolved_references(account_key, batch, trace)
+        retained.extend(row for row in rows if not row.get("_statement_context"))
+        neutral.extend(reviews)
+        assessments.extend(decisions)
+        warnings += skipped
+    retained.sort(key=lambda row: row["_report_index"])
+    _prepare_statement_sources(retained)
+    return retained, neutral, warnings, assessments
+
+
+def _map_statement_drafts(account_key, drafts, skipped, assessments, trace=False, overlaps=()):
+    if overlaps:
+        drafts, neutral, review_warnings, statement_assessments = _separate_overlapping_statements(account_key, drafts, overlaps, trace)
+    else:
+        _prepare_statement_sources(drafts)
+        drafts, neutral, review_warnings, statement_assessments = _separate_unresolved_references(account_key, drafts, trace)
     if assessments is not None:
         assessments.extend(statement_assessments)
     else:
