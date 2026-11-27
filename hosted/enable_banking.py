@@ -2143,7 +2143,8 @@ def _overlap_proof_rows(conn, account_key, amount, currency, details, drafts):
                              {"bounds": bounds, "sparse": sparse, "reports": reports})
 
 
-def _verified_statement_balance(row, candidates):
+def _verified_statement_observation(row, candidates):
+    """Reuse facts shared by the corroborating stored observations."""
     matches = set()
     for old in candidates:
         if not old.balance_key or core._bank_facts_conflict(row, old):
@@ -2152,12 +2153,16 @@ def _verified_statement_balance(row, candidates):
         if shared_dates is False:
             continue
         if shared_dates is True and row["provider_ref"] and row["provider_ref"] == old.provider_ref:
-            matches.add((old.balance_key, old.value_day, old.transaction_day))
+            matches.add(old)
         elif core._bank_economic_replay(row, old._asdict()):
-            matches.add((old.balance_key, old.value_day, old.transaction_day))
-    if len(matches) == 1:
-        return next(iter(matches))[0]
-    return None
+            matches.add(old)
+    if len({(old.balance_key, old.value_day, old.transaction_day) for old in matches}) != 1:
+        return {}
+    fields = {"balance_key": next(iter(matches)).balance_key}
+    days = {old.booked_day for old in matches}
+    if len(days) == 1 and (day := next(iter(days))):
+        fields["booked_day"] = day
+    return fields
 
 
 def _recover_legacy_statement_balances(currency, reports, fingerprints, *, witnessed_amounts=()):
@@ -2540,6 +2545,7 @@ class _StatementFetch:
             if key and (index in witnessed or row.get("_fetch_page") is not None):
                 current_balances[row["currency"], row["_amount_key"], key].append(row)
         sources = {}
+        source_days = {}
         pending_counts = {}
         missing = defaultdict(set)
         for index, row in enumerate(self.drafts):
@@ -2556,7 +2562,10 @@ class _StatementFetch:
                 continue
             candidates = core._bank_statement_group_bookings(conn, groups)
             candidates.update(option for group in groups for option in alternatives[group])
-            if key := witnessed.get(index, (None, {}))[1].get("balance_key") or _verified_statement_balance(row, candidates):
+            fields = witnessed.get(index, (None, {}))[1]
+            if not fields.get("balance_key"):
+                fields = _verified_statement_observation(row, candidates) | fields
+            if key := fields.get("balance_key"):
                 currency = row["currency"]
                 # A balance belongs to the corroborated observation. Do not
                 # also infer it for another copy whose balance is unknown.
@@ -2566,6 +2575,7 @@ class _StatementFetch:
                        for other in current_balances[currency, row["_amount_key"], key]):
                     continue
                 sources[index] = currency, key
+                source_days[index] = fields.get("booked_day")
                 if key not in known[currency]:
                     missing[currency].add(key)
         for currency, fingerprints in missing.items():
@@ -2579,6 +2589,13 @@ class _StatementFetch:
             currency, key = sources.get(index, (row["currency"], None))
             if key in known[currency]:
                 row = row | {"_statement_balance": (currency, known[currency][key]), "balance_key": key}
+                # Keep the corroborated checkpoint on its known BOOK day.
+                # Reusing only its balance would introduce an undated witness
+                # that can invalidate an otherwise closed occurrence proof.
+                if not row["booked_day"] and (day := source_days.get(index)):
+                    group = fingerprint(self.account_key, day, row["_amount_key"], currency)
+                    row |= {"date": day, "booked_day": day, "bank_group": group,
+                            "bank_groups": row["bank_groups"] | {day: group}}
             if index in witnessed:
                 ref, fields = witnessed[index]
                 dated = {field: fields[field] for field in _STATEMENT_DATE_FIELDS if field in fields and not row[field]}
