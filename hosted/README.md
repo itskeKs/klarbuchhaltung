@@ -138,6 +138,9 @@ the bank revises a reference or supplies a previously missing balance.
 Independent earlier and later balances can establish the payment count
 when each repeated report omits its own balance. A complete replay can
 reuse corroborated balances from the same account if the bank omits them.
+A checkpoint on the same booking day can prove a minimum while leaving
+another payment possible after that checkpoint. A later closing balance
+can resolve the remaining amount, and a weaker replay keeps that resolution.
 Receiving the same observations on one page or several pages leaves the booked
 amount unchanged. If the statement establishes both the amount and its purpose,
 **Zahlungen** shows the observed purpose.

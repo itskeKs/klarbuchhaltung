@@ -2204,10 +2204,31 @@ def _joint_replay_rank(row, groups, old, booked, *, subject):
     # description and typed dates still identify it in a complete replay.
     if (not subject and not row["balance_key"] and (not row["provider_ref"] or row["provider_ref"] == old.provider_ref)
             and row["booked_day"] and row["booked_day"] == old.booked_day
-            and all(row[field] and row[field] == getattr(old, field) for field in _SECONDARY_BANK_DATES)
+            and core._stored_secondary_match(row, old) is not False
             and core._bank_description_matches(row, booked) and not core._bank_facts_conflict(row, old)):
         return 2
     return None
+
+
+def _joint_replay_matches(choices):
+    """Return assignments that every complete matching must contain."""
+    def assign(omitted=None):
+        matched = {}
+
+        def place(member, seen):
+            for index in sorted(choices[member]):
+                if index in seen or omitted == (member, index):
+                    continue
+                seen.add(index)
+                if index not in matched or place(matched[index], seen):
+                    matched[index] = member
+                    return True
+            return False
+
+        return matched if all(place(member, set()) for member in range(len(choices))) else {}
+
+    return {index: member for index, member in assign().items()
+            if len(choices[member]) == 1 or not assign((member, index))}
 
 
 def _joint_replay_evidence(conn, account, first, last, drafts):
@@ -2226,7 +2247,7 @@ def _joint_replay_evidence(conn, account, first, last, drafts):
     for index, row in enumerate(drafts):
         for group in row["bank_groups"].values():
             candidates[row["currency"], group].append(index)
-    evidence, balances = defaultdict(set), defaultdict(dict)
+    evidence, balances = defaultdict(list), defaultdict(dict)
     checked = set()
     for currency, encoded in saved:
         for proof in core._joint_evidence_versions(json.loads(encoded)):
@@ -2237,7 +2258,7 @@ def _joint_replay_evidence(conn, account, first, last, drafts):
                 continue
             checked.add(identity)
             subjects = {group for groups, _ in proof["observations"] for group in groups}
-            covered = {}
+            choices, bookings = [], []
             for groups, facts in members:
                 scope = tuple(groups)
                 if scope not in recorded:
@@ -2257,17 +2278,30 @@ def _joint_replay_evidence(conn, account, first, last, drafts):
                 if not ranked:
                     break
                 best = min(priority for priority, _ in ranked)
-                matches = [index for priority, index in ranked if priority == best]
-                if len(matches) != 1 or matches[0] in covered:
-                    break
-                covered[matches[0]] = booking.ref, old.balance_key
+                choices.append([index for priority, index in ranked if priority == best])
+                bookings.append(old._replace(ref=booking.ref))
             else:
-                if sum(bool(key) for _, key in covered.values()) < 2:
+                covered = _joint_replay_matches(choices)
+                if sum(bool(bookings[member].balance_key) for member in covered.values()) < 2:
                     continue
                 balances[currency].update((key, Decimal(value)) for key, value in joint.get("balances", ()))
-                for index, facts in covered.items():
-                    evidence[index].add(facts)
-    return {index: next(iter(matches)) for index, matches in evidence.items() if len(matches) == 1}, balances
+                for index, member in covered.items():
+                    previous = bookings[member]
+                    row = drafts[index]
+                    if core._stored_secondary_match(row, previous) is not False:
+                        evidence[index].append(previous)
+
+    witnessed = {}
+    for index, versions in evidence.items():
+        if len({old.ref for old in versions}) != 1:
+            continue
+        fields = ("balance_key", *_STATEMENT_DATE_FIELDS)
+        # Different saved versions can be complementary. A conflict on a
+        # typed field supplies no replacement for an omitted observation.
+        available = {field: next(iter(values)) for field in fields
+                     if len(values := {getattr(old, field) for old in versions if getattr(old, field)}) == 1}
+        witnessed[index] = versions[0].ref, available
+    return witnessed, balances
 
 
 @dataclass(eq=False)
@@ -2313,7 +2347,7 @@ class _StatementFetch:
                     pending_pages[group].append((index, details["occurrences"][1], sparse_days, signed_edge, options))
         current_balances = defaultdict(list)
         for index, row in enumerate(self.drafts):
-            key = row["balance_key"] if _reported_balance(row) else witnessed.get(index, (None, None))[1]
+            key = row["balance_key"] if _reported_balance(row) else witnessed.get(index, (None, {}))[1].get("balance_key")
             if key and (index in witnessed or row.get("_fetch_page") is not None):
                 current_balances[row["currency"], row["_amount_key"], key].append(row)
         sources = {}
@@ -2331,7 +2365,7 @@ class _StatementFetch:
                 continue
             candidates = core._bank_statement_group_bookings(conn, groups)
             candidates.update(option for group in groups for option in alternatives[group])
-            if key := witnessed.get(index, (None, None))[1] or _verified_statement_balance(row, candidates):
+            if key := witnessed.get(index, (None, {}))[1].get("balance_key") or _verified_statement_balance(row, candidates):
                 currency = row["currency"]
                 # A balance belongs to the corroborated observation. Do not
                 # also infer it for another copy whose balance is unknown.
@@ -2355,7 +2389,12 @@ class _StatementFetch:
             if key in known[currency]:
                 row = row | {"_statement_balance": (currency, known[currency][key]), "balance_key": key}
             if index in witnessed:
-                row = row | {"_confirmed_reference_aliases": {witnessed[index][0]}}
+                ref, fields = witnessed[index]
+                dated = {field: fields[field] for field in _STATEMENT_DATE_FIELDS if field in fields and not row[field]}
+                groups = {day: fingerprint(self.account_key, day, row["_amount_key"], row["currency"]) for day in dated.values()}
+                row = row | dated | {"_confirmed_reference_aliases": {ref}, "bank_groups": row["bank_groups"] | groups}
+                if day := dated.get("booked_day"):
+                    row |= {"date": day, "bank_group": groups[day]}
             if index in pending_counts:
                 count, sparse_days, signed_edge = pending_counts[index]
                 row = row | {"_pending_page_count": count, "_pending_sparse_days": sparse_days, "_pending_signed_edge": signed_edge}
@@ -3129,18 +3168,18 @@ def _joint_balance_proofs(families, account_by_currency):
             peers = [row for row in account_by_currency[currency] if row["_report_index"] in window - subjects]
             if not any(_reported_balance(row) for row in peers):
                 continue
+            bounded = len(window) <= _STATEMENT_PLACEMENT_BUDGET
+            witnesses = [copies[0] for copies in _balance_witness_groups(peers, currency)] if bounded else peers
             subject_rows = [row for family in connected for row in family.reports]
             if not any(_reported_balance(row) for row in subject_rows):
                 # The subjects can all lack their own balances. Independent
                 # dated checkpoints must still bracket the possible postings.
                 days = [row["booked_day"] for row in subject_rows]
-                checkpoints = [row["booked_day"] for row in peers if row["booked_day"] and _reported_balance(row)]
-                if not all(days) or not checkpoints or not min(checkpoints) < min(days) <= max(days) < max(checkpoints):
+                checkpoints = [row["booked_day"] for row in witnesses if row["booked_day"] and _reported_balance(row)]
+                if not all(days) or len(checkpoints) < 2 or not min(checkpoints) <= min(days) <= max(days) <= max(checkpoints):
                     continue
-            witnesses = []
             decisions = None
-            if len(window) <= _STATEMENT_PLACEMENT_BUDGET:
-                witnesses = [copies[0] for copies in _balance_witness_groups(peers, currency)]
+            if bounded:
                 decisions = _joint_balance_window(connected, witnesses, currency)
             if decisions and decisions[0]:
                 for subject, supported, selection in decisions[0]:

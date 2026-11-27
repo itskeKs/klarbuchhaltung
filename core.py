@@ -3188,7 +3188,7 @@ def _store_joint_evidence(conn, slots, assessments, snapshot, details):
         conn.execute("UPDATE bank_statement_assessments SET details=? WHERE review_key=?", (json.dumps(saved), key))
 
 
-def _joint_statement_has_closing_bound(rows, account, currency, dates):
+def _joint_statement_has_closing_bound(rows, account, currency, dates, *, surplus=Decimal(0)):
     """Check a closed interval that contains every possible surplus day."""
     opening, closing = defaultdict(set), defaultdict(set)
     movements = defaultdict(list)
@@ -3209,7 +3209,7 @@ def _joint_statement_has_closing_bound(rows, account, currency, dates):
     if not before or not after:
         return False
     inside = [entry for day, entries in movements.items() if before < day < after for entry in entries]
-    return all(ref for _, ref in inside) and sum(amount for amount, _ in inside) == (
+    return all(ref for _, ref in inside) and sum(amount for amount, _ in inside) + surplus == (
         next(iter(opening[after])) - next(iter(closing[before]))
     )
 
@@ -3338,8 +3338,14 @@ def _restore_joint_bank_reviews(conn, rows, assessments):
         prior_bounds = [entry["joint"]["closed_upper"] for entry in (
             *(slot[-1] for slot in slots), *stored.values(),
         ) if "closed_upper" in entry["joint"]]
-        if verified and not incoming and _joint_statement_has_closing_bound(named, joint["account_key"], currency, dates):
-            _store_joint_upper_bound(conn, slots, stored, verified)
+        current_bound = joint.get("minimum") if incoming else verified
+        complete_count = current_bound and (not incoming or current_bound == joint["maximum"])
+        closed = complete_count and _joint_statement_has_closing_bound(
+            named, joint["account_key"], currency, dates,
+            surplus=Decimal(str(amount)) * current_bound if incoming else Decimal(0),
+        )
+        if closed:
+            _store_joint_upper_bound(conn, slots, stored, current_bound)
             maximum = minimum
         elif prior_bounds:
             maximum = max(minimum, min(maximum, *prior_bounds))
@@ -3386,6 +3392,8 @@ def _restore_joint_bank_reviews(conn, rows, assessments):
             review = next((row for row in free_templates if row["ref"] == key), None)
             review = review or _joint_statement_template(scope, number, details, dates, currency, amount)
             review = review | {"_statement_remainder": False}
+            if closed:
+                review["_statement_joint"] = review["_statement_joint"] | {"closed_upper": current_bound}
             if review["state"] == "confirmed":
                 additions.append(review)
             else:
