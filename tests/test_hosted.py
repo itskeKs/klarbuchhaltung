@@ -2205,6 +2205,67 @@ def test_bank_revision_waits_for_witnesses_before_booking_an_unresolved_named_pa
         assert core.pending_bank_statement_amounts(ledger) == []
 
 
+@pytest.mark.parametrize("sign", [-1, 1])
+@pytest.mark.parametrize("earlier_missing_balance", [None, "Service", "ATM"])
+@pytest.mark.parametrize("omissions", [
+    {name: fields}
+    for name in ("Opening", "Rent", "Late", "Service", "ATM", "Extra", "Closing")
+    for fields in (("booking_date",), ("balance_after_transaction",), ("entry_reference",),
+                   ("booking_date", "value_date", "transaction_date"))
+] + [
+    {"Opening": ("booking_date",), name: ("balance_after_transaction",)}
+    for name in ("Service", "ATM", "Extra")
+] + [
+    {name: ("booking_date",), "Service": ("entry_reference", "balance_after_transaction")}
+    for name in ("Rent", "Late", "Closing")
+])
+def test_bank_revision_conserves_occurrences_when_optional_evidence_disappears(sandbox, sign, omissions, earlier_missing_balance):
+    import core
+
+    prior, complete = _bank_late_fee_history(sign)
+    prior = [row | {"balance_after_transaction": None} if row["remittance_information"] == [earlier_missing_balance]
+             else row for row in prior]
+    partial = [row | dict.fromkeys(omissions.get(row["remittance_information"][0], ())) for row in complete]
+    with closing(core.db()) as ledger:
+        assert _sync_bank_pages(ledger, [prior]) == (3 if earlier_missing_balance == "ATM" else 4)
+        original = {row["id"]: tuple(row) for row in ledger.execute(
+            "SELECT id,ref,date,description FROM transactions ORDER BY id",
+        )}
+        for ident in original:
+            core.set_tx_category(ledger, ident, "gebuehr", f"Assigned {ident}")
+        for phase, reply in enumerate((partial, partial[::-1], complete, complete[::-1], prior, complete)):
+            reply = [row | {"transaction_id": f"observation-{phase}-{index}"} for index, row in enumerate(reply)]
+            _sync_bank_pages(ledger, [reply[:4], reply[4:]] if len(reply) > 4 else [reply])
+            counts = dict(ledger.execute("SELECT description,count(*) FROM transactions GROUP BY description"))
+            assert all(counts.get(name, 0) <= 1 for name in ("Opening", "Rent", "Late", "Service", "ATM", "Extra", "Closing"))
+            assert ledger.execute("SELECT count(*) FROM transactions WHERE abs(amount)=23").fetchone()[0] <= 3
+            assert {row["id"]: tuple(row) for row in ledger.execute(
+                "SELECT id,ref,date,description FROM transactions WHERE category='gebuehr' ORDER BY id",
+            )} == original
+            assert all(row["note"] == f"Assigned {row['id']}" for row in ledger.execute(
+                "SELECT id,note FROM transactions WHERE category='gebuehr'",
+            ))
+            if phase >= 2:
+                assert tuple(ledger.execute("SELECT count(*),sum(amount) FROM transactions").fetchone()) == (7, sign * 125)
+                assert set(counts) == {"Opening", "Rent", "Late", "Service", "ATM", "Extra", "Closing"}
+                assert core.pending_bank_statement_amounts(ledger) == []
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+@pytest.mark.parametrize("omissions", [
+    {"ATM": ("booking_date", "value_date", "transaction_date")},
+    {"Opening": ("booking_date",), "Service": ("balance_after_transaction",)},
+    {"Opening": ("booking_date",), "ATM": ("balance_after_transaction",)},
+])
+def test_bank_revision_keeps_identified_witnesses_before_reducing_copies(sandbox, sign, omissions):
+    import core
+
+    prior, complete = _bank_late_fee_history(sign)
+    partial = [row | dict.fromkeys(omissions.get(row["remittance_information"][0], ())) for row in complete]
+    with closing(core.db()) as ledger:
+        _verify_late_fee_replay(ledger, prior, partial, complete, sign)
+
+
 @pytest.mark.parametrize("shape", ["undated tail", "dense days", "long trail", "unreferenced fee", "undated rent", "undated fee"])
 def test_bank_balance_revision_uses_the_evidenced_interval(sandbox, shape):
     import core

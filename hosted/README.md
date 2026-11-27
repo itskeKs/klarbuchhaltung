@@ -113,6 +113,13 @@ reference can identify a report even when another copy omits it. A short sync th
 amended report against the established booking flags it for review and
 preserves the original amount and assignment. Updated bank descriptions
 can still corroborate an earlier statement when the monetary facts agree.
+Valid signed observations remain available to the comparison before overlapping
+copies are reduced, including an identified payment whose dates disappear from
+a reply. The verified statement can reuse that payment's known date or establish
+a missing balance without changing its assignment. A consumed matching candidate
+or missing evidence does not establish another payment. An additional occurrence
+needs independent evidence; unresolved replies can wait for a fuller statement
+without making the later reconciliation post the established payments again.
 After the bank establishes a payment's booking month, replays of its confirmed
 reports can use the same statement evidence even if the fetch only covers that month.
 Previously confirmed movements on that day can also help check a new report

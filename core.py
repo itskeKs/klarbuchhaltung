@@ -2005,7 +2005,11 @@ def _bank_named_revision_candidate(row, old):
 
 
 def _bank_revision_candidate(row, old):
-    return _bank_balance_only_difference(row, old) or _bank_named_revision_candidate(row, old)
+    undated = (not any(row[field] for field in ("booked_day", *_BANK_SECONDARY_DATES))
+               and row["provider_ref"] and row["provider_ref"] == old.provider_ref
+               and _bank_description_matches(row, old)
+               and not _bank_facts_conflict(row | {"balance_key": old.balance_key}, old))
+    return bool(undated or _bank_balance_only_difference(row, old) or _bank_named_revision_candidate(row, old))
 
 
 def _bank_secondary_match(first, second):
@@ -2257,6 +2261,7 @@ def _bank_matches(conn, rows):
     posting_conflicts = set()
     corrections = {}
     amended_observations = set()
+    uncertain_revisions = {}
     proven_matches = {}
     revised = {row["_bank_balance_revision"]: row["ref"] for row in bank_rows if row.get("_bank_balance_revision")}
     unconfirmed_payers = defaultdict(list)
@@ -2282,6 +2287,8 @@ def _bank_matches(conn, rows):
                 candidates.add(existing)
                 break
             ref = _occupied_bank_reference(ref, row)
+        possible_revisions = {old.ref for old in candidates if _bank_revision_candidate(row, old)
+                              and row["balance_key"] != old.balance_key}
         candidates = {old for old in candidates if revised.get(old.ref, row["ref"]) == row["ref"]}
         source_refs = _bank_source_refs(row, candidates)
         observed_refs = _bank_observed_secondary_refs(row, by_day)
@@ -2290,6 +2297,8 @@ def _bank_matches(conn, rows):
             old.ref for old in candidates if _bank_facts_conflict(row, old)
             and (_bank_economic_replay(row, old._asdict()) or _bank_named_revision_candidate(row, old))
         }
+        if possible_revisions and not row.get("_bank_new_occurrence"):
+            uncertain_revisions[row["ref"]] = possible_revisions
         if not row.get("_statement_edge_occurrence") and any(
             (old.balance_key == row["balance_key"] and _stored_secondary_match(row, old) is False
              and not _bank_description_matches(row, old))
@@ -2360,6 +2369,20 @@ def _bank_matches(conn, rows):
     ambiguous.update(ref for ref, candidates in corrections.items() if ref not in matched and (
         candidates - used or ref in amended_observations
     ))
+    reports = {row["ref"]: row for row in bank_rows}
+    assigned = {old: reports[ref] for ref, old in matched.items()}
+    for ref, candidates in uncertain_revisions.items():
+        if ref in matched:
+            continue
+        row = reports[ref]
+        # A reused reference with a different independently established
+        # acquisition date can describe another payment. Consuming the old
+        # candidate alone is not evidence of that additional occurrence.
+        if any(old not in assigned or _bank_secondary_match(
+            (row[field] for field in _BANK_SECONDARY_DATES),
+            (assigned[old][field] for field in _BANK_SECONDARY_DATES),
+        ) is not False for old in candidates):
+            ambiguous.add(ref)
     storage_refs = {}
     reserved = set()
     known = {booking.ref: booking for candidates in (*by_day.values(), *by_alias.values()) for booking in candidates}
@@ -2377,7 +2400,15 @@ def _bank_matches(conn, rows):
                 if (old and proven_matches.get(source_ref) == old.ref and row["description"] != old.description
                         and all(text and text != "Bankumsatz" for text in (row["description"], old.description))):
                     ambiguous.add(source_ref)
-                _remember_bank_booking(conn, matched[source_ref], row)
+                remembered = row
+                if (old and not old.balance_key and source_ref in uncertain_revisions
+                        and row.get("_bank_balance_revision") != old.ref):
+                    # Preserve the earlier unknown checkpoint until the
+                    # amended statement is verified. Learning a later balance
+                    # here would turn a possible revision into an impossible
+                    # historical trail and prevent a fuller reply settling it.
+                    remembered = row | {"balance_key": None}
+                _remember_bank_booking(conn, matched[source_ref], remembered)
         elif source_ref not in ambiguous:
             ref = source_ref
             while ref in reserved or conn.execute("SELECT 1 FROM transactions WHERE ref = ?", (ref,)).fetchone():
@@ -3478,6 +3509,17 @@ def _bank_aligned_balance_revisions(conn, account, currency, current, prior, mat
             assignments = _bank_recover_revision_assignments(
                 conn, groups, recorded, matches, opening, currency, previous_family,
             )
+            # An incomplete earlier import can contain checkpoints on both
+            # sides of an unbooked movement. Its stored trail cannot balance
+            # yet. Exact occurrences in the current verified trail still
+            # establish the old members and any additional occurrence.
+            if not assignments:
+                stored_movements = {old.ref: (old, movement) for entries in recorded.values() for old, movement in entries}
+                anchors = _bank_revision_anchors(groups, stored_movements, matches)
+                for _, family, siblings in groups:
+                    known = {id(row): anchors[id(row)] for row in siblings if id(row) in anchors}
+                    if family <= set(known.values()):
+                        assignments.update((id(row), known.get(id(row))) for row in siblings)
             if not assignments:
                 continue
         else:
@@ -3618,6 +3660,9 @@ def _reconcile_bank_balance_revisions(conn, rows, assessments):
                             aligned = _bank_common_revision_matches(aligned, answer)
         aligned = aligned or {}
         aligned_rows.update(aligned)
+        for row in reports:
+            if id(row) in aligned and aligned[id(row)][0] is None:
+                revisions[id(row)] = {"_bank_new_occurrence": True}
         verified.update(id(row) for row in reports if id(row) in aligned
                         and row.get("_bank_account_key") and row.get("_bank_observed_balance"))
         candidates = defaultdict(list)
@@ -3637,7 +3682,7 @@ def _reconcile_bank_balance_revisions(conn, rows, assessments):
             for row in targets:
                 source = [(old, keys) for old, _, keys in matches[id(row)]]
                 known = {old.ref for old, keys in source if row["balance_key"] != old.balance_key and row["balance_key"] in keys}
-                inferred, by_name = None, False
+                inferred, ending, by_name = None, None, False
                 if id(row) in aligned:
                     ref, ending, by_name = aligned[id(row)]
                     known = {ref} if ref else set()
@@ -3647,11 +3692,12 @@ def _reconcile_bank_balance_revisions(conn, rows, assessments):
                     previous_balance = _bank_balance_hash(currency, row["_bank_observed_balance"][1] - delta)
                     known = {old.ref for old, keys in source if previous_balance in keys and row["balance_key"] not in keys}
                 if len(known) == 1 and (row["balance_key"] or inferred or by_name):
-                    candidates[next(iter(known))].append((row, inferred))
+                    candidates[next(iter(known))].append((row, inferred, ending))
         for ref, matches in candidates.items():
             if len(matches) == 1:
-                row, inferred = matches[0]
-                revisions[id(row)] = {"_bank_balance_revision": ref, "_bank_revision_balance": inferred}
+                row, inferred, ending = matches[0]
+                revisions[id(row)] = {"_bank_balance_revision": ref, "_bank_revision_balance": inferred,
+                                       "_bank_revision_ending": ending}
 
     # Distinct occurrences without their own checkpoints can share the
     # mapper's source key. A verified statement can keep their names separate.
@@ -3726,13 +3772,14 @@ def _joint_proof_member_matches(left, right, *, subject):
     ))
 
 
-def _bank_statement_member_count(first, second, *, subjects):
+def _bank_statement_member_count(first, second, *, subjects, second_versions=None):
     """Count distinct correspondences between actual statement movements."""
     matching = {}
 
     def assign(index, visited):
         for target, member in enumerate(second):
-            if target in visited or not _joint_proof_member_matches(first[index], member, subject=subjects):
+            versions = second_versions.get(target, (member,)) if second_versions else (member,)
+            if target in visited or not any(_joint_proof_member_matches(first[index], version, subject=subjects) for version in versions):
                 continue
             visited.add(target)
             if target not in matching or assign(matching[target], visited):
@@ -4228,8 +4275,8 @@ def _settle_booked_bank_occurrences(conn, rows, booked):
                 (row["bank_group"], _bank_statement_option(row), row["description"]),
             )
     scoped = defaultdict(list)
-    for row in booked.values():
-        scoped[row["_bank_account_key"], row["currency"], row["booked_day"]].append(row)
+    for ref, row in booked.items():
+        scoped[row["_bank_account_key"], row["currency"], row["booked_day"]].append((ref, row))
     pending = conn.execute(
         "SELECT review_key,account_key,currency,date,amount,details FROM bank_statement_assessments "
         "WHERE state='pending' AND json_type(details, '$.occurrences')='array'",
@@ -4242,8 +4289,17 @@ def _settle_booked_bank_occurrences(conn, rows, booked):
                                                                        witnesses[account, currency]):
             continue
         options = details["observations"]
-        candidates = [_bank_statement_option(row) for row in payments]
-        confirmed = min(upper, _bank_statement_member_count(options, candidates, subjects=True))
+        candidates = [_bank_statement_option(row) for _, row in payments]
+        versions = {}
+        for index, (ref, _) in enumerate(payments):
+            groups, facts = candidates[index]
+            balance = conn.execute("SELECT balance_key FROM bank_import_facts WHERE ref=?", (ref,)).fetchone()[0]
+            booking = _BankBooking(*facts)._replace(ref=ref, balance_key=balance)
+            # Earlier observed checkpoints are versions of this one booked
+            # movement. They may settle an old review, but never add a slot.
+            versions[index] = [candidates[index], *((groups, booking._replace(balance_key=key))
+                               for key in _bank_known_balance_keys(conn, booking))]
+        confirmed = min(upper, _bank_statement_member_count(options, candidates, subjects=True, second_versions=versions))
         if confirmed <= lower:
             continue
         # The signed amount is also part of the statement groups. Use the

@@ -2466,7 +2466,31 @@ class _StatementFetch:
     skipped: int
     original: dict = field(default_factory=dict)
 
+    def revision_drafts(self, conn):
+        """Retain identifiable movements before reducing optional page copies."""
+        reports = [row | {"ref": row["ref"] or core.bank_source_reference(row["_source_key"], index),
+                          "_bank_account_key": self.account_key, "_bank_observed_balance": _reported_balance(row)}
+                   for index, row in enumerate(self.drafts, start=1)]
+        revised, _ = core._reconcile_bank_balance_revisions(conn, reports, ())
+        result = []
+        for row, observed in zip(self.drafts, revised):
+            if observed.get("_bank_new_occurrence"):
+                row = row | {"_statement_new_observation": True}
+            if ref := observed.get("_bank_balance_revision"):
+                row = row.copy()
+                if not row["date"]:
+                    known = conn.execute("SELECT t.date,f.booked_day FROM transactions t JOIN bank_import_facts f USING(ref) "
+                                         "WHERE ref=?", (ref,)).fetchone()
+                    row |= {"date": known[0], "booked_day": known[1]}
+                    row["bank_groups"] = {known[0]: fingerprint(self.account_key, known[0], row["_amount_key"], row["currency"])}
+                    row["bank_group"] = row["bank_groups"][known[0]]
+                if not row["balance_key"] and (ending := observed.get("_bank_revision_ending")) is not None:
+                    row |= {"balance_key": observed["_bank_revision_balance"], "_statement_balance": (row["currency"], ending)}
+            result.append(row)
+        return result
+
     def corrected_drafts(self, conn):
+        self.drafts = self.revision_drafts(conn)
         last = max(row["date"] for row in self.drafts)
         first = min(row["date"] for row in self.drafts)
         # A placed receipt can be re-reported on its resolved day after the
@@ -2484,7 +2508,7 @@ class _StatementFetch:
         if replay:
             return [], (), ()
         if not saved and not witnessed:
-            return None
+            return self.drafts, (), ()
         alternatives = defaultdict(list)
         pending_pages = defaultdict(list)
         for index, (state, _, currency, details) in enumerate(saved):
@@ -2518,7 +2542,9 @@ class _StatementFetch:
                            if _matches_page_occurrence(row, options)}
                 if len(matches) == 1:
                     pending_counts[index] = next(iter(matches))[1:]
-            if row["_statement_balance"]:
+            # A possible additional occurrence must not inherit the cached
+            # checkpoint of an already represented member of its family.
+            if row["_statement_balance"] or row.get("_statement_new_observation"):
                 continue
             candidates = core._bank_statement_group_bookings(conn, groups)
             candidates.update(option for group in groups for option in alternatives[group])
@@ -2631,7 +2657,8 @@ def transaction_rows(account_key, transactions, *, assessments=None, ledger=None
             continue
         try:
             dates = [tx.get(key) for key in ("booking_date", "value_date", "transaction_date")]
-            booking = date.fromisoformat(next(d for d in dates if d)).isoformat()
+            supplied_day = next((d for d in dates if d), None)
+            booking = date.fromisoformat(supplied_day).isoformat() if supplied_day else ""
             amount_struct = tx["transaction_amount"]
             currency = amount_struct["currency"].upper()
             amount = abs(Decimal(amount_struct["amount"]))
@@ -2739,6 +2766,8 @@ def transaction_rows(account_key, transactions, *, assessments=None, ledger=None
     assessment_start = len(assessments) if source is not None else 0
     rows, skipped = _map_statement_drafts(account_key, drafts, skipped, assessments,
                                          trace=source is not None, overlaps=overlaps, checkpoints=checkpoints)
+    skipped += sum(not row["date"] for row in rows)
+    rows = [row for row in rows if row["date"]]
     if source is not None:
         for assessment in assessments[assessment_start:]:
             assessment["_statement_fetch"] = source
@@ -3743,4 +3772,5 @@ def _map_statement_drafts(account_key, drafts, skipped, assessments, trace=False
         row.pop("_statement_capacity", None)
         row.pop("_statement_choice", None)
         row.pop("_statement_slot", None)
+        row.pop("_statement_new_observation", None)
     return [*(row for row in rows if row["ref"] not in rejected), *neutral], skipped + warnings
