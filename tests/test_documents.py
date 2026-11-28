@@ -29,6 +29,19 @@ def test_add_document(conn, doc):
     assert p.read_bytes() == b"%PDF-1.4 beleg"
 
 
+def test_same_name_uploads_keep_both_receipts(conn, monkeypatch):
+    class FixedClock(core.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 3, 10, 12, 0, 0, tzinfo=tz)
+
+    monkeypatch.setattr(core, "datetime", FixedClock)
+    ids = [core.add_document(conn, content, "receipt.pdf") for content in (b"First", b"Second", b"Third")]
+    paths = [core.abs_pfad(core.get_document(conn, doc_id)["file_path"]) for doc_id in ids]
+    assert len(set(paths)) == 3
+    assert [path.read_bytes() for path in paths] == [b"First", b"Second", b"Third"]
+
+
 @pytest.mark.parametrize("filename,ftype", [
     ("a.pdf", "pdf"), ("a.PDF", "pdf"), ("b.jpg", "jpg"), ("b.jpeg", "jpg"),
     ("c.png", "png"), ("d.txt", "txt"), ("ohne_endung", "file"),

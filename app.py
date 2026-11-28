@@ -16,7 +16,9 @@ import threading
 import time
 import traceback
 import webbrowser
+from contextlib import closing
 from datetime import date, timedelta as _timedelta
+from decimal import Decimal, InvalidOperation
 
 from flask import (Flask, abort, flash, jsonify, redirect, render_template,
                    request, send_file, session, url_for)
@@ -276,7 +278,14 @@ def invoices():
              for y in sorted(byyear, reverse=True)]
     rows = byyear.get(year, []) if year else []
     custs = core.list_customers(conn)
-    return render_template("invoices.html", active="invoices", tab=tab, direction=direction,
+    mail_drafts = {}
+    if app.config.get("KLAR_HOSTED") and direction == "out":
+        customer_emails = {customer["id"]: customer["email"] or "" for customer in custs}
+        for item in rows:
+            subject, body = _email_texts(item["customer_name"], item["number"], _eur(item["gross"]),
+                                         core.de_date(item["due_date"]))
+            mail_drafts[item["id"]] = (customer_emails.get(item["customer_id"], ""), subject, body)
+    return render_template("invoices.html", mail_drafts=mail_drafts, active="invoices", tab=tab, direction=direction,
                            year=year, years=years, rows=rows, dirs=dirs,
                            customers=custs, today=date.today().isoformat(),
                            cust_invoices={c["id"]: core.list_customer_invoices(conn, c["id"])
@@ -697,7 +706,9 @@ def _tax_label(cat, vat):
     if cat == "einnahme_rechnung":
         return "ohne USt./VSt."
     if cat == "einnahme_sonstige":
-        return "19% USt."
+        return "ohne USt."
+    if cat in core.TAXABLE_BANK_INCOME:
+        return f"{core.TAXABLE_BANK_INCOME[cat][0]}% USt."
     return "—"
 
 
@@ -750,11 +761,16 @@ def zahlungen():
                 skr_no, skr_name = _skr.get(cat, ("", core.TX_CATEGORIES.get(cat, cat)))
                 if skr_no:                                   # Modal-Vorbelegung (Konto + ohne USt)
                     st["category"], st["vat_rate"] = f"{skr_no} - {skr_name}", 0
+            elif cat in core.TAXABLE_BANK_INCOME:
+                rate, skr_no, skr_name = core.TAXABLE_BANK_INCOME[cat]
+                st.update(action=cat, vat_rate=rate)
             elif cat == "offen":
                 s = core.suggestion_for(rules, t["description"])
                 if s:
-                    st = {"action": s["action"], "category": s["category"] or "",
-                          "vat_rate": int(s["vat_rate"]) if s["vat_rate"] is not None else 19,
+                    action = s["action"]
+                    income = core.TAXABLE_BANK_INCOME.get(action)
+                    vat_rate = income[0] if income else (s["vat_rate"] if s["vat_rate"] is not None else 19)
+                    st = {"action": action, "category": s["category"] or "", "vat_rate": int(vat_rate),
                           "private_share": int(round(s["private_share"] or 0)),
                           "vat_kind": core.expense_vat_kind(s)}
             tax_label = _tax_label(cat, st["vat_rate"])
@@ -814,6 +830,7 @@ def zahlungen():
     summary = {"money_in": money_in, "money_out": money_out, "net": money_in + money_out}
     return render_template("zahlungen.html", active="zahlungen", groups=groups,
                            inv_options=inv_options, cats=core.TX_CATEGORIES,
+                           direct_income=hosted and core.direct_income_available(core.load_config()),
                            summary=summary, count=count, p=p, plabel=plabel, periods=periods,
                            open_count=open_count, statement_reviews=statement_reviews)
 
@@ -822,7 +839,6 @@ def zahlungen():
 def zahlungen_export():
     import csv
     import io
-    from contextlib import closing
     from flask import Response
     hosted = app.config.get("KLAR_HOSTED")
     with closing(core.db()) as conn:
@@ -865,6 +881,9 @@ def zahlungen_manual():
         amt = -amt
     cur = (f.get("currency") or core.home_currency()).upper()
     method = (f.get("method") or "Kasse").strip()
+    if app.config.get("KLAR_HOSTED") and not 0.005 <= abs(amt) <= 10**14:
+        flash("Gib einen gültigen Betrag ein.", "error")
+        return redirect(url_for("zahlungen"))
     if amt:
         core.create_manual_transaction(core.db(), d, desc, amt, cur, method=method)
         hc = core.home_currency()
@@ -895,9 +914,13 @@ def zahlungen_bulk():
                                      f.get("vat_rate", 0), f.get("private_share", 0))
         flash(f"{n} Buchung(en) als Betriebsausgabe erfasst.", "ok")
     else:
-        n = core.bulk_set_category(conn, ids, action)
-        label = core.TX_CATEGORIES.get(action, action)
-        flash(f"{n} Buchung(en) auf '{label}' gesetzt.", "ok")
+        try:
+            n = core.bulk_set_category(conn, ids, action)
+        except ValueError as exc:
+            flash(str(exc), "error")
+        else:
+            label = core.TX_CATEGORIES[action]
+            flash(f"{n} Buchung(en) auf '{label}' gesetzt.", "ok")
     return redirect(url_for("zahlungen", filter=f.get("back", "all"), q=f.get("q") or None))
 
 
@@ -947,26 +970,33 @@ def zahlungen_set(tid):
     f = request.form
     action = f.get("action", "")
     conn = core.db()
-    if action == "expense":
-        core.reset_tx(conn, tid)   # bestehende Zuordnung lösen -> Um-/Neubuchen
-        core.create_expense_from_tx(conn, tid, f.get("category", "Sonstiges"),
-                                    f.get("vat_rate", 0), private_share=f.get("private_share", 0),
-                                    vat_kind=f.get("vat_kind"))
-        flash("Als Betriebsausgabe erfasst.", "ok")
-    elif action == "invoice":
-        inv_id = f.get("invoice_id")
-        if inv_id:
-            core.reset_tx(conn, tid)
-            core.link_tx_invoice(conn, tid, int(inv_id))
-            flash("Rechnung zugeordnet und als bezahlt markiert.", "ok")
+    try:
+        if action == "expense":
+            core.reset_tx(conn, tid)   # bestehende Zuordnung lösen -> Um-/Neubuchen
+            core.create_expense_from_tx(conn, tid, f.get("category", "Sonstiges"),
+                                        f.get("vat_rate", 0), private_share=f.get("private_share", 0),
+                                        vat_kind=f.get("vat_kind"))
+            flash("Als Betriebsausgabe erfasst.", "ok")
+        elif action == "invoice":
+            inv_id = f.get("invoice_id")
+            if inv_id:
+                invoice_id = int(inv_id)
+                tx = core.get_transaction(conn, tid)
+                if not tx or tx["category"] not in core.TAXABLE_BANK_INCOME:
+                    core.reset_tx(conn, tid)
+                core.link_tx_invoice(conn, tid, invoice_id)
+                flash("Rechnung zugeordnet und als bezahlt markiert.", "ok")
+            else:
+                flash("Keine Rechnung gewählt.", "error")
+        elif action in core.TX_CATEGORIES:
+            if action not in core.TAXABLE_BANK_INCOME:
+                core.reset_tx(conn, tid)
+            core.set_tx_category(conn, tid, action)
+            flash(f"Buchung auf '{core.TX_CATEGORIES[action]}' gesetzt.", "ok")
         else:
-            flash("Keine Rechnung gewählt.", "error")
-    elif action in core.TX_CATEGORIES:
-        core.reset_tx(conn, tid)
-        core.set_tx_category(conn, tid, action)
-        flash(f"Buchung auf '{core.TX_CATEGORIES[action]}' gesetzt.", "ok")
-    else:
-        flash("Keine Aktion gewählt.", "error")
+            flash("Keine Aktion gewählt.", "error")
+    except ValueError as exc:
+        flash(str(exc), "error")
     return redirect(url_for("zahlungen", filter=f.get("back", "all"), q=f.get("q") or None))
 
 
@@ -1163,11 +1193,17 @@ def _learn_vendor_rule(vendor, category, vat_rate, private_share):
     core.save_settings(s)
 
 
+def _document_confirmation_error(error, status):
+    if _wants_json():
+        return jsonify(ok=False, error=error), status
+    flash(error, "error")
+    return redirect(url_for("files"))
+
+
 @app.route("/documents/<int:did>/confirm", methods=["POST"])
 def document_confirm(did):
     f = request.form
-    conn = core.db()
-    doc = core.get_document(conn, did)
+    hosted = app.config.get("KLAR_HOSTED")
     tx_id = f.get("tx_id")
     lines_raw = f.get("lines")
     lines = []
@@ -1176,17 +1212,53 @@ def document_confirm(did):
             lines = [l for l in (_json.loads(lines_raw) or []) if l]
         except (ValueError, TypeError):
             lines = []
-    if lines:
-        core.split_document(conn, did, lines, int(tx_id) if tx_id else None)
-        msg = "Beleg auf mehrere Buchungssätze aufgeteilt und verbucht."
-    elif tx_id:
-        core.match_document_to_tx(conn, did, int(tx_id), category=f.get("category", "Sonstiges"),
-                                  vat_rate=f.get("vat_rate", 19), private_share=f.get("private_share", 0))
-        msg = "Beleg an Zahlung zugeordnet und verbucht."
-    else:
-        core.confirm_document(conn, did, category=f.get("category", "Sonstiges"),
-                              vat_rate=f.get("vat_rate", 19), private_share=f.get("private_share", 0))
-        msg = "Beleg als eigenständige Ausgabe verbucht (keine passende Zahlung)."
+    try:
+        with closing(core.db()) as conn, conn:
+            if hosted:
+                # Hold the writer lock until both the expense and document status are recorded.
+                conn.execute("BEGIN IMMEDIATE")
+            doc = core.get_document(conn, did)
+            if hosted:
+                if not doc:
+                    abort(404)
+                if doc["status"] != "to_review":
+                    error = ("Dieser Beleg ist bereits verbucht." if doc["status"] == "matched"
+                             else "Dieser Beleg kann gerade nicht verbucht werden.")
+                    return _document_confirmation_error(error, 409)
+                if tx_id:
+                    transaction = core.get_transaction(conn, int(tx_id))
+                    if not transaction or transaction["category"] != "offen" or transaction["amount"] >= 0:
+                        raise ValueError
+                    amount = abs(Decimal(str(transaction["amount_home"])))
+                else:
+                    amount = Decimal(f.get("document_amount", "").replace(",", "."))
+                    doc_date = date.fromisoformat(f.get("document_date", "")).isoformat()
+                if not amount.is_finite() or not 0 < amount <= 10**14:
+                    raise ValueError
+                if lines:
+                    parts = [Decimal(str(part["amount"])) for part in lines]
+                    if any(not part.is_finite() or part <= 0 for part in parts) or abs(sum(parts) - amount) >= Decimal("0.01"):
+                        raise ValueError
+                if not tx_id:
+                    conn.execute("UPDATE documents SET vendor = ?, amount = ?, doc_date = ? WHERE id = ?",
+                                 (f.get("vendor", "").strip()[:120] or doc["vendor"], float(amount), doc_date, did))
+                    doc = core.get_document(conn, did)
+            booking = {"category": f.get("category", "Sonstiges"), "vat_rate": f.get("vat_rate", 19),
+                       "private_share": f.get("private_share", 0), "commit": False}
+            if lines:
+                core.split_document(conn, did, lines, int(tx_id) if tx_id else None, commit=False)
+                msg = "Beleg auf mehrere Buchungssätze aufgeteilt und verbucht."
+            elif tx_id:
+                core.match_document_to_tx(conn, did, int(tx_id), **booking)
+                msg = "Beleg an Zahlung zugeordnet und verbucht."
+            else:
+                core.confirm_document(conn, did, **booking)
+                msg = "Beleg als eigenständige Ausgabe verbucht (keine passende Zahlung)."
+    except (InvalidOperation, KeyError, ValueError, TypeError):
+        if not hosted:
+            raise
+        return _document_confirmation_error(
+            "Wähle eine offene Ausgabe oder prüfe Betrag, Belegdatum und Buchungssätze.", 400)
     # Anbieter-Regel merken (nur bei Einzelbuchung, nicht bei Splits)
     if doc and doc["vendor"] and not lines:
         _learn_vendor_rule(doc["vendor"], f.get("category", "Sonstiges"),

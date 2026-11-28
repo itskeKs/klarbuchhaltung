@@ -71,18 +71,19 @@
       <button class="iconbtn" onclick="closeModal('doc-modal')"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
     </div>
     <div class="modal__body" style="padding-top:18px">
-      <div class="row" style="gap:8px;align-items:center;font-size:12px;font-weight:600;color:var(--azure-deep);background:var(--azure-tint);padding:6px 11px;border-radius:999px;width:fit-content;margin-bottom:18px"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 4.7L18.6 9l-4.7 1.9L12 15.6 10.1 10.9 5.4 9l4.7-1.3z"/></svg>Von Klar AI vorbefüllt · bitte prüfen</div>
+      {% if not hosted %}<div class="row" style="gap:8px;align-items:center;font-size:12px;font-weight:600;color:var(--azure-deep);background:var(--azure-tint);padding:6px 11px;border-radius:999px;width:fit-content;margin-bottom:18px"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 4.7L18.6 9l-4.7 1.9L12 15.6 10.1 10.9 5.4 9l4.7-1.3z"/></svg>Von Klar AI vorbefüllt · bitte prüfen</div>{% endif %}
       <form id="dm-form" method="post" class="stack">
         <div class="field"><label>An Zahlung zuordnen <span class="muted" id="dm-tx-hint" style="font-weight:500"></span></label>
           <select class="select" name="tx_id" id="dm-tx">
             <option value="">— keine passende Zahlung (als eigene Ausgabe buchen) —</option>
-            {% for t in open_txs %}<option value="{{ t['id'] }}">{{ t['date']|de_date }} · {{ (t['description'] or '—')[:32] }} · {{ (t['amount_home'] if t['amount_home'] is not none else t['amount'])|eur }}</option>{% endfor %}
+            {% for t in open_txs %}<option value="{{ t['id'] }}" data-gross="{{ (t['amount_home'] or 0)|abs }}">{{ t['date']|de_date }} · {{ (t['description'] or '—')[:32] }} · {{ (t['amount_home'] if t['amount_home'] is not none else t['amount'])|eur }}</option>{% endfor %}
           </select></div>
-        <div class="grid-2">
-          <div class="field" style="grid-column:1 / -1"><label>Anbieter</label><input class="input" name="vendor" id="dm-vendor" disabled></div>
-          <div class="field"><label>Betrag (brutto)</label><input class="input num" id="dm-amount" disabled></div>
-          <div class="field"><label>Belegdatum</label><input class="input" id="dm-date" disabled></div>
+        <div id="dm-document-fields" class="grid-2">
+          <div class="field" style="grid-column:1 / -1"><label for="dm-vendor">Anbieter</label><input class="input" name="vendor" id="dm-vendor" {{ '' if hosted else 'disabled' }}></div>
+          <div class="field"><label for="dm-amount">Betrag (brutto)</label><input class="input num" id="dm-amount" name="document_amount" inputmode="decimal" {{ 'required' if hosted else 'disabled' }}></div>
+          <div class="field"><label for="dm-date">Belegdatum</label><input class="input" id="dm-date" name="document_date" {{ 'type=date required' if hosted else 'disabled' }}></div>
         </div>
+        {% if hosted %}<p id="dm-error" role="alert" style="color:var(--coral-deep)" hidden></p>{% endif %}
         <div id="dm-single" class="grid-2">
           <div class="field"><label>Buchungssatz (SKR03)</label>
             <select class="select" name="category">{% for a in expense_accounts %}<option value="{{ a }}">{{ a }}</option>{% endfor %}</select></div>
@@ -150,8 +151,9 @@
   function fillModal(r){ const d=r.dataset;
     $('dm-name').textContent=d.name;
     $('dm-vendor').value=d.vendor||'';
-    $('dm-amount').value=d.amount?(d.amount+' €'):'—';
-    $('dm-date').value=d.date||'—';
+    $('dm-amount').value={% if hosted %}d.amount||''{% else %}d.amount?(d.amount+' €'):'—'{% endif %};
+    $('dm-date').value=d.date||{% if hosted %}''{% else %}'—'{% endif %};
+    {% if hosted %}$('dm-error').hidden=true;{% endif %}
     $('dm-form').action='/documents/'+d.id+'/confirm';
     $('dm-del').action='/documents/'+d.id+'/delete';
     $('dm-open').href=d.file;
@@ -175,7 +177,7 @@
     const hint=$('dm-rule-hint'); if(hint) hint.style.display = (rule && catMatched) ? 'inline-flex' : 'none';
     const book=$('dm-book'); if(book){ const canBook=d.status==='to_review'; book.disabled=!canBook; book.textContent=canBook?'Verbuchen & weiter':'Bereits verbucht'; }
     // Split-Zustand je Beleg zurücksetzen
-    curGross=parseFloat(d.amount)||0;
+    {% if hosted %}updateHostedFields();{% else %}curGross=parseFloat(d.amount)||0;{% endif %}
     $('dm-split-lines').innerHTML=''; $('dm-split').hidden=true; $('dm-single').style.display=''; $('dm-lines').value='';
     $('dm-split-btn').textContent='＋ Auf mehrere Buchungssätze aufteilen';
     updateNav();
@@ -183,6 +185,15 @@
   // ── Split / Unterbuchungen ──
   let curGross=0;
   const splitAmt=v=>parseFloat((v||'').toString().replace(/\s/g,'').replace(',','.'))||0;
+  {% if hosted %}
+  function updateHostedFields(){
+    const tx=$('dm-tx');
+    const linked=Boolean(tx.value);
+    for(const input of $('dm-document-fields').querySelectorAll('input')) input.disabled=linked;
+    curGross=linked ? Number(tx.selectedOptions[0].dataset.gross) : splitAmt($('dm-amount').value);
+    updateSplitSum();
+  }
+  {% endif %}
   const fmtEur=x=>'€'+(x||0).toLocaleString('de-DE',{minimumFractionDigits:2,maximumFractionDigits:2});
   function updateSplitSum(){ let sum=0; document.querySelectorAll('#dm-split-lines .sl-amt').forEach(i=>sum+=splitAmt(i.value));
     const diff=sum-curGross;
@@ -219,7 +230,8 @@
   function navDoc(delta){ if(curIdx<0) return; const i=curIdx+delta; if(i<0||i>=reviewRows.length) return; curIdx=i; fillModal(reviewRows[i]); }
   function markMatched(r, vendor){ r.dataset.status='matched';
     const cells=r.children;   // [icon, name, mid, right]
-    cells[2].innerHTML='<div class="row" style="gap:6px;color:var(--green-deep);font-size:13px;font-weight:600"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>'+(vendor||'verbucht')+'</div>';
+    cells[2].innerHTML='<div class="row" style="gap:6px;color:var(--green-deep);font-size:13px;font-weight:600"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>'+'<span></span></div>';
+    cells[2].querySelector('span').textContent=vendor||'verbucht';
     cells[3].innerHTML='<span class="status status--paid">Verbucht</span>';
     // im aktuellen Filter „Zu prüfen" ausblenden
     const active=document.querySelector('.chip--active'); if(active && active.dataset.s==='to_review') r.style.display='none';
@@ -243,12 +255,19 @@
     } else { $('dm-lines').value=''; }
     book.disabled=true; book.textContent='Verbuche…';
     try{ const d=await (await fetch(form.action+'?json=1',{method:'POST',headers:{'Accept':'application/json'},body:new FormData(form)})).json();
-      if(!d.ok){ book.disabled=false; book.textContent='Verbuchen & weiter'; return; }
+      if(!d.ok){
+        {% if hosted %}const error=$('dm-error'); error.textContent=d.error||'Der Beleg konnte nicht verbucht werden.'; error.hidden=false;{% endif %}
+        book.disabled=false; book.textContent='Verbuchen & weiter'; return;
+      }
       if(d.doc_vendor && d.rule) learnedRules[d.doc_vendor]=d.rule;   // Regel für nächste gleiche Anbieter merken
       markMatched(r, d.vendor); advanceAfter(r);
     }catch(e){ book.disabled=false; book.textContent='Verbuchen & weiter'; }
   }
   document.addEventListener('DOMContentLoaded',()=>{ $('dm-form').addEventListener('submit',bookDoc);
+    {% if hosted %}
+    $('dm-tx').addEventListener('change',updateHostedFields);
+    $('dm-amount').addEventListener('input',updateHostedFields);
+    {% endif %}
     $('dm-split-btn').addEventListener('click',toggleSplit);
     $('dm-addline').addEventListener('click',()=>addSplitLine()); });
   async function docDelete(){ const opt={titel:'Dokument löschen', ja:'Löschen', gefahr:true};

@@ -140,7 +140,10 @@
        data-net="{{ i['net']|eur }}" data-vatamt="{{ (i['gross']-i['net'])|eur }}" data-gross="{{ i['gross']|eur }}"
        data-grossnum="{{ '%.2f'|format(i['gross']) }}" data-currency="{{ i['currency'] or 'EUR' }}"
        data-status="{{ 'Bezahlt' if i['paid_date'] else ('Versendet' if i['sent_at'] else 'Offen') }}" data-paidbool="{{ '1' if i['paid_date'] else '0' }}"
-       data-pdf="{{ url_for('invoice_pdf', iid=i['id']) }}" data-id="{{ i['id'] }}">
+       data-pdf="{{ url_for('invoice_pdf', iid=i['id']) }}" data-id="{{ i['id'] }}"
+       {% if hosted %}data-pdf-ready="{{ '1' if i['pdf_path'] else '' }}"
+       data-mail-recipient="{{ mail_drafts[i['id']][0] }}" data-mail-subject="{{ mail_drafts[i['id']][1] }}"
+       data-mail-body="{{ mail_drafts[i['id']][2] }}"{% endif %}>
     <div style="min-width:0"><div class="num" style="font-weight:600;font-size:14px">#{{ i['number'] }}</div><div class="muted" style="font-size:12px;margin-top:1px">{{ i['issue_date']|de_date }}</div></div>
     <div style="min-width:0;font-size:15px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ i['customer_name'] }}</div>
     <div>{% if i['paid_date'] %}<span class="status status--paid">Bezahlt</span>{% elif i['sent_at'] %}<span class="status" style="background:var(--azure-tint);color:var(--azure-deep)">Versendet</span>{% else %}<span class="status status--due">Offen</span>{% endif %}</div>
@@ -204,8 +207,19 @@
       </div>
       <div class="row" style="gap:10px;margin-top:22px">
         <a class="btn btn--primary" id="im-pdf" href="#" target="_blank">PDF öffnen</a>
+        {% if hosted %}<button class="btn btn--outline" id="im-mailbtn" type="button">E-Mail vorbereiten</button>{% endif %}
         <button class="btn btn--outline" id="im-paybtn" type="button" onclick="document.getElementById('im-payrow').hidden=!document.getElementById('im-payrow').hidden">Zahlung erfassen</button>
       </div>
+      {% if hosted %}
+      <form id="im-mailform" hidden style="margin-top:14px">
+        <label for="im-mailto">Empfänger</label>
+        <div class="row" style="gap:8px;flex-wrap:wrap">
+          <input class="input" id="im-mailto" type="email" required style="flex:1;min-width:160px">
+          <button type="submit" class="btn btn--primary">Im E-Mail-Programm öffnen</button>
+        </div>
+        <p class="muted"><a href="#" id="im-mailpdf" download>PDF herunterladen</a> und im E-Mail-Programm anhängen.</p>
+      </form>
+      {% endif %}
       <div id="im-payrow" hidden style="margin-top:14px;border-top:1px solid var(--line-3);padding-top:14px">
         <form id="im-payform" method="post" class="stack">
           <input type="hidden" name="create_tx" value="1">
@@ -317,6 +331,21 @@
     document.getElementById('im-vatamt').textContent=d.vatamt;
     document.getElementById('im-gross').textContent=d.gross;
     document.getElementById('im-pdf').href=d.pdf;
+    {% if hosted %}
+    const mailButton=document.getElementById('im-mailbtn'), mailForm=document.getElementById('im-mailform');
+    mailButton.hidden=!d.pdfReady;
+    mailForm.hidden=true;
+    mailButton.onclick=()=>{ mailForm.hidden=!mailForm.hidden; };
+    document.getElementById('im-mailpdf').href=d.pdf;
+    const recipient=document.getElementById('im-mailto');
+    recipient.value=d.mailRecipient;
+    mailForm.onsubmit=event=>{
+      event.preventDefault();
+      const address=encodeURIComponent(recipient.value).replace('%40','@');
+      const subject=encodeURIComponent(d.mailSubject.replace(/[\r\n]+/g,' '));
+      location.href='mailto:'+address+'?subject='+subject+'&body='+encodeURIComponent(d.mailBody);
+    };
+    {% endif %}
     const pay=document.getElementById('im-paybtn'), payrow=document.getElementById('im-payrow');
     if(d.paidbool==='1'){ pay.style.display='none'; payrow.hidden=true; }
     else { pay.style.display=''; document.getElementById('im-payform').action='/invoices/'+d.id+'/pay';
