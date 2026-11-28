@@ -11,7 +11,7 @@ import re
 import sqlite3
 import subprocess
 import sys
-from threading import Barrier, BrokenBarrierError
+from threading import Barrier, BrokenBarrierError, Event
 from time import monotonic, sleep
 from urllib.parse import parse_qs, urlencode, urlsplit
 from urllib.request import HTTPError, Request, urlopen
@@ -157,6 +157,15 @@ def test_two_hosted_logins_and_enable_banking(tmp_path, monkeypatch):
         assert post(a, "/settings", {"section": "llm"}, token=token_a).status_code == 404
         for disabled in ("/terminal", "/pty", "/agent/api", "/chat", "/banking/live", "/restart"):
             assert fetch(a, disabled).status_code == 404
+        invoice = {"new_name": "Sample Client", "issue_date": date.today().isoformat(),
+                   "service_from": date.today().isoformat(), "item_desc": "Invoice line", "item_qty": "1",
+                   "item_unit": "x", "item_price": "100", "item_rate": "19"}
+        assert post(a, "/invoices/new", invoice | {"number": "2026-11-01/../../danger"}, token=token_a).status_code == 400
+        assert post(a, "/invoices/new", invoice, token=token_a).location == "/invoices"
+        assert fetch(a, "/invoices/1/pdf").data.startswith(b"%PDF")
+        assert fetch(b, "/invoices/1/pdf").status_code == 404
+        assert "E-Mail vorbereiten" in fetch(a, f"/invoices?dir=out&year={date.today().year}").get_data(as_text=True)
+
         assert "Enable Banking einrichten" in fetch(a, "/banking").get_data(as_text=True)
         prefix = "/banking/enable-banking/"
         assert post(a, prefix + "credentials", {"application_id": APP_ID,
@@ -190,6 +199,12 @@ def test_two_hosted_logins_and_enable_banking(tmp_path, monkeypatch):
 
         assert fetch(a, callback).location == "/banking"
         assert "konnte nicht zugeordnet werden" in fetch(a, "/banking").get_data(as_text=True)
+        booking_url = "/zahlungen/tx/1/set"
+        assert "Umsatzsteuer ohne Rechnungszuordnung" in page
+        assert post(a, booking_url, {"action": "einnahme_ust19"}, token=token_a).status_code == 302
+        with sqlite3.connect(tmp_path / "tenant-a" / "data" / "bookkeeping.db") as ledger:
+            assert ledger.execute("SELECT category FROM transactions WHERE id=1").fetchone() == ("einnahme_ust19",)
+        assert post(a, booking_url, {"action": "offen"}, token=token_a).status_code == 302
         assert post(a, "/zahlungen/tx/2/set", {"action": "gebuehr"}, token=token_a).status_code == 302
         sync_again()
         assert fetch(a, "/zahlungen").get_data(as_text=True).count('data-uncat="1"') == 1
@@ -199,11 +214,223 @@ def test_two_hosted_logins_and_enable_banking(tmp_path, monkeypatch):
             assert ledger.execute("SELECT amount, category FROM transactions ORDER BY id").fetchall() == [
                 (119.0, "offen"), (-23.0, "gebuehr"),
             ]
+            assert ledger.execute("SELECT paid_date FROM invoices").fetchone() == (None,)
+
+        assert post(a, booking_url, {"action": "einnahme_ust7"}, token=token_a).status_code == 302
+        assert post(a, "/zahlungen/manual", {"amount": "107", "description": "Fixture bank transfer"},
+                    token=token_a).location == "/zahlungen"
+        expected_suggestion = 'data-tid="3" data-action="einnahme_ust7" data-cat="" data-vat="7"'
+        assert expected_suggestion in fetch(a, "/zahlungen").get_data(as_text=True)
+
+        assert post(a, "/documents/upload", {"file": (io.BytesIO(b"<svg>fixture</svg>"), "private.svg")},
+                    token=token_a).location == "/files"
+        file_a, file_b = fetch(a, "/documents/1/file"), fetch(b, "/documents/1/file")
+        assert file_a.data == b"<svg>fixture</svg>"
+        assert file_a.mimetype == "application/octet-stream"
+        assert file_a.headers["Content-Disposition"].startswith("attachment")
+        assert file_a.headers["Cache-Control"] == "no-store"
+        assert file_b.status_code == 404
+        path = "/documents/1/confirm?json=1"
+        assert post(a, path, token=token_a).status_code == 400
+        assert post(a, path, {"document_amount": "12,00", "document_date": date.today().isoformat()},
+                    token=token_a).get_json()["ok"]
 
         cookie = a.get_cookie("__Host-klar-auth", domain=urlsplit(SITE).netloc)
         assert post(a, "/logout", {"_klar_csrf": token_a}).location == "/login"
         a.set_cookie(cookie.key, cookie.value, domain=urlsplit(SITE).netloc)
         assert fetch(a, "/files").location == "/login"
+
+
+def test_direct_taxable_income_reporting_and_reassignment(sandbox):
+    from decimal import Decimal
+
+    import core
+
+    conn = core.db()
+    cfg = core.load_config()
+    assert core.direct_income_available(cfg)
+    assert not core.direct_income_available({"tax": {"taxation": "soll"}})
+    assert not core.direct_income_available({"tax": {"small_business": True}})
+    lo, hi, _ = core.period_bounds(2026, "quarter", 1)
+    eur_amounts = [(119, "einnahme_ust19"), (107, "einnahme_ust7")]
+    ids = []
+    for index, (amount, category) in enumerate(eur_amounts):
+        tid = core.create_manual_transaction(conn, "2026-02-20", f"Bank receipt {index}", amount)
+        core.set_tx_category(conn, tid, category)
+        ids.append(tid)
+    conn.execute("UPDATE transactions SET amount_home = 153 WHERE id = ?", (ids[0],))
+    conn.commit()
+    euer = core.euer(conn, cfg, lo, hi)
+    assert (euer["income_net"], euer["umsatz_ust"], euer["betriebseinnahmen"]) == (200, 26, 226)
+    vat = core.vat_data(conn, cfg, 2026, 1)
+    assert (vat["net19"], vat["ust19"], vat["net7"], vat["ust7"]) == (100, 19, 100, 7)
+    assert core.vat_annual(conn, cfg, 2026)["zahllast"] == Decimal("26.00")
+
+    core.reset_tx(conn, ids[0])
+    assert core.vat_data(conn, cfg, 2026, 1)["ust19"] == 0
+    assert core.euer(conn, cfg, lo, hi)["betriebseinnahmen"] == 107
+    invoice = core.create_invoice(conn, cfg, customer=core.adhoc_customer("Fixture"),
+                                  kind="domestic", issue_date="2026-02-16", service_from="2026-02-15",
+                                  service_to=None, items=[{"description": "Test", "unit_price": "100", "vat_rate": 7}],
+                                  render=False)
+    core.link_tx_invoice(conn, ids[1], invoice["id"])
+    vat = core.vat_data(conn, cfg, 2026, 1)
+    assert (vat["ust19"], vat["ust7"]) == (0, 7)
+    with pytest.raises(ValueError, match="ungebundene"):
+        core.set_tx_category(conn, ids[1], "einnahme_ust7")
+    assert core.get_transaction(conn, ids[1])["invoice_id"] == invoice["id"]
+    assert core.vat_annual(conn, cfg, 2026)["zahllast"] == Decimal("7.00")
+    assert core.euer(conn, cfg, lo, hi)["betriebseinnahmen"] == 107
+
+
+def test_closed_direct_receipt_is_not_auto_linked_or_reclassified(sandbox):
+    import core
+
+    conn = core.db()
+    cfg = core.load_config()
+    invoice = core.create_invoice(conn, cfg, customer=core.adhoc_customer("Fixture"),
+                                  kind="domestic", issue_date="2026-02-16", service_from="2026-02-15",
+                                  service_to=None, items=[{"description": "Test", "unit_price": "100", "vat_rate": 19}],
+                                  render=False)
+    tid = core.create_manual_transaction(conn, "2026-02-20", "Cash receipt", 119)
+    core.set_tx_category(conn, tid, "einnahme_ust19")
+    core.close_period("2026-Q1")
+    result = core.import_bank_csv(conn, (
+        "Type,Product,Started Date,Completed Date,Description,Amount,Fee,Currency,State,Balance\n"
+        "CARD_PAYMENT,Current,2026-03-01,2026-03-01,Unrelated,-2,0,EUR,COMPLETED,500\n"
+    ))
+    assert result["imported"] == 1 and result["matched"] == 0
+    assert core.get_invoice(conn, invoice["id"])["paid_date"] is None
+    for reassign in (
+        lambda: core.reset_tx(conn, tid),
+        lambda: core.link_tx_invoice(conn, tid, invoice["id"]),
+        lambda: core.create_expense_from_tx(conn, tid, "Sonstiges", 0),
+    ):
+        with pytest.raises(ValueError, match="festgeschrieben"):
+            reassign()
+    assert core.get_transaction(conn, tid)["category"] == "einnahme_ust19"
+
+
+def test_bulk_booking_preserves_all_rows_when_direct_receipt_is_closed(sandbox, monkeypatch):
+    import core
+    from app import app
+
+    monkeypatch.setitem(app.config, "KLAR_HOSTED", True)
+    with closing(core.db()) as ledger:
+        open_id = core.create_manual_transaction(ledger, "2026-04-20", "Open payment", 107)
+        closed_id = core.create_manual_transaction(ledger, "2026-02-20", "Closed receipt", 119)
+        core.set_tx_category(ledger, closed_id, "einnahme_ust19")
+        core.close_period("2026-Q1")
+        client = app.test_client()
+        response = client.post("/zahlungen/bulk", data={"ids": f"{open_id},{closed_id}", "action": "privatentnahme"})
+        assert core.get_transaction(ledger, open_id)["category"] == "offen"
+        assert core.get_transaction(ledger, closed_id)["category"] == "einnahme_ust19"
+        assert core.suggestion_for(core.get_rules_map(ledger), "Open payment") is None
+        assert response.status_code == 302
+        with client.session_transaction() as session:
+            assert any("2026-Q1 ist festgeschrieben" in message for _, message in session["_flashes"])
+
+
+def test_hosted_document_booking_is_atomic_across_retries(sandbox, monkeypatch):
+    import core
+    from app import app
+
+    monkeypatch.setitem(app.config, "KLAR_HOSTED", True)
+    with closing(core.db()) as ledger:
+        doc_id = core.add_document(ledger, b"Synthetic receipt", "receipt.txt", status="to_review")
+    endpoint = f"/documents/{doc_id}/confirm?json=1"
+    form = {"document_amount": "119.00", "document_date": "2026-03-10"}
+    original = core.create_expense
+    inserted, resume = Event(), Event()
+
+    def pause_after_insert(*args, **kwargs):
+        expense = original(*args, **kwargs)
+        if not inserted.is_set():
+            inserted.set()
+            assert resume.wait(5)
+        return expense
+
+    monkeypatch.setattr(core, "create_expense", pause_after_insert)
+
+    def confirm():
+        return app.test_client().post(endpoint, data=form)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(confirm)
+        try:
+            assert inserted.wait(5)
+            with closing(sqlite3.connect(core.DB_PATH)) as ledger:
+                assert ledger.execute("SELECT COUNT(*) FROM expenses").fetchone() == (0,)
+            retry = pool.submit(confirm)
+        finally:
+            resume.set()
+        assert first.result(timeout=5).status_code == 200
+        response = retry.result(timeout=5)
+    assert response.status_code == 409
+    assert "bereits verbucht" in response.get_json()["error"]
+    with closing(core.db()) as ledger:
+        assert core.get_document(ledger, doc_id)["status"] == "matched"
+        assert len(core.list_expenses(ledger)) == 1
+
+
+@pytest.mark.parametrize("linked", [False, True])
+def test_hosted_document_booking_rolls_back_invalid_split(sandbox, monkeypatch, linked):
+    import core
+    from app import app
+
+    monkeypatch.setitem(app.config, "KLAR_HOSTED", True)
+    with closing(core.db()) as ledger:
+        doc_id = core.add_document(ledger, b"Synthetic receipt", "receipt.txt", status="to_review")
+        path = f"/documents/{doc_id}/confirm?json=1"
+        form = {"document_amount": "119.00", "document_date": "2026-03-10"}
+        if linked:
+            tx_id = core.create_manual_transaction(ledger, "2026-03-10", "Open debit", -119)
+            prior_receipt = core.attach_receipt_to_tx(ledger, tx_id, b"Earlier receipt", "receipt.txt")
+            form = {"tx_id": str(tx_id)}
+        lines = [{"amount": "19.00", "vat_rate": 0}, {"amount": "100.00", "vat_rate": "invalid"}]
+        client = app.test_client()
+        response = client.post(path, data=form | {"lines": json.dumps(lines)})
+        assert not core.list_expenses(ledger)
+        assert core.get_document(ledger, doc_id)["status"] == "to_review"
+        if linked:
+            assert prior_receipt.read_bytes() == b"Earlier receipt"
+            assert core.get_transaction(ledger, tx_id)["category"] == "offen"
+        assert response.status_code == 400
+        assert client.post(path, data=form).get_json()["ok"]
+        assert len(core.list_expenses(ledger)) == 1
+
+
+def test_hosted_document_booking_preserves_existing_attachment_on_database_failure(sandbox, monkeypatch):
+    import core
+    from app import app
+
+    monkeypatch.setitem(app.config, "KLAR_HOSTED", True)
+    with closing(core.db()) as ledger:
+        doc_id = core.add_document(ledger, b"New receipt", "receipt.txt", status="to_review")
+        tx_id = core.create_manual_transaction(ledger, "2026-03-10", "Open debit", -119)
+        prior_receipt = core.attach_receipt_to_tx(ledger, tx_id, b"Earlier receipt", "receipt.txt")
+        ledger.executescript("""
+            CREATE TRIGGER fail_booking BEFORE UPDATE OF status ON documents
+            WHEN NEW.status = 'matched' BEGIN
+                SELECT RAISE(ABORT, 'fixture write failure');
+            END;
+        """)
+        client = app.test_client()
+        path = f"/documents/{doc_id}/confirm?json=1"
+        form = {"tx_id": str(tx_id)}
+        assert client.post(path, data=form).status_code == 500
+        assert prior_receipt.read_bytes() == b"Earlier receipt"
+        assert core.get_transaction(ledger, tx_id)["receipt_path"] == core.rel_pfad(prior_receipt)
+        assert core.get_document(ledger, doc_id)["status"] == "to_review"
+        assert not core.list_expenses(ledger)
+
+        ledger.execute("DROP TRIGGER fail_booking")
+        assert client.post(path, data=form).get_json()["ok"]
+        download = f"/zahlungen/tx/{tx_id}/receipt"
+        assert client.get(f"/documents/{doc_id}/file").data == b"New receipt"
+        assert client.get(download).data == b"New receipt"
+        assert client.post(f"/documents/{doc_id}/delete?json=1").get_json()["ok"]
+        assert client.get(download).data == b"New receipt"
 
 
 def test_reference_fallback_and_previous_vendor_matching(sandbox):

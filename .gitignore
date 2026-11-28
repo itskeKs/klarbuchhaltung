@@ -16,3 +16,20 @@ import_bb/
 
 # macOS
 .DS_Store
+
+# Local test and hosted runtime data
+.pytest_cache/
+.env
+.env.*
+!.env.example
+/secrets/
+gateway.json
+gateway-token
+application-id
+*.pem
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*

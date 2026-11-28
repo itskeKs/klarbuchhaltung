@@ -1,0 +1,20 @@
+---
+description: Hosted tenant isolation and bank integration
+paths:
+  - "app.py"
+  - "hosted/**"
+  - "compose.hosted.yml"
+  - "static/hosted.js"
+  - "tests/test_hosted.py"
+---
+
+Keep the edge limited to the gateway. Preserve per-tenant data and secrets, the hosted
+endpoint allowlist, CSRF verification and the login binding of provider state. Hosted entry
+points must keep the local-only profile switch, terminal, agent and chat disabled. A download
+may serve only the current tenant's own files and must use the existing safe response path.
+
+Use the current bank service for consent, scheduling, reference matching and deduplication.
+Use the provider stub and separate tenants for tests. Never use a real bank key, consent code
+or production ledger in fixtures, logs or acceptance evidence.
+
+See [operations](../../docs/operations/README.md) and [hosted tests](../../tests/test_hosted.py).

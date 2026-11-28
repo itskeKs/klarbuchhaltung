@@ -209,6 +209,10 @@ When a consent expires, use **Bank verbinden** and complete consent again. **Ver
 trennen** stops imports for that connection. Its payments and their categories remain in
 your ledger. See the [two-login walkthrough](../docs/acceptance/journeys.md).
 
+In an EUR ledger using cash-basis VAT under the regular VAT regime, book a positive
+domestic EUR receipt directly at 19% or 7% in **Zahlungen**, or assign it to an invoice.
+Direct booking uses the receipt date. The selected treatment contributes once to reports.
+
 ## Banking screens
 
 | Step | Desktop | 360 px |
